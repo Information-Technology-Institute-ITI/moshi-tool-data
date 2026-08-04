@@ -1,0 +1,87 @@
+audio:
+  sample_rate: 24000
+  sample_width: 16
+  fade_ms: 10
+
+transcription:
+  quality_profile: balanced
+  model: large-v3
+  # Set this to a different locally cached Whisper model for independent review.
+  # When null, flagged segments use the main model with a stricter decode.
+  review_model: null
+  language: ar
+  device: auto
+  compute_type: float16
+  batch_size: 1
+  chunk_size: 20
+  retry_chunk_size: 10
+  beam_size: 5
+  review_beam_size: 8
+  repetition_penalty: 1.1
+  no_repeat_ngram_size: 3
+  hallucination_silence_threshold: 1.0
+  suspect_avg_logprob: -0.50
+  min_words_per_second: 0.35
+  max_words_per_second: 6.0
+  max_repeated_ngram_occurrences: 3
+  decode_disagreement_ratio: 0.25
+
+alignment:
+  backend: whisperx
+  model: null
+  low_confidence_score: 0.40
+
+diarization:
+  model: pyannote/speaker-diarization-community-1
+  min_speakers: 2
+  max_speakers: 2
+  min_assignment_overlap: 0.35
+  short_turn_seconds: 0.35
+  # Bridge only same-speaker gaps containing an aligned word; overlap and exclusions block it.
+  activity_merge_gap_seconds: 0.50
+
+separation:
+  enabled: false
+  model: speechbrain/sepformer-whamr16k
+  embedding_model: speechbrain/spkrec-ecapa-voxceleb
+  sample_rate: 16000
+  context_seconds: 1.0
+  max_window_seconds: 12.0
+  enrollment_seconds: 30.0
+  minimum_enrollment_turn: 1.5
+  minimum_identity_similarity: 0.65
+  minimum_identity_margin: 0.10
+
+segmentation:
+  min_duration: 20
+  target_duration: 40
+  max_duration: 50
+  max_overlap_ratio: 0.20
+  overlap_warning_ratio: 0.05
+  max_silence_ratio: 0.80
+  min_speaker_duration: 1.0
+  min_speaker_share: 0.02
+  context_before: 0.25
+  context_after: 0.25
+
+normalization:
+  remove_diacritics: true
+  normalize_alef: true
+  normalize_alef_maqsura: false
+  keep_punctuation: true
+
+qc:
+  silence_threshold_db: -50.0
+  max_channel_silence_ratio: 0.995
+  clipping_review_ratio: 0.001
+  clipping_reject_ratio: 0.01
+  leakage_review_ratio: 0.25
+  low_confidence_review_ratio: 0.10
+  low_confidence_reject_ratio: 0.35
+  uncertain_assignment_review_ratio: 0.05
+  uncertain_assignment_reject_ratio: 0.15
+
+review:
+  host: 127.0.0.1
+  port: 8765
+  require_overlap_review: true

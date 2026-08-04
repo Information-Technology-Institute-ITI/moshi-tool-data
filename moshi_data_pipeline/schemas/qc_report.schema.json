@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/qc_report.schema.json",
+  "title": "Per-source Moshi dataset quality report",
+  "type": "object",
+  "required": ["source", "assistant_speaker", "status_counts", "clips"],
+  "properties": {
+    "source": {
+      "type": "string"
+    },
+    "assistant_speaker": {
+      "type": "string"
+    },
+    "status_counts": {
+      "type": "object",
+      "required": ["PASS", "REVIEW", "REJECT"],
+      "properties": {
+        "PASS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "REVIEW": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "REJECT": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "clips": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["status", "reasons", "metrics"],
+        "properties": {
+          "status": {
+            "enum": ["PASS", "REVIEW", "REJECT"]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metrics": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  }
+}

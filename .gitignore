@@ -1,0 +1,17 @@
+.venv/
+.downloads/
+.runtime/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.env
+raw/
+studio_workspace/
+web/node_modules/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
