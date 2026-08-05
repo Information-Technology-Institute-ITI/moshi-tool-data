@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Protocol
 
 from moshi_data_pipeline.config import AlignmentConfig, TranscriptionConfig
 from moshi_data_pipeline.exceptions import DependencyError, ModelStageError, UnsupportedFeatureError
+from moshi_data_pipeline.model_revisions import snapshot_for_revision
 from moshi_data_pipeline.models import Word
 from moshi_data_pipeline.transcription.quality import latin_script_word
 from moshi_data_pipeline.transcription.whisperx_backend import release_model, resolve_device
@@ -90,11 +92,27 @@ class WhisperXAlignmentBackend:
         model = None
         try:
             language = str(transcription.get("language") or transcription_config.language)
-            LOGGER.info("Loading WhisperX alignment model for language=%s on %s", language, device)
+            alignment_model = alignment_config.model
+            model_revision: str | None = None
+            model_name: str | None = alignment_model
+            if alignment_model is not None:
+                snapshot, model_revision = snapshot_for_revision(
+                    alignment_model,
+                    alignment_config.model_revision,
+                    token=os.environ.get("HF_TOKEN") or None,
+                )
+                model_name = str(snapshot)
+            LOGGER.info(
+                "Loading WhisperX alignment model=%s revision=%s language=%s on %s",
+                alignment_model or "whisperx-default",
+                model_revision or "unresolved-default",
+                language,
+                device,
+            )
             model, metadata = whisperx.load_align_model(
                 language_code=language,
                 device=device,
-                model_name=alignment_config.model,
+                model_name=model_name,
             )
             result = whisperx.align(
                 corrected_segments
@@ -109,6 +127,7 @@ class WhisperXAlignmentBackend:
             )
             result["language"] = language
             result["alignment_model"] = alignment_config.model or "whisperx-default"
+            result["alignment_model_revision"] = model_revision
             words = words_from_result(result)
             result["low_confidence_latin_words"] = [
                 word.to_dict()

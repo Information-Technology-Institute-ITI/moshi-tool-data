@@ -55,4 +55,4 @@ def _configure_private_ffmpeg_runtime() -> None:
 _load_local_hf_token()
 _configure_private_ffmpeg_runtime()
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

@@ -54,6 +54,9 @@ class StudioPaths:
     def canonical_audio(self, source_id: str) -> Path:
         return self.source_root(source_id) / "canonical.wav"
 
+    def canonical_channels(self, source_id: str) -> Path:
+        return self.source_root(source_id) / "canonical_channels.wav"
+
     def video_proxy(self, source_id: str) -> Path:
         return self.source_root(source_id) / "proxy.mp4"
 

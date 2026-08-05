@@ -23,6 +23,10 @@ from moshi_data_pipeline.output.manifest import (
     rebuild_manifest,
 )
 from moshi_data_pipeline.pipeline import ProcessOptions, ProcessSummary, process_file
+from moshi_data_pipeline.separation_evaluation import (
+    compare_evaluations,
+    evaluate_manifest,
+)
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -53,6 +57,13 @@ def _config_overrides(
         "transcription": {
             "quality_profile": quality_profile,
             "model": model,
+            "model_repository": (
+                model
+                if model is not None and ("/" in model or Path(model).exists())
+                else f"Systran/faster-whisper-{model}"
+                if model is not None
+                else None
+            ),
             "language": language,
             "device": device,
             "compute_type": compute_type,
@@ -354,7 +365,7 @@ def web_command(
     port: int = typer.Option(8765, "--port", min=1, max=65_535),
     allow_remote: bool = typer.Option(False, "--allow-remote"),
 ) -> None:
-    """Start the local v2 upload, annotation, review, and export studio."""
+    """Start the local v3 upload, annotation, review, and export studio."""
     from moshi_data_pipeline.studio.server import serve_studio
 
     try:
@@ -389,6 +400,11 @@ def benchmark_command(
         config = load_config(config_path)
         if model is not None:
             config.transcription.model = model
+            config.transcription.model_repository = (
+                model
+                if "/" in model or Path(model).exists()
+                else f"Systran/faster-whisper-{model}"
+            )
         if language is not None:
             config.transcription.language = language
         if device is not None:
@@ -412,3 +428,37 @@ def stages_command() -> None:
     """List valid values for --force-stage."""
     for stage in STAGES:
         console.print(stage)
+
+
+@app.command("evaluate-separation")
+def evaluate_separation_command(
+    manifest: Path = typer.Option(..., "--manifest", exists=True, dir_okay=False),
+    output_json: Path | None = typer.Option(None, "--output-json"),
+    baseline: Path | None = typer.Option(None, "--baseline", exists=True, dir_okay=False),
+    maximum_si_sdr_regression_db: float = typer.Option(
+        0.5,
+        "--maximum-si-sdr-regression-db",
+        min=0.0,
+    ),
+) -> None:
+    """Score a fixed podcast separation set and optionally fail on regression."""
+    try:
+        result = evaluate_manifest(manifest)
+        regressions: list[str] = []
+        if baseline is not None:
+            baseline_result = json.loads(baseline.read_text(encoding="utf-8"))
+            regressions = compare_evaluations(
+                result,
+                baseline_result,
+                maximum_si_sdr_regression_db,
+            )
+        result["regressions"] = regressions
+        result["passed_regression_check"] = not regressions
+        if output_json is not None:
+            atomic_write_json(output_json, result)
+        console.print_json(json.dumps(result, ensure_ascii=False))
+        if regressions:
+            raise typer.Exit(2)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]ERROR:[/red] {exc}")
+        raise typer.Exit(1) from exc

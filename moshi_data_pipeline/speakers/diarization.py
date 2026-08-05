@@ -8,6 +8,7 @@ from typing import Any
 from moshi_data_pipeline.audio.io import read_audio
 from moshi_data_pipeline.config import DiarizationConfig, TranscriptionConfig
 from moshi_data_pipeline.exceptions import DependencyError, ModelStageError
+from moshi_data_pipeline.model_revisions import resolve_model_revision
 from moshi_data_pipeline.models import SpeakerSegment
 from moshi_data_pipeline.speakers.overlap import overlap_intervals
 from moshi_data_pipeline.transcription.whisperx_backend import release_model, resolve_device
@@ -80,14 +81,22 @@ class WhisperXDiarizer:
         device = resolve_device(transcription_config.device)
         pipeline = None
         try:
-            LOGGER.info(
-                "Loading diarization model=%s device=%s token=<configured>",
+            model_revision = resolve_model_revision(
                 config.model,
+                config.model_revision,
+                token=token,
+            )
+            LOGGER.info(
+                "Loading diarization model=%s revision=%s device=%s token=<configured>",
+                config.model,
+                model_revision,
                 device,
             )
-            pipeline = Pipeline.from_pretrained(config.model, token=token).to(
-                torch.device(device)
-            )
+            pipeline = Pipeline.from_pretrained(
+                config.model,
+                revision=model_revision,
+                token=token,
+            ).to(torch.device(device))
             audio, sample_rate = read_audio(audio_path)
             waveform = torch.from_numpy(audio.T)
             arguments: dict[str, int] = {}
@@ -111,6 +120,7 @@ class WhisperXDiarizer:
             overlaps = overlap_intervals(overlap_segments)
             report = {
                 "model": config.model,
+                "model_revision": model_revision,
                 "segments": [segment.to_dict() for segment in overlap_segments],
                 "exclusive_segments": [
                     segment.to_dict() for segment in exclusive_segments

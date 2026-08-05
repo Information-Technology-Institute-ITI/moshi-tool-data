@@ -4,7 +4,8 @@ This project provides a local, single-user website for turning two-person mixed
 podcast videos into a manually verified dataset for the official
 [Kyutai Moshi fine-tuning repository](https://github.com/kyutai-labs/moshi-finetune).
 The older command-line pipeline remains available, but source annotation is now
-the authority for v2 clipping, stereo rendering, review, and immutable export.
+the authority for v3 channel routing, clipping, stereo rendering, review, and
+immutable export.
 This is a separate project: it does not modify a Moshi checkout.
 
 The format was verified against `kyutai-labs/moshi-finetune` commit
@@ -46,6 +47,8 @@ faster-whisper 1.2.1, pyannote.audio 4.0.7, PyTorch/torchaudio 2.8.0, SoundFile
 0.14.0, SpeechBrain 1.1.0, FastAPI 0.140.13, and NumPy 2.2.6. WhisperX 3.8.6 maps Arabic alignment to
 `jonatasgrosman/wav2vec2-large-xlsr-53-arabic`; model quality and availability are
 external dependencies, so unaligned words are reported, never timestamped by guess.
+At load time, every Hugging Face model branch or tag is resolved to an immutable
+commit SHA and that SHA is recorded in stage output and exports.
 
 ## Windows installation
 
@@ -135,6 +138,10 @@ Copy `config.example.yaml` and edit it. CLI options override YAML values:
 Copy-Item config.example.yaml config.yaml
 ```
 
+The example pins the currently verified model snapshots by full commit SHA. If
+you change a model, change its repository/name and revision together; the runtime
+still resolves a branch or tag to a SHA before loading and records the result.
+
 The legacy CLI defaults use a relaxed, higher-yield policy:
 
 - One file at a time; batch mode is sequential.
@@ -147,7 +154,7 @@ The legacy CLI defaults use a relaxed, higher-yield policy:
   unless optional separation confidently recovers it.
 - PCM-16, 24 kHz, two-channel output with 10 ms mask-boundary fades.
 
-The v2 Studio keeps the same QC thresholds but uses the product-level 20–100
+The v3 Studio keeps the same QC thresholds but uses the product-level 20–100
 second hard clip range and requires an explicit planning mode.
 
 If `large-v3` runs out of VRAM, the pipeline fails and recommends an explicit
@@ -156,7 +163,7 @@ the result irreproducible.
 
 ## Commands
 
-### Dataset Studio v2
+### Dataset Studio v3
 
 Start the website and its one persistent local GPU worker:
 
@@ -173,13 +180,14 @@ The guided workflow is:
 
 1. Create a dataset project and upload one or more podcast videos.
 2. Choose manual or assisted initialization for each source.
-3. Mark independent Speaker A/B activity and exclusions, select the Moshi speaker,
-   choose clean reference turns for stable speaker identity, edit the RTL transcript,
-   and save a versioned annotation.
+3. Inspect the original channel evidence. When the source really contains isolated
+   speakers on left/right, map A/B and confirm independent routing; otherwise keep
+   the conservative mixed/mono path. Then mark activity/exclusions, select the Moshi
+   speaker, choose clean identity references, and edit the RTL transcript.
 4. Work through the prioritized transcript queue. Generate second-pass candidates
    only for unresolved high-risk utterances, realign corrections, and verify them
    against the audio.
-5. Recover short overlap regions, optionally transcribe the isolated stems for
+5. Recover overlap regions, optionally transcribe the isolated stems for
    comparison, and explicitly approve or reject every recovery.
 6. Choose clip count, target duration, or manual boundaries and refine the proposal.
 7. Generate, listen to, and approve every final stereo clip.
@@ -201,6 +209,28 @@ downstream clip approvals.
 The site binds to loopback by default. Remote binding requires both a non-loopback
 `--host` and the explicit `--allow-remote` flag. Interactive API documentation is
 available at `http://127.0.0.1:8765/api/docs`.
+
+### Separation regression benchmark
+
+Keep a fixed set of real podcast mixtures, estimates, and—where available—clean
+references. Paths in the JSON/JSONL manifest are relative to the manifest:
+
+```json
+{"items":[{"id":"case-01","mixture":"mix.wav","estimated_a":"a.wav","estimated_b":"b.wav","reference_a":"ref-a.wav","reference_b":"ref-b.wav","seams_seconds":[12.0]}]}
+```
+
+Score permutation-aware SI-SDR, SI-SDR improvement, mixture reconstruction,
+clipping, and chunk seam jumps:
+
+```powershell
+python -m moshi_data_pipeline evaluate-separation `
+  --manifest evaluation\podcasts.json `
+  --output-json evaluation\v3-baseline.json
+```
+
+On later changes, pass the saved result through `--baseline`. The command exits
+with status 2 if success rate drops or mean SI-SDR regresses by more than the
+configured tolerance (0.5 dB by default).
 
 ### Legacy command-line workflow
 
@@ -359,6 +389,7 @@ studio_workspace/
 ├── originals/                         # immutable uploaded media
 ├── sources/<source-id>/
 │   ├── canonical.wav
+│   ├── canonical_channels.wav         # original stereo preserved when available
 │   ├── proxy.mp4
 │   ├── peaks.json
 │   ├── recovery/annotation_v<revision>_<id>/
@@ -377,7 +408,7 @@ studio_workspace/
 ```
 
 `reproducibility.json` records the complete configuration fingerprint, model
-identifiers and discoverable cached revisions, pinned dependency versions,
+identifiers, requested revisions and immutable commit SHAs, pinned dependency versions,
 runtime versions, and SHA-256 hashes for exported artifacts.
 
 Train/evaluation assignment is deterministic at whole-source level. A project
@@ -428,13 +459,18 @@ are UTF-8, pretty-printed, and validated with
 
 ## Diarization and optional overlap recovery
 
-Diarization estimates **who spoke when**. The source is still a mono mixture. A
-time mask can route clean single-speaker intervals, but it cannot recover two
-independent voices from overlap. By default, the pipeline removes mixed overlap
-from both channels.
+Diarization estimates **who spoke when**; it does not separate a mono mixture.
+V3 first preserves and inspects original stereo channels. Low correlation plus
+substantial left- and right-dominant speech produces a routing suggestion, but a
+human must audition the stereo and confirm the A/B map. Dual-mono, correlated,
+ambiguous, and mono inputs stay on the diarization-masked mono path. Mixed overlap
+is removed from both outputs until recovery is approved.
 
 `--separate-overlap` enables SpeechBrain SepFormer only on overlap windows, with
-one second of context and a 12-second maximum inference window. ECAPA speaker
+one second of context and a 12-second maximum inference window. Longer overlaps
+are split into overlapping windows, identity-checked per chunk, gain-matched,
+projected back to mixture consistency, overlap-added, and joined with short seams.
+ECAPA speaker
 embeddings match each separated stem to clean enrollment speech. Ambiguous or
 failed identity matches fall back to omitted overlap without failing the file.
 Coverage below 95% is rejected only above the 20% overlap ceiling, and every
@@ -481,7 +517,8 @@ English code-switches, named entities, laughter, fillers, or dialectal phonemes.
 Alignment can omit words that its character dictionary cannot represent. Diarization
 labels are file-local and may swap identities between episodes. Music detection is
 reported as not run because no detector with reliable behavior is bundled; music
-must be reviewed manually. Energy-based leakage checks are heuristics, not proof of
+must be marked as an exclusion manually. Full-file separation and agent/LLM
+orchestration are intentionally not used. Energy-based leakage checks are heuristics, not proof of
 speaker isolation.
 
 ## Synthetic example and tests
@@ -503,7 +540,8 @@ pnpm test
 pnpm run build
 ```
 
-The Python suite covers the existing pipeline plus source-region validation,
+The Python suite covers the existing pipeline plus channel classification and
+mapping, long-overlap reconstruction, separation regression scoring, source-region validation,
 derived overlap/silence, sample-accurate boundaries, clip feasibility, optimistic
 annotation conflicts, durable job recovery, cleanup safety, source-level splitting,
 unresolved-overlap muting, stereo routing, and the Moshi export contract. Frontend
@@ -519,7 +557,7 @@ moshi_data_pipeline/
 ├── segmentation/   # turn-window creation and rejection policy
 ├── output/         # official JSON, manifest, reports
 ├── review/         # loopback FastAPI server and offline browser UI
-├── studio/         # v2 catalog, API, durable worker, planning, export, React build
+├── studio/         # v3 catalog, API, durable worker, planning, export, React build
 ├── schemas/        # JSON Schema documents
 ├── cache.py
 ├── cli.py

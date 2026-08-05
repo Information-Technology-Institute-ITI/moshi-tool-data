@@ -37,6 +37,24 @@ def masked_energy(signal: np.ndarray, mask: np.ndarray) -> float:
     return float(np.mean(np.square(selected.astype(np.float64))))
 
 
+def mixture_reconstruction_error_db(
+    reference: np.ndarray,
+    stereo: np.ndarray,
+    mask: np.ndarray,
+) -> float | None:
+    if stereo.ndim != 2 or stereo.shape[1] != 2:
+        raise ValueError("Expected stereo audio shaped [samples, 2]")
+    if reference.shape != mask.shape or len(stereo) != len(reference):
+        raise ValueError("Reference, stereo, and reconstruction mask lengths must match")
+    if not mask.any():
+        return None
+    selected_reference = reference[mask].astype(np.float64)
+    selected_estimate = np.sum(stereo[mask], axis=1, dtype=np.float64)
+    reference_rms = safe_rms(selected_reference)
+    error_rms = safe_rms(selected_estimate - selected_reference)
+    return 20.0 * math.log10(max(error_rms, 1e-12) / max(reference_rms, 1e-12))
+
+
 def channel_metrics(stereo: np.ndarray, silence_threshold_db: float = -50.0) -> dict[str, float]:
     if stereo.ndim != 2 or stereo.shape[1] != 2:
         raise ValueError("Expected stereo audio shaped [samples, 2]")

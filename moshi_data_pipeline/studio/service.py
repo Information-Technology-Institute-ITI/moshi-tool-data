@@ -27,6 +27,7 @@ from moshi_data_pipeline.studio.worker import StudioWorker
 
 class StudioService:
     def __init__(self, workspace: Path, config: PipelineConfig):
+        self.config = config
         self.paths = StudioPaths(workspace)
         self.catalog = StudioCatalog(self.paths.database)
         self._repair_annotation_bounds()
@@ -98,6 +99,11 @@ class StudioService:
             "clip_artifacts": clip_artifacts(self.catalog, self.paths, source_id),
             "urls": {
                 "canonical_audio": f"/media/{source_id}/canonical",
+                "canonical_channels": (
+                    f"/media/{source_id}/channels"
+                    if self.paths.canonical_channels(source_id).exists()
+                    else None
+                ),
                 "video_proxy": (
                     f"/media/{source_id}/proxy"
                     if self.paths.video_proxy(source_id).exists()

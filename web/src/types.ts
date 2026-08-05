@@ -25,6 +25,20 @@ export interface Source {
   active_annotation_version: number;
   inspection?: {
     video_frame_rate?: number | null;
+    channel_routing?: {
+      channel_count: number;
+      routing_candidate: boolean;
+      recommended_mode: "mono" | "independent_stereo";
+      reason: string;
+      channel_rms_db?: number[];
+      absolute_correlation?: number;
+      estimated_lag_ms?: number;
+      left_dominant_fraction?: number;
+      right_dominant_fraction?: number;
+      dual_mono?: boolean;
+      suggested_speaker_channel_map?: Partial<Record<Speaker, number>>;
+      mapping_suggestion_error?: string;
+    };
   };
 }
 
@@ -79,6 +93,9 @@ export interface Annotation {
   source_id: string;
   version: number;
   assistant_speaker?: Speaker | null;
+  channel_routing_mode: "mono" | "independent_stereo";
+  channel_routing_verified: boolean;
+  speaker_channel_map: Partial<Record<Speaker, number>>;
   activities_finalized: boolean;
   activities: ActivityRegion[];
   speaker_references: SpeakerReferenceRegion[];
@@ -102,10 +119,12 @@ export interface ClipArtifact {
   qc: {
     status: "PASS" | "REVIEW" | "REJECT";
     reasons: string[];
-    metrics: Record<string, number | string | boolean>;
+    metrics: Record<string, number | string | boolean | null>;
   };
   raw_overlap_ratio: number;
   separation_used: boolean;
+  recovery_method?: string | null;
+  routing_method?: string;
   transcript?: {
     assistant_speaker: Speaker;
     original_and_normalized: {
@@ -177,6 +196,7 @@ export interface SourceDetail extends Source {
   };
   urls: {
     canonical_audio: string;
+    canonical_channels?: string | null;
     video_proxy?: string | null;
     peaks?: string | null;
     original: string;

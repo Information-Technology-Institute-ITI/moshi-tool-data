@@ -7,13 +7,19 @@ from typing import Any
 
 import numpy as np
 
-from moshi_data_pipeline.audio.channels import render_stereo
+from moshi_data_pipeline.audio.channels import render_independent_stereo, render_stereo
 from moshi_data_pipeline.audio.ffmpeg import (
     create_video_proxy,
+    extract_preserved_channels_wav,
     extract_working_wav,
     inspect_media,
 )
 from moshi_data_pipeline.audio.io import audio_info, read_audio_segment, write_pcm16
+from moshi_data_pipeline.audio.metrics import mixture_reconstruction_error_db
+from moshi_data_pipeline.audio.routing import (
+    analyze_channel_file,
+    infer_speaker_channel_mapping_file,
+)
 from moshi_data_pipeline.audio.validation import validate_clip
 from moshi_data_pipeline.cache import atomic_write_json
 from moshi_data_pipeline.config import PipelineConfig
@@ -72,6 +78,22 @@ def _segments_from_annotation(annotation: AnnotationDocument) -> list[SpeakerSeg
         )
         for region in annotation.activities
     ]
+
+
+def _independent_channel_routing_ready(
+    paths: StudioPaths,
+    source_id: str,
+    annotation: AnnotationDocument,
+) -> bool:
+    channel_path = paths.canonical_channels(source_id)
+    return (
+        annotation.channel_routing_mode == "independent_stereo"
+        and annotation.channel_routing_verified
+        and set(annotation.speaker_channel_map) == {"A", "B"}
+        and set(annotation.speaker_channel_map.values()) == {0, 1}
+        and channel_path.is_file()
+        and int(audio_info(channel_path)["channels"]) == 2
+    )
 
 
 def _speaker_for_interval(
@@ -264,6 +286,29 @@ def rediarize_source(
         int(source["duration_samples"] or 0),
     )
     saved = catalog.save_annotation(source_id, annotation.version, updated)
+    inspection = dict(source.get("inspection") or {})
+    channel_report = dict(inspection.get("channel_routing") or {})
+    if (
+        channel_report.get("routing_candidate")
+        and paths.canonical_channels(source_id).exists()
+    ):
+        try:
+            channel_mapping, channel_mapping_report = infer_speaker_channel_mapping_file(
+                paths.canonical_channels(source_id),
+                mapped_overlap,
+                config.channel_routing,
+            )
+            channel_report.update(
+                {
+                    "suggested_speaker_channel_map": channel_mapping,
+                    "speaker_channel_evidence": channel_mapping_report,
+                }
+            )
+            channel_report.pop("mapping_suggestion_error", None)
+        except ValueError as exc:
+            channel_report["mapping_suggestion_error"] = str(exc)
+        inspection["channel_routing"] = channel_report
+        catalog.update_source(source_id, inspection=inspection)
     diarization["speaker_mapping"] = mapping
     diarization["identity_lock"] = identity_report
     diarization["word_supported_activity_gap_merges"] = repaired_gaps
@@ -297,6 +342,28 @@ def initialize_source(
         extract_working_wav(original, canonical, SAMPLE_RATE)
     else:
         progress(0.18, "Reusing immutable canonical audio")
+    preserved_channels = paths.canonical_channels(source_id)
+    if (
+        config.audio.preserve_source_channels
+        and int(inspection.get("channels") or 0) > 1
+    ):
+        if not preserved_channels.exists():
+            progress(0.23, "Preserving source channels for channel-first routing")
+            extract_preserved_channels_wav(original, preserved_channels, SAMPLE_RATE)
+        else:
+            progress(0.23, "Reusing preserved source channels")
+        inspection["channel_routing"] = analyze_channel_file(
+            preserved_channels,
+            config.channel_routing,
+        )
+    else:
+        inspection["channel_routing"] = {
+            "channel_count": int(inspection.get("channels") or 1),
+            "routing_candidate": False,
+            "recommended_mode": "mono",
+            "requires_human_confirmation": True,
+            "reason": "source_channels_are_not_available",
+        }
     info = audio_info(canonical)
     peaks_path = paths.peaks(source_id)
     if peaks_path.exists():
@@ -329,6 +396,23 @@ def initialize_source(
             canonical, config.diarization, config.transcription
         )
         mapped_exclusive, mapped_overlap, mapping = _map_diarization(exclusive, diarization)
+        if inspection["channel_routing"].get("routing_candidate"):
+            try:
+                channel_mapping, channel_mapping_report = (
+                    infer_speaker_channel_mapping_file(
+                        preserved_channels,
+                        mapped_overlap,
+                        config.channel_routing,
+                    )
+                )
+                inspection["channel_routing"].update(
+                    {
+                        "suggested_speaker_channel_map": channel_mapping,
+                        "speaker_channel_evidence": channel_mapping_report,
+                    }
+                )
+            except ValueError as exc:
+                inspection["channel_routing"]["mapping_suggestion_error"] = str(exc)
         words, _ = assign_speakers_to_words(
             words, mapped_exclusive, config.diarization.min_assignment_overlap
         )
@@ -469,9 +553,21 @@ def generate_review_candidates(
             "candidates": 0,
         }
     review_model = config.transcription.review_model or config.transcription.model
+    review_repository = (
+        config.transcription.review_model_repository
+        if config.transcription.review_model
+        else config.transcription.model_repository
+    )
+    review_revision = (
+        config.transcription.review_model_revision
+        if config.transcription.review_model
+        else config.transcription.model_revision
+    )
     review_config = config.transcription.model_copy(
         update={
             "model": review_model,
+            "model_repository": review_repository,
+            "model_revision": review_revision,
             "batch_size": 1,
             "chunk_size": config.transcription.retry_chunk_size,
             "beam_size": config.transcription.review_beam_size,
@@ -667,9 +763,21 @@ def transcribe_overlap_stems(
     if record is None or record["status"] != "recovered":
         raise ValueError("Recover this overlap before transcribing its isolated stems")
     review_model = config.transcription.review_model or config.transcription.model
+    review_repository = (
+        config.transcription.review_model_repository
+        if config.transcription.review_model
+        else config.transcription.model_repository
+    )
+    review_revision = (
+        config.transcription.review_model_revision
+        if config.transcription.review_model
+        else config.transcription.model_revision
+    )
     review_config = config.transcription.model_copy(
         update={
             "model": review_model,
+            "model_repository": review_repository,
+            "model_revision": review_revision,
             "batch_size": 1,
             "chunk_size": config.transcription.retry_chunk_size,
             "beam_size": config.transcription.review_beam_size,
@@ -719,6 +827,13 @@ def recover_source_overlaps(
         raise ValueError("Choose the Moshi speaker before recovering overlap")
     if not annotation.activities_finalized:
         raise ValueError("Finalize the human speaker regions before recovering overlap")
+    if (
+        annotation.channel_routing_mode == "independent_stereo"
+        and not _independent_channel_routing_ready(paths, source_id, annotation)
+    ):
+        raise ValueError(
+            "Independent stereo routing must have a verified A/B channel map"
+        )
     overlaps = derived_overlaps(annotation.activities)
     if not overlaps:
         catalog.replace_overlap_recoveries(source_id, annotation.version, [])
@@ -731,16 +846,23 @@ def recover_source_overlaps(
     )
     output_root.mkdir(parents=True, exist_ok=True)
     segments = _segments_from_annotation(annotation)
-    config.separation.enabled = True
-    progress(0.05, "Loading overlap separation models")
-    separator = build_overlap_separator(
-        paths.canonical_audio(source_id),
-        segments,
-        segments,
-        annotation.assistant_speaker,
-        config.separation,
-        resolve_device(config.transcription.device),
+    direct_channels = _independent_channel_routing_ready(
+        paths, source_id, annotation
     )
+    separator = None
+    if direct_channels:
+        progress(0.05, "Using verified independent source channels")
+    else:
+        config.separation.enabled = True
+        progress(0.05, "Loading pinned overlap separation models")
+        separator = build_overlap_separator(
+            paths.canonical_audio(source_id),
+            segments,
+            segments,
+            annotation.assistant_speaker,
+            config.separation,
+            resolve_device(config.transcription.device),
+        )
     records: list[dict[str, Any]] = []
     source = catalog.get_source(source_id)
     duration_samples = int(source["duration_samples"])
@@ -766,8 +888,36 @@ def recover_source_overlaps(
         original_path = output_root / f"{region_id}_original.wav"
         write_pcm16(original_path, original_audio[:, :1], original_rate)
         base["original_path"] = paths.relative(original_path)
-        if end - start > round(config.separation.max_window_seconds * SAMPLE_RATE):
-            base["details"] = {"reason": "overlap_exceeds_maximum_window"}
+        if direct_channels:
+            routed, routed_rate = read_audio_segment(
+                paths.canonical_channels(source_id),
+                _seconds(start),
+                _seconds(end),
+                SAMPLE_RATE,
+            )
+            if routed.shape[1] != 2:
+                base["details"] = {"reason": "preserved_source_is_not_stereo"}
+                records.append(base)
+                continue
+            user_speaker = "B" if annotation.assistant_speaker == "A" else "A"
+            assistant_channel = annotation.speaker_channel_map[annotation.assistant_speaker]
+            user_channel = annotation.speaker_channel_map[user_speaker]
+            assistant_path = output_root / f"{region_id}_assistant.wav"
+            user_path = output_root / f"{region_id}_user.wav"
+            write_pcm16(assistant_path, routed[:, assistant_channel : assistant_channel + 1], routed_rate)
+            write_pcm16(user_path, routed[:, user_channel : user_channel + 1], routed_rate)
+            base.update(
+                {
+                    "status": "recovered",
+                    "assistant_path": paths.relative(assistant_path),
+                    "user_path": paths.relative(user_path),
+                    "details": {
+                        "coverage": 1.0,
+                        "recovery_method": "verified_independent_stereo",
+                        "speaker_channel_map": annotation.speaker_channel_map,
+                    },
+                }
+            )
             records.append(base)
             continue
         if separator is None:
@@ -811,13 +961,23 @@ def recover_source_overlaps(
                     "status": "recovered",
                     "assistant_path": paths.relative(assistant_path),
                     "user_path": paths.relative(user_path),
-                    "details": {"coverage": coverage, "failures": recovery.failures},
+                    "details": {
+                        "coverage": coverage,
+                        "failures": recovery.failures,
+                        "chunk_metrics": recovery.chunk_metrics,
+                        "recovery_method": recovery.recovery_method,
+                    },
                 }
             )
         else:
             base.update(
                 {
-                    "details": {"coverage": coverage, "failures": recovery.failures},
+                    "details": {
+                        "coverage": coverage,
+                        "failures": recovery.failures,
+                        "chunk_metrics": recovery.chunk_metrics,
+                        "recovery_method": recovery.recovery_method,
+                    },
                 }
             )
         records.append(base)
@@ -845,6 +1005,7 @@ def _approved_recovery(
     user = np.zeros(length, dtype=np.float32)
     mask = np.zeros(length, dtype=bool)
     result = OverlapRecovery(assistant, user, mask)
+    methods: set[str] = set()
     for record in catalog.overlap_recoveries(source_id):
         if (
             record["annotation_version"] != annotation.version
@@ -877,6 +1038,9 @@ def _approved_recovery(
         user[target_start:target_end] = user_audio[:, 0]
         mask[target_start:target_end] = True
         result.recovered_intervals.append((_seconds(left), _seconds(right)))
+        methods.add(str(record["details"].get("recovery_method", "unknown")))
+    if methods:
+        result.recovery_method = next(iter(methods)) if len(methods) == 1 else "mixed"
     return result if result.used else None
 
 
@@ -900,6 +1064,13 @@ def render_source_clips(
         raise ValueError("Finalize the human speaker regions before generating clips")
     if not annotation.aligned_words:
         raise ValueError("Align the Moshi transcript before generating clips")
+    if (
+        annotation.channel_routing_mode == "independent_stereo"
+        and not _independent_channel_routing_ready(paths, source_id, annotation)
+    ):
+        raise ValueError(
+            "Independent stereo routing must have a verified A/B channel map"
+        )
     output_root = (
         paths.source_root(source_id)
         / "clips"
@@ -914,12 +1085,6 @@ def render_source_clips(
             0.05 + 0.90 * index / max(1, len(plan.clips)),
             f"Rendering clip {index + 1} of {len(plan.clips)}",
         )
-        audio, sample_rate = read_audio_segment(
-            paths.canonical_audio(source_id),
-            _seconds(clip.start_sample),
-            _seconds(clip.end_sample),
-            SAMPLE_RATE,
-        )
         recovered = _approved_recovery(
             catalog,
             paths,
@@ -928,16 +1093,51 @@ def render_source_clips(
             clip.start_sample,
             clip.end_sample,
         )
-        rendered = render_stereo(
-            audio[:, 0],
-            sample_rate,
-            _seconds(clip.start_sample),
-            _seconds(clip.end_sample),
-            segments,
-            annotation.assistant_speaker,
-            config.audio.fade_ms,
-            segments,
-            recovered,
+        if _independent_channel_routing_ready(paths, source_id, annotation):
+            audio, sample_rate = read_audio_segment(
+                paths.canonical_channels(source_id),
+                _seconds(clip.start_sample),
+                _seconds(clip.end_sample),
+                SAMPLE_RATE,
+            )
+            rendered = render_independent_stereo(
+                audio,
+                sample_rate,
+                _seconds(clip.start_sample),
+                _seconds(clip.end_sample),
+                segments,
+                annotation.assistant_speaker,
+                dict(annotation.speaker_channel_map),
+                config.audio.fade_ms,
+                segments,
+                recovered,
+                config.separation.recovery_seam_ms,
+            )
+            mixture_reference = audio[:, 0] + audio[:, 1]
+        else:
+            audio, sample_rate = read_audio_segment(
+                paths.canonical_audio(source_id),
+                _seconds(clip.start_sample),
+                _seconds(clip.end_sample),
+                SAMPLE_RATE,
+            )
+            rendered = render_stereo(
+                audio[:, 0],
+                sample_rate,
+                _seconds(clip.start_sample),
+                _seconds(clip.end_sample),
+                segments,
+                annotation.assistant_speaker,
+                config.audio.fade_ms,
+                segments,
+                recovered,
+                config.separation.recovery_seam_ms,
+            )
+            mixture_reference = audio[:, 0]
+        reconstruction_mask = (
+            recovered.mask.copy()
+            if recovered is not None and recovered.used
+            else np.zeros(len(rendered.stereo), dtype=bool)
         )
         for exclusion in annotation.exclusions:
             left = max(clip.start_sample, exclusion.start_sample)
@@ -948,6 +1148,14 @@ def render_source_clips(
                     left - clip.start_sample : right - clip.start_sample
                 ] = False
                 rendered.user_mask[left - clip.start_sample : right - clip.start_sample] = False
+                reconstruction_mask[
+                    left - clip.start_sample : right - clip.start_sample
+                ] = False
+        reconstruction_error = mixture_reconstruction_error_db(
+            mixture_reference,
+            rendered.stereo,
+            reconstruction_mask,
+        )
         wav_path = output_root / f"{clip.id}.wav"
         json_path = output_root / f"{clip.id}.json"
         write_pcm16(wav_path, rendered.stereo, sample_rate)
@@ -974,6 +1182,9 @@ def render_source_clips(
             user_mask=rendered.user_mask,
             overlap_ratio=raw_overlap_ratio,
             separation_used=bool(recovered and recovered.used),
+            recovery_method=recovered.recovery_method if recovered else None,
+            routing_method=rendered.routing_method,
+            reconstruction_error_db=reconstruction_error,
             separation_coverage=separation_coverage,
             expected_duration=(clip.end_sample - clip.start_sample) / SAMPLE_RATE,
             total_words=len(payload["alignments"]),
@@ -990,6 +1201,8 @@ def render_source_clips(
                 "transcript": transcript_report,
                 "raw_overlap_ratio": raw_overlap_ratio,
                 "separation_used": bool(recovered and recovered.used),
+                "recovery_method": recovered.recovery_method if recovered else None,
+                "routing_method": rendered.routing_method,
             }
         )
     manifest = {

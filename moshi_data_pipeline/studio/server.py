@@ -346,6 +346,8 @@ def create_studio_app(
             return service.paths.resolve_relative(source["stored_path"])
         if kind == "canonical":
             return service.paths.canonical_audio(source_id)
+        if kind == "channels":
+            return service.paths.canonical_channels(source_id)
         if kind == "proxy":
             return service.paths.video_proxy(source_id)
         if kind == "peaks":
@@ -359,6 +361,7 @@ def create_studio_app(
             raise KeyError(kind)
         media_types = {
             "canonical": "audio/wav",
+            "channels": "audio/wav",
             "proxy": "video/mp4",
             "peaks": "application/json",
         }

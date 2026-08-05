@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -10,6 +11,7 @@ from scipy.signal import resample_poly
 
 from moshi_data_pipeline.audio.io import read_audio
 from moshi_data_pipeline.config import SeparationConfig
+from moshi_data_pipeline.model_revisions import resolve_model_revision
 from moshi_data_pipeline.models import SpeakerSegment
 from moshi_data_pipeline.speakers.overlap import merge_intervals, overlap_intervals
 
@@ -28,6 +30,8 @@ class OverlapRecovery:
     mask: np.ndarray
     recovered_intervals: list[tuple[float, float]] = field(default_factory=list)
     failures: list[dict[str, float | str]] = field(default_factory=list)
+    chunk_metrics: list[dict[str, object]] = field(default_factory=list)
+    recovery_method: str = "speechbrain_sepformer"
 
     @property
     def used(self) -> bool:
@@ -78,6 +82,7 @@ class SpeechBrainOverlapSeparator:
             import torch
             from speechbrain.inference.classifiers import EncoderClassifier
             from speechbrain.inference.separation import SepformerSeparation
+            from speechbrain.utils.fetching import FetchConfig
         except ImportError as exc:
             raise RuntimeError(
                 'Overlap separation requires the optional dependency: pip install -e ".[separation]"'
@@ -86,13 +91,33 @@ class SpeechBrainOverlapSeparator:
         self.config = config
         self.device = "cuda:0" if device == "cuda" else device
         self.torch = torch
+        token = os.environ.get("HF_TOKEN") or None
+        token_configured = bool(token)
+        self.model_revision = resolve_model_revision(
+            config.model,
+            config.model_revision,
+            token=token,
+        )
+        self.embedding_model_revision = resolve_model_revision(
+            config.embedding_model,
+            config.embedding_model_revision,
+            token=token,
+        )
         self.separator = SepformerSeparation.from_hparams(
             source=config.model,
             run_opts={"device": self.device},
+            fetch_config=FetchConfig(
+                revision=self.model_revision,
+                token=token_configured,
+            ),
         )
         self.encoder = EncoderClassifier.from_hparams(
             source=config.embedding_model,
             run_opts={"device": self.device},
+            fetch_config=FetchConfig(
+                revision=self.embedding_model_revision,
+                token=token_configured,
+            ),
         )
         self.assistant_speaker = assistant_speaker
         audio, self.sample_rate = read_audio(audio_path)
@@ -157,7 +182,7 @@ class SpeechBrainOverlapSeparator:
 
     def _assign_stems(
         self, stems: list[np.ndarray], sample_rate: int
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, object]] | None:
         speakers = sorted(self.prototypes)
         embeddings = [self._embedding(stem, sample_rate) for stem in stems]
         similarities = np.asarray(
@@ -181,7 +206,7 @@ class SpeechBrainOverlapSeparator:
             speakers[speaker_index]: stems[stem_index]
             for stem_index, speaker_index in enumerate(assignment)
         }
-        return (
+        assistant, user = (
             stems_by_speaker[self.assistant_speaker],
             next(
                 stem
@@ -189,6 +214,13 @@ class SpeechBrainOverlapSeparator:
                 if speaker != self.assistant_speaker
             ),
         )
+        return assistant, user, {
+            "speakers": speakers,
+            "similarities": similarities.tolist(),
+            "assignment": list(assignment),
+            "model_revision": self.model_revision,
+            "embedding_model_revision": self.embedding_model_revision,
+        }
 
     def recover_clip(
         self,
@@ -202,22 +234,32 @@ class SpeechBrainOverlapSeparator:
         user = np.zeros(length, dtype=np.float32)
         mask = np.zeros(length, dtype=bool)
         result = OverlapRecovery(assistant, user, mask)
+        assistant_sum = np.zeros(length, dtype=np.float64)
+        user_sum = np.zeros(length, dtype=np.float64)
+        weight_sum = np.zeros(length, dtype=np.float64)
         core_limit = max(
             0.5, self.config.max_window_seconds - 2 * self.config.context_seconds
+        )
+        crossfade = min(
+            self.config.chunk_crossfade_seconds,
+            max(0.0, core_limit / 2.0 - 1.0 / sample_rate),
         )
         clipped = [
             (max(clip_start, start), min(clip_end, end))
             for start, end in self.overlaps
             if end > clip_start and start < clip_end
         ]
-        cores: list[tuple[float, float]] = []
+        cores: list[tuple[float, float, float, float]] = []
         for start, end in merge_intervals(clipped):
             cursor = start
             while cursor < end:
                 core_end = min(end, cursor + core_limit)
-                cores.append((cursor, core_end))
-                cursor = core_end
-        for core_start, core_end in cores:
+                cores.append((cursor, core_end, start, end))
+                if core_end >= end:
+                    break
+                next_cursor = core_end - crossfade
+                cursor = next_cursor if next_cursor > cursor else core_end
+        for core_start, core_end, interval_start, interval_end in cores:
             window_start = max(clip_start, core_start - self.config.context_seconds)
             window_end = min(clip_end, core_end + self.config.context_seconds)
             first = round((window_start - clip_start) * sample_rate)
@@ -242,20 +284,92 @@ class SpeechBrainOverlapSeparator:
                     }
                 )
                 continue
-            assistant_stem, user_stem = assigned
+            assistant_stem, user_stem, identity = assigned
             core_first_in_window = round((core_start - window_start) * sample_rate)
             core_length = round((core_end - core_start) * sample_rate)
             output_first = round((core_start - clip_start) * sample_rate)
             output_last = min(length, output_first + core_length)
-            actual_length = output_last - output_first
-            assistant[output_first:output_last] = assistant_stem[
+            actual_length = min(
+                output_last - output_first,
+                len(assistant_stem) - core_first_in_window,
+                len(user_stem) - core_first_in_window,
+            )
+            if actual_length <= 0:
+                continue
+            output_last = output_first + actual_length
+            assistant_core = assistant_stem[
                 core_first_in_window : core_first_in_window + actual_length
-            ]
-            user[output_first:output_last] = user_stem[
+            ].astype(np.float64, copy=False)
+            user_core = user_stem[
                 core_first_in_window : core_first_in_window + actual_length
-            ]
-            mask[output_first:output_last] = True
-            result.recovered_intervals.append((core_start, core_end))
+            ].astype(np.float64, copy=False)
+            reference = mono[output_first:output_last].astype(np.float64, copy=False)
+            reconstructed = assistant_core + user_core
+            reference_rms = float(np.sqrt(np.mean(reference * reference)))
+            reconstructed_rms = float(np.sqrt(np.mean(reconstructed * reconstructed)))
+            gain = (
+                reference_rms / reconstructed_rms
+                if reconstructed_rms > 1e-8
+                else 1.0
+            )
+            gain = float(
+                np.clip(gain, self.config.minimum_gain, self.config.maximum_gain)
+            )
+            assistant_core = assistant_core * gain
+            user_core = user_core * gain
+            error_before = reference - (assistant_core + user_core)
+            reconstruction_error_before_db = 20.0 * float(
+                np.log10(
+                    max(float(np.sqrt(np.mean(error_before * error_before))), 1e-12)
+                    / max(reference_rms, 1e-12)
+                )
+            )
+            if self.config.mixture_consistency:
+                assistant_core += error_before * 0.5
+                user_core += error_before * 0.5
+            error_after = reference - (assistant_core + user_core)
+            reconstruction_error_after_db = 20.0 * float(
+                np.log10(
+                    max(float(np.sqrt(np.mean(error_after * error_after))), 1e-12)
+                    / max(reference_rms, 1e-12)
+                )
+            )
+            weights = np.ones(actual_length, dtype=np.float64)
+            crossfade_samples = min(round(crossfade * sample_rate), actual_length // 2)
+            if crossfade_samples and core_start > interval_start:
+                phase = np.linspace(0.0, np.pi / 2.0, crossfade_samples, endpoint=True)
+                weights[:crossfade_samples] *= np.square(np.sin(phase))
+            if crossfade_samples and core_end < interval_end:
+                phase = np.linspace(0.0, np.pi / 2.0, crossfade_samples, endpoint=True)
+                weights[-crossfade_samples:] *= np.square(np.cos(phase))
+            assistant_sum[output_first:output_last] += assistant_core * weights
+            user_sum[output_first:output_last] += user_core * weights
+            weight_sum[output_first:output_last] += weights
+            result.chunk_metrics.append(
+                {
+                    "start": core_start,
+                    "end": core_end,
+                    "gain": gain,
+                    "gain_db": 20.0 * float(np.log10(max(gain, 1e-8))),
+                    "reconstruction_error_before_db": reconstruction_error_before_db,
+                    "reconstruction_error_after_db": reconstruction_error_after_db,
+                    "identity": identity,
+                }
+            )
+        valid = weight_sum > 1e-8
+        assistant[valid] = (assistant_sum[valid] / weight_sum[valid]).astype(np.float32)
+        user[valid] = (user_sum[valid] / weight_sum[valid]).astype(np.float32)
+        mask[:] = valid
+        padded = np.pad(valid.astype(np.int8), (1, 1))
+        starts = np.flatnonzero(np.diff(padded) == 1)
+        ends = np.flatnonzero(np.diff(padded) == -1)
+        result.recovered_intervals = [
+            (
+                clip_start + start / sample_rate,
+                clip_start + end / sample_rate,
+            )
+            for start, end in zip(starts, ends, strict=True)
+        ]
         return result
 
 

@@ -340,6 +340,8 @@ def build_project_export(
                         "qc": artifact["qc"],
                         "raw_overlap_ratio": artifact["raw_overlap_ratio"],
                         "separation_used": artifact["separation_used"],
+                        "recovery_method": artifact.get("recovery_method"),
+                        "routing_method": artifact.get("routing_method"),
                     }
                 )
         train_records.sort(key=lambda item: item["path"])

@@ -107,6 +107,9 @@ class AnnotationDocument(BaseModel):
     source_id: str
     version: int = Field(default=0, ge=0)
     assistant_speaker: Speaker | None = None
+    channel_routing_mode: Literal["mono", "independent_stereo"] = "mono"
+    channel_routing_verified: bool = False
+    speaker_channel_map: dict[Speaker, int] = Field(default_factory=dict)
     activities_finalized: bool = False
     activities: list[ActivityRegion] = Field(default_factory=list)
     speaker_references: list[SpeakerReferenceRegion] = Field(default_factory=list)
@@ -114,6 +117,30 @@ class AnnotationDocument(BaseModel):
     transcript: list[TranscriptUtterance] = Field(default_factory=list)
     aligned_words: list[dict[str, Any]] = Field(default_factory=list)
     note: str = Field(default="", max_length=4_000)
+
+    @model_validator(mode="after")
+    def valid_channel_routing(self) -> AnnotationDocument:
+        if any(channel not in {0, 1} for channel in self.speaker_channel_map.values()):
+            raise ValueError("speaker channel indexes must be 0 or 1")
+        if self.speaker_channel_map and (
+            set(self.speaker_channel_map) != {"A", "B"}
+            or set(self.speaker_channel_map.values()) != {0, 1}
+        ):
+            raise ValueError("speaker_channel_map must map A and B to distinct stereo channels")
+        if (
+            self.channel_routing_mode == "independent_stereo"
+            and self.channel_routing_verified
+            and (
+                set(self.speaker_channel_map) != {"A", "B"}
+                or set(self.speaker_channel_map.values()) != {0, 1}
+            )
+        ):
+            raise ValueError(
+                "verified independent routing requires a complete A/B channel map"
+            )
+        if self.channel_routing_mode == "mono" and self.channel_routing_verified:
+            self.channel_routing_verified = False
+        return self
 
 
 class AnnotationSave(BaseModel):

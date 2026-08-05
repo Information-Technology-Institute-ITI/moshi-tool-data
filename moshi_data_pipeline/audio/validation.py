@@ -65,6 +65,9 @@ def validate_clip(
     unresolved_hallucinations: int = 0,
     separation_coverage: float = 0.0,
     separation_used: bool = False,
+    recovery_method: str | None = None,
+    routing_method: str | None = None,
+    reconstruction_error_db: float | None = None,
     expected_duration: float | None = None,
 ) -> QCResult:
     reasons: list[str] = []
@@ -109,6 +112,12 @@ def validate_clip(
         "separation_coverage": float(separation_coverage),
         "separation_used": bool(separation_used),
     }
+    if recovery_method is not None:
+        metrics["recovery_method"] = recovery_method
+    if routing_method is not None:
+        metrics["routing_method"] = routing_method
+    if reconstruction_error_db is not None:
+        metrics["mixture_reconstruction_error_db"] = reconstruction_error_db
     low_confidence_ratio = low_confidence_words / total_words if total_words else 0.0
     uncertain_assignment_ratio = (
         uncertain_word_assignments / total_words if total_words else 0.0
@@ -150,6 +159,11 @@ def validate_clip(
     metrics["unrecovered_overlap_ratio"] = unrecovered_overlap_ratio
     if separation_used:
         reasons.append("separated_overlap_requires_review")
+    if reconstruction_error_db is not None:
+        if reconstruction_error_db >= config.qc.reconstruction_reject_error_db:
+            reasons.append("mixture_reconstruction_error_above_reject_threshold")
+        elif reconstruction_error_db >= config.qc.reconstruction_review_error_db:
+            reasons.append("mixture_reconstruction_error_above_warning_threshold")
     if overlap_ratio > config.segmentation.max_overlap_ratio and separation_coverage < 0.95:
         reasons.append("overlap_separation_incomplete")
     elif unrecovered_overlap_ratio > config.segmentation.max_overlap_ratio:
@@ -186,6 +200,7 @@ def validate_clip(
         "clipping_ratio_above_reject_threshold",
         "overlap_ratio_above_reject_threshold",
         "overlap_separation_incomplete",
+        "mixture_reconstruction_error_above_reject_threshold",
         "low_confidence_ratio_above_reject_threshold",
         "uncertain_assignment_ratio_above_reject_threshold",
         "unresolved_transcript_hallucination",

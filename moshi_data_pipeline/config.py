@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -18,12 +18,39 @@ class AudioConfig(StrictModel):
     sample_rate: int = 24_000
     sample_width: int = 16
     fade_ms: float = 10.0
+    preserve_source_channels: bool = True
+
+
+class ChannelRoutingConfig(StrictModel):
+    mode: Literal["review", "mono"] = "review"
+    analysis_seconds: float = 300.0
+    activity_threshold_db: float = -48.0
+    dominance_db: float = 9.0
+    minimum_dominant_fraction: float = 0.05
+    maximum_absolute_correlation: float = 0.80
+    mapping_minimum_margin_db: float = 6.0
+
+    @model_validator(mode="after")
+    def routing_values_are_valid(self) -> ChannelRoutingConfig:
+        if self.analysis_seconds <= 0:
+            raise ValueError("channel routing analysis_seconds must be positive")
+        if self.dominance_db <= 0 or self.mapping_minimum_margin_db <= 0:
+            raise ValueError("channel routing margins must be positive")
+        if not 0 <= self.minimum_dominant_fraction <= 1:
+            raise ValueError("minimum_dominant_fraction must be between 0 and 1")
+        if not 0 <= self.maximum_absolute_correlation <= 1:
+            raise ValueError("maximum_absolute_correlation must be between 0 and 1")
+        return self
 
 
 class TranscriptionConfig(StrictModel):
     quality_profile: str = "balanced"
     model: str = "large-v3"
+    model_repository: str | None = None
+    model_revision: str | None = None
     review_model: str | None = None
+    review_model_repository: str | None = None
+    review_model_revision: str | None = None
     language: str = "ar"
     device: str = "auto"
     compute_type: str = "float16"
@@ -58,12 +85,14 @@ class TranscriptionConfig(StrictModel):
 
 class AlignmentConfig(StrictModel):
     backend: str = "whisperx"
-    model: str | None = None
+    model: str | None = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+    model_revision: str | None = None
     low_confidence_score: float = 0.40
 
 
 class DiarizationConfig(StrictModel):
     model: str = "pyannote/speaker-diarization-community-1"
+    model_revision: str | None = None
     min_speakers: int = 2
     max_speakers: int = 2
     min_assignment_overlap: float = 0.35
@@ -81,15 +110,39 @@ class DiarizationConfig(StrictModel):
 
 class SeparationConfig(StrictModel):
     enabled: bool = False
+    backend: Literal["speechbrain"] = "speechbrain"
     model: str = "speechbrain/sepformer-whamr16k"
+    model_revision: str | None = None
     embedding_model: str = "speechbrain/spkrec-ecapa-voxceleb"
+    embedding_model_revision: str | None = None
     sample_rate: int = 16_000
     context_seconds: float = 1.0
     max_window_seconds: float = 12.0
+    chunk_crossfade_seconds: float = 0.20
+    recovery_seam_ms: float = 20.0
+    minimum_gain: float = 0.25
+    maximum_gain: float = 4.0
+    mixture_consistency: bool = True
     enrollment_seconds: float = 30.0
     minimum_enrollment_turn: float = 1.5
     minimum_identity_similarity: float = 0.65
     minimum_identity_margin: float = 0.10
+
+    @model_validator(mode="after")
+    def separation_values_are_valid(self) -> SeparationConfig:
+        if (
+            self.context_seconds < 0
+            or self.max_window_seconds <= 0
+            or 2 * self.context_seconds >= self.max_window_seconds
+        ):
+            raise ValueError("separation context/window values are invalid")
+        if not 0 <= self.chunk_crossfade_seconds < self.max_window_seconds:
+            raise ValueError("chunk_crossfade_seconds must be inside the model window")
+        if self.recovery_seam_ms < 0:
+            raise ValueError("recovery_seam_ms must be non-negative")
+        if not 0 < self.minimum_gain <= self.maximum_gain:
+            raise ValueError("separation gain limits must satisfy 0 < minimum <= maximum")
+        return self
 
 
 class SegmentationConfig(StrictModel):
@@ -133,10 +186,20 @@ class QCConfig(StrictModel):
     clipping_review_ratio: float = 0.001
     clipping_reject_ratio: float = 0.01
     leakage_review_ratio: float = 0.25
+    reconstruction_review_error_db: float = -15.0
+    reconstruction_reject_error_db: float = -5.0
     low_confidence_review_ratio: float = 0.10
     low_confidence_reject_ratio: float = 0.35
     uncertain_assignment_review_ratio: float = 0.05
     uncertain_assignment_reject_ratio: float = 0.15
+
+    @model_validator(mode="after")
+    def reconstruction_thresholds_are_ordered(self) -> QCConfig:
+        if self.reconstruction_review_error_db >= self.reconstruction_reject_error_db:
+            raise ValueError(
+                "reconstruction review error must be below the reject error"
+            )
+        return self
 
 
 class ReviewConfig(StrictModel):
@@ -147,6 +210,7 @@ class ReviewConfig(StrictModel):
 
 class PipelineConfig(StrictModel):
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    channel_routing: ChannelRoutingConfig = Field(default_factory=ChannelRoutingConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     alignment: AlignmentConfig = Field(default_factory=AlignmentConfig)
     diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)

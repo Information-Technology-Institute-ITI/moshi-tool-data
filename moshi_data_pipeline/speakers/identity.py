@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from scipy.signal import resample_poly
 
 from moshi_data_pipeline.audio.io import read_audio
 from moshi_data_pipeline.config import SeparationConfig
+from moshi_data_pipeline.model_revisions import resolve_model_revision
 from moshi_data_pipeline.models import SpeakerSegment
 
 SAMPLE_RATE = 24_000
@@ -70,6 +72,7 @@ class SpeakerReferenceMatcher:
         try:
             import torch
             from speechbrain.inference.classifiers import EncoderClassifier
+            from speechbrain.utils.fetching import FetchConfig
         except ImportError as exc:
             raise RuntimeError(
                 'Stable speaker identity requires: pip install -e ".[separation]"'
@@ -77,9 +80,19 @@ class SpeakerReferenceMatcher:
         self.config = config
         self.torch = torch
         self.device = "cuda:0" if device == "cuda" else device
+        token = os.environ.get("HF_TOKEN") or None
+        self.embedding_model_revision = resolve_model_revision(
+            config.embedding_model,
+            config.embedding_model_revision,
+            token=token,
+        )
         self.encoder = EncoderClassifier.from_hparams(
             source=config.embedding_model,
             run_opts={"device": self.device},
+            fetch_config=FetchConfig(
+                revision=self.embedding_model_revision,
+                token=bool(token),
+            ),
         )
         audio, self.sample_rate = read_audio(audio_path)
         if self.sample_rate != SAMPLE_RATE:
@@ -143,5 +156,6 @@ class SpeakerReferenceMatcher:
             "mapping": mapping,
             "similarities": similarities,
             "embedding_model": self.config.embedding_model,
+            "embedding_model_revision": self.embedding_model_revision,
             "enrollment_seconds": collected,
         }

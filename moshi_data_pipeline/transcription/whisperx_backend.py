@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 from moshi_data_pipeline.config import TranscriptionConfig
 from moshi_data_pipeline.exceptions import DependencyError, ModelStageError
+from moshi_data_pipeline.model_revisions import snapshot_for_revision
 from moshi_data_pipeline.transcription.quality import (
     analyze_segment,
     normalized_disagreement,
@@ -17,6 +19,16 @@ from moshi_data_pipeline.transcription.quality import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def model_repository(config: TranscriptionConfig) -> str:
+    """Return the concrete faster-whisper repository behind a display model name."""
+    if config.model_repository:
+        return config.model_repository
+    candidate = Path(config.model)
+    if candidate.exists() or "/" in config.model:
+        return config.model
+    return f"Systran/faster-whisper-{config.model}"
 
 
 def _aggregate_average_log_probability(
@@ -109,16 +121,24 @@ class WhisperXTranscriber:
         device = resolve_device(config.device)
         model = None
         try:
+            repository = model_repository(config)
+            snapshot, model_revision = snapshot_for_revision(
+                repository,
+                config.model_revision,
+                token=os.environ.get("HF_TOKEN") or None,
+            )
             LOGGER.info(
-                "Loading WhisperX model=%s language=%s device=%s compute_type=%s batch_size=%d",
+                "Loading WhisperX model=%s revision=%s language=%s device=%s "
+                "compute_type=%s batch_size=%d",
                 config.model,
+                model_revision,
                 config.language,
                 device,
                 config.compute_type,
                 config.batch_size,
             )
             model = whisperx.load_model(
-                config.model,
+                str(snapshot),
                 device,
                 compute_type=config.compute_type,
                 language=config.language,
@@ -199,6 +219,8 @@ class WhisperXTranscriber:
                 segment["quality_flags"] = sorted(set(flags))
             result["requested_language"] = config.language
             result["model"] = config.model
+            result["model_repository"] = repository
+            result["model_revision"] = model_revision
             result["device"] = device
             result["compute_type"] = config.compute_type
             result["quality_profile"] = config.quality_profile

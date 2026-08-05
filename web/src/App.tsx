@@ -824,6 +824,109 @@ function Studio({
                 </label>
               </div>
             </section>
+            {detail.inspection?.channel_routing && (
+              <section className="card identity-lock">
+                <div>
+                  <span className="eyebrow">Channel-first routing</span>
+                  <h2>Preserve isolated source channels</h2>
+                  <p>
+                    The inspector recommends {detail.inspection.channel_routing.recommended_mode.replaceAll("_", " ")}.
+                    Independent routing is never enabled without your confirmation.
+                  </p>
+                  <div className="reason-list">
+                    <span>{detail.inspection.channel_routing.reason.replaceAll("_", " ")}</span>
+                    {detail.inspection.channel_routing.absolute_correlation !== undefined && (
+                      <span>correlation {detail.inspection.channel_routing.absolute_correlation.toFixed(3)}</span>
+                    )}
+                    {detail.inspection.channel_routing.estimated_lag_ms !== undefined && (
+                      <span>lag {detail.inspection.channel_routing.estimated_lag_ms.toFixed(2)} ms</span>
+                    )}
+                    {detail.inspection.channel_routing.dual_mono && <span>dual mono</span>}
+                  </div>
+                </div>
+                <label>
+                  Routing mode
+                  <select
+                    value={annotation.channel_routing_mode}
+                    onChange={(event) => {
+                      const mode = event.target.value as Annotation["channel_routing_mode"];
+                      edit({
+                        ...annotation,
+                        channel_routing_mode: mode,
+                        channel_routing_verified: false,
+                        speaker_channel_map: mode === "independent_stereo"
+                          ? {
+                              A: detail.inspection?.channel_routing
+                                ?.suggested_speaker_channel_map?.A ?? 0,
+                              B: detail.inspection?.channel_routing
+                                ?.suggested_speaker_channel_map?.B ?? 1,
+                            }
+                          : {},
+                      });
+                    }}
+                  >
+                    <option value="mono">Mixed/mono analysis</option>
+                    <option
+                      value="independent_stereo"
+                      disabled={
+                        !detail.urls.canonical_channels
+                        || detail.inspection?.channel_routing?.channel_count !== 2
+                      }
+                    >
+                      Independent stereo channels
+                    </option>
+                  </select>
+                </label>
+                {annotation.channel_routing_mode === "independent_stereo" && (
+                  <>
+                    <label>
+                      Speaker A channel
+                      <select
+                        value={annotation.speaker_channel_map.A ?? 0}
+                        onChange={(event) => {
+                          const channel = Number(event.target.value);
+                          edit({
+                            ...annotation,
+                            channel_routing_verified: false,
+                            speaker_channel_map: { A: channel, B: 1 - channel },
+                          });
+                        }}
+                      >
+                        <option value={0}>Channel 1 / left</option>
+                        <option value={1}>Channel 2 / right</option>
+                      </select>
+                    </label>
+                    <label>
+                      Speaker B channel
+                      <strong>
+                        {annotation.speaker_channel_map.B === 0
+                          ? "Channel 1 / left"
+                          : "Channel 2 / right"}
+                      </strong>
+                    </label>
+                    {detail.urls.canonical_channels && (
+                      <label className="wide">
+                        Preserved stereo preview
+                        <audio controls preload="metadata" src={detail.urls.canonical_channels} />
+                      </label>
+                    )}
+                    <label className="checkbox wide">
+                      <input
+                        type="checkbox"
+                        checked={annotation.channel_routing_verified}
+                        onChange={(event) =>
+                          edit({
+                            ...annotation,
+                            channel_routing_verified: event.target.checked,
+                          })
+                        }
+                      />
+                      I confirmed that A and B are isolated on the selected channels.
+                    </label>
+                  </>
+                )}
+              </section>
+            )}
             <section className="card identity-lock">
               <div>
                 <span className="eyebrow">Stable speaker identity</span>
@@ -1539,6 +1642,12 @@ function ClipReview({ detail, item, index, rendered, onReload, setError }: { det
             {Number(item.clip.metrics.exclusion_ratio) > 0 && <span>contains muted exclusions</span>}
             {item.raw_overlap_ratio > 0 && <span>contains overlap</span>}
             {item.separation_used && <span>approved overlap recovery used</span>}
+            {item.routing_method && (
+              <span>routing: {item.routing_method.replaceAll("_", " ")}</span>
+            )}
+            {item.recovery_method && (
+              <span>recovery: {item.recovery_method.replaceAll("_", " ")}</span>
+            )}
           </div>
           {!!item.transcript?.original_and_normalized.length && (
             <p className="clip-transcript" dir="rtl" lang="ar">

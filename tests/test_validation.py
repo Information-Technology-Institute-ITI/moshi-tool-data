@@ -58,3 +58,22 @@ def test_separated_overlap_always_requires_review(tmp_path) -> None:
     )
     assert result.status == QCStatus.REVIEW
     assert "separated_overlap_requires_review" in result.reasons
+
+
+def test_large_mixture_reconstruction_error_is_rejected(tmp_path) -> None:
+    wav_path = tmp_path / "clip.wav"
+    json_path = tmp_path / "clip.json"
+    audio = np.ones((24_000, 2), dtype=np.float32) * 0.02
+    write_pcm16(wav_path, audio, 24_000)
+    atomic_write_json(
+        json_path,
+        {"alignments": [["word", [0.1, 0.2], "SPEAKER_MAIN"]]},
+    )
+    result = validate_clip(
+        wav_path,
+        json_path,
+        PipelineConfig(),
+        reconstruction_error_db=-4.0,
+    )
+    assert result.status == QCStatus.REJECT
+    assert "mixture_reconstruction_error_above_reject_threshold" in result.reasons

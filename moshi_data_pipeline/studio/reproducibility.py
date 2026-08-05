@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from moshi_data_pipeline.config import PipelineConfig
+from moshi_data_pipeline.model_revisions import IMMUTABLE_REVISION
+from moshi_data_pipeline.transcription.whisperx_backend import model_repository
 
 _PACKAGES = (
     "moshi-data-pipeline",
@@ -42,9 +44,18 @@ def _package_versions() -> dict[str, str | None]:
     return values
 
 
-def _hf_revision(identifier: str, workspace: Path) -> str | None:
+def _hf_revision(
+    identifier: str,
+    workspace: Path,
+    requested_revision: str | None,
+) -> str | None:
+    if Path(identifier).exists():
+        return "local"
     if "/" not in identifier:
         return None
+    requested = requested_revision or "main"
+    if IMMUTABLE_REVISION.fullmatch(requested):
+        return requested.lower()
     repo_directory = f"models--{identifier.replace('/', '--')}"
     candidates: list[Path] = []
     explicit_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
@@ -60,7 +71,7 @@ def _hf_revision(identifier: str, workspace: Path) -> str | None:
         ]
     )
     for cache in candidates:
-        reference = cache / repo_directory / "refs" / "main"
+        reference = cache / repo_directory / "refs" / requested
         if reference.is_file():
             value = reference.read_text(encoding="utf-8").strip()
             if value:
@@ -94,26 +105,63 @@ def reproducibility_snapshot(
     output_files: list[Path],
 ) -> dict[str, Any]:
     packages = _package_versions()
+    review = config.transcription.model_copy(
+        update={
+            "model": config.transcription.review_model or config.transcription.model,
+            "model_repository": (
+                config.transcription.review_model_repository
+                if config.transcription.review_model
+                else config.transcription.model_repository
+            ),
+        }
+    )
     model_identifiers = {
-        "transcription": config.transcription.model,
-        "transcription_review": (
-            config.transcription.review_model or config.transcription.model
+        "transcription": (
+            config.transcription.model,
+            model_repository(config.transcription),
+            config.transcription.model_revision,
         ),
-        "alignment": config.alignment.model or "whisperx-language-default",
-        "diarization": config.diarization.model,
-        "separation": config.separation.model,
-        "speaker_embedding": config.separation.embedding_model,
+        "transcription_review": (
+            review.model,
+            model_repository(review),
+            config.transcription.review_model_revision
+            if config.transcription.review_model
+            else config.transcription.model_revision,
+        ),
+        "alignment": (
+            config.alignment.model or "whisperx-language-default",
+            config.alignment.model or "whisperx-language-default",
+            config.alignment.model_revision,
+        ),
+        "diarization": (
+            config.diarization.model,
+            config.diarization.model,
+            config.diarization.model_revision,
+        ),
+        "separation": (
+            config.separation.model,
+            config.separation.model,
+            config.separation.model_revision,
+        ),
+        "speaker_embedding": (
+            config.separation.embedding_model,
+            config.separation.embedding_model,
+            config.separation.embedding_model_revision,
+        ),
     }
     models = {}
-    for role, identifier in model_identifiers.items():
-        cache_identifier = _cache_identifier(role, identifier)
-        revision = _hf_revision(cache_identifier, workspace)
+    for role, (identifier, repository, requested_revision) in model_identifiers.items():
+        cache_identifier = _cache_identifier(role, repository)
+        revision = _hf_revision(cache_identifier, workspace, requested_revision)
         material = f"{role}\0{cache_identifier}\0{revision or 'unknown'}".encode()
         models[role] = {
             "identifier": identifier,
             "cache_identifier": cache_identifier,
-            "cached_revision": revision,
-            "revision_status": "resolved" if revision else "not_discoverable",
+            "requested_revision": requested_revision or "main",
+            "immutable_revision": revision,
+            "revision_status": (
+                "local" if revision == "local" else "resolved" if revision else "not_discoverable"
+            ),
             "descriptor_sha256": hashlib.sha256(material).hexdigest(),
         }
     return {

@@ -222,6 +222,40 @@ def extract_working_wav(source: Path, destination: Path, sample_rate: int = 24_0
             temporary.unlink()
 
 
+def extract_preserved_channels_wav(
+    source: Path,
+    destination: Path,
+    sample_rate: int = 24_000,
+) -> None:
+    """Decode the first audio stream without changing its channel layout."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.stem}.{os.getpid()}.tmp.wav")
+    try:
+        run_command(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(source),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ar",
+                str(sample_rate),
+                "-c:a",
+                "pcm_f32le",
+                str(temporary),
+            ],
+            tool="ffmpeg channel-preserving extraction",
+        )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def create_video_proxy(source: Path, destination: Path) -> None:
     """Create a browser-compatible review proxy while preserving source timing."""
     destination.parent.mkdir(parents=True, exist_ok=True)
