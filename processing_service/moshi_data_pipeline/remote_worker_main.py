@@ -1,3 +1,5 @@
+"""Entrypoint for the long-running remote processing worker."""
+
 from __future__ import annotations
 
 import logging

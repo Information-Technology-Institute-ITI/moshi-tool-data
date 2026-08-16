@@ -15,7 +15,11 @@ services:
     networks:
       - worker_private
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/api/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=4)
       interval: 10s
       timeout: 5s
       retries: 6
