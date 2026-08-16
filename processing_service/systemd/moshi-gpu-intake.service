@@ -14,8 +14,7 @@ Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/ubuntu/.config/moshi/gpu-intake.env
 EnvironmentFile=/home/ubuntu/.config/moshi/gpu-intake-token.env
 EnvironmentFile=/home/ubuntu/.config/moshi/huggingface.env
-EnvironmentFile=/home/ubuntu/.config/moshi/worker-token.env
-ExecStart=/home/ubuntu/moshi-tool-data/.venv/bin/python -m moshi_data_pipeline.gpu_intake_main
+ExecStart=/bin/bash -c 'set -a; . /home/ubuntu/.config/moshi/worker-token.env; set +a; exec /home/ubuntu/moshi-tool-data/.venv/bin/python -m moshi_data_pipeline.gpu_intake_main'
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=120s

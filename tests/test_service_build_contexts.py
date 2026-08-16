@@ -113,3 +113,15 @@ def test_root_compose_does_not_mount_web_data_into_worker() -> None:
     block = processing.group(1)
     assert "studio_workspace" not in block
     assert "worker_cache:/cache" in block
+
+
+def test_gpu_systemd_unit_sources_exported_callback_token() -> None:
+    unit = (
+        ROOT / "processing_service/systemd/moshi-gpu-intake.service"
+    ).read_text(encoding="utf-8")
+    token_file = "/home/ubuntu/.config/moshi/worker-token.env"
+
+    assert f"EnvironmentFile={token_file}" not in unit
+    assert f". {token_file}" in unit
+    assert "set -a" in unit
+    assert "set +a" in unit
