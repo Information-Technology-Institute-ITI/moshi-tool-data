@@ -6,6 +6,24 @@ from moshi_data_pipeline.studio.media import StudioPaths
 from moshi_data_pipeline.studio.server import create_studio_app
 
 
+def test_state_changes_reject_untrusted_browser_origins(tmp_path) -> None:
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    payload = {"name": "Origin test", "language": "ar"}
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/projects",
+            json=payload,
+            headers={"origin": "https://attacker.invalid"},
+        )
+        assert rejected.status_code == 403
+        accepted = client.post(
+            "/api/projects",
+            json=payload,
+            headers={"origin": "http://testserver"},
+        )
+        assert accepted.status_code == 201
+
+
 def test_studio_project_upload_rights_and_delete(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     with TestClient(app) as client:

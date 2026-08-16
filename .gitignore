@@ -15,3 +15,14 @@ web/node_modules/
 web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
+web_service/.venv/
+web_service/frontend/node_modules/
+processing_service/.venv/
+local_data/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example

@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moshi.local/schemas/worker-protocol-1.0.json",
+  "title": "Moshi worker protocol 1.0",
+  "type": "object",
+  "required": ["message_type", "body"],
+  "additionalProperties": false,
+  "properties": {
+    "message_type": {
+      "enum": [
+        "worker_heartbeat",
+        "claim_request",
+        "job_context",
+        "job_heartbeat",
+        "upload_create",
+        "job_completion",
+        "job_failure"
+      ]
+    },
+    "body": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"message_type": {"const": "worker_heartbeat"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/workerHeartbeat"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "claim_request"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/claimRequest"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "job_context"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/jobContext"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "job_heartbeat"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/jobHeartbeat"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "upload_create"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/uploadCreate"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "job_completion"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/jobCompletion"}}}
+    },
+    {
+      "if": {"properties": {"message_type": {"const": "job_failure"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/jobFailure"}}}
+    }
+  ],
+  "$defs": {
+    "protocolVersion": {"const": "1.0"},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "safeName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 180,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$"
+    },
+    "jobKind": {
+      "enum": [
+        "initialize",
+        "transcribe",
+        "review_transcript",
+        "rediarize",
+        "realign",
+        "recover_overlap",
+        "transcribe_overlap",
+        "generate",
+        "export"
+      ]
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "role", "sha256", "size_bytes", "media_type", "filename"],
+      "properties": {
+        "artifact_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "role": {"type": "string", "minLength": 1, "maxLength": 120},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "maxLength": 200},
+        "filename": {"$ref": "#/$defs/safeName"},
+        "project_id": {"type": ["string", "null"], "maxLength": 120},
+        "source_id": {"type": ["string", "null"], "maxLength": 120}
+      }
+    },
+    "workerHeartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version", "worker_id", "boot_id", "build_id",
+        "supported_kinds", "status"
+      ],
+      "properties": {
+        "protocol_version": {"type": "string", "maxLength": 20},
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "boot_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "build_id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "supported_kinds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/jobKind"}
+        },
+        "status": {"enum": ["ready", "busy", "draining", "incompatible", "idle", "offline"]},
+        "current_job_id": {"type": ["string", "null"], "maxLength": 120},
+        "details": {"type": "object"}
+      }
+    },
+    "claimRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "worker_id", "boot_id", "build_id", "supported_kinds"],
+      "properties": {
+        "protocol_version": {"type": "string", "maxLength": 20},
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "boot_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "build_id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "supported_kinds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/jobKind"}
+        }
+      }
+    },
+    "jobContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version", "job_id", "kind", "attempt", "lease_expires_at",
+        "input_fingerprint", "payload", "preconditions", "config", "inputs"
+      ],
+      "properties": {
+        "protocol_version": {"$ref": "#/$defs/protocolVersion"},
+        "job_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "kind": {"$ref": "#/$defs/jobKind"},
+        "attempt": {"type": "integer", "minimum": 1},
+        "lease_expires_at": {"type": "string", "format": "date-time"},
+        "input_fingerprint": {"$ref": "#/$defs/sha256"},
+        "payload": {"type": "object"},
+        "preconditions": {"type": "object"},
+        "config": {"type": "object"},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/artifactRef"}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "initialize"}}},
+          "then": {"properties": {"payload": {"required": ["mode"]}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "realign"}}},
+          "then": {"properties": {"payload": {"required": ["annotation_version"]}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "transcribe_overlap"}}},
+          "then": {"properties": {"payload": {"required": ["region_id"]}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "export"}}},
+          "then": {"properties": {"payload": {"required": ["export_id"]}}}
+        }
+      ]
+    },
+    "jobHeartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "progress": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "message": {"type": ["string", "null"], "maxLength": 1000}
+      }
+    },
+    "uploadCreate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "role", "sha256", "size_bytes", "media_type", "filename"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "role": {"type": "string", "minLength": 1, "maxLength": 120},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "maxLength": 200},
+        "filename": {"$ref": "#/$defs/safeName"}
+      }
+    },
+    "producedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["upload_id", "role", "sha256", "size_bytes", "media_type"],
+      "properties": {
+        "upload_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "role": {"type": "string", "minLength": 1, "maxLength": 120},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "media_type": {"type": "string", "maxLength": 200}
+      }
+    },
+    "jobCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "input_fingerprint", "kind", "result", "artifacts"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "input_fingerprint": {"$ref": "#/$defs/sha256"},
+        "kind": {"$ref": "#/$defs/jobKind"},
+        "result": {"type": "object"},
+        "artifacts": {"type": "array", "items": {"$ref": "#/$defs/producedArtifact"}}
+      }
+    },
+    "jobFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_id", "failure_class", "error", "retryable"],
+      "properties": {
+        "worker_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "failure_class": {"type": "string", "minLength": 1, "maxLength": 120},
+        "error": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "retryable": {"type": "boolean"}
+      }
+    }
+  }
+}

@@ -210,6 +210,30 @@ The site binds to loopback by default. Remote binding requires both a non-loopba
 `--host` and the explicit `--allow-remote` flag. Interactive API documentation is
 available at `http://127.0.0.1:8765/api/docs`.
 
+### Production two-service deployment
+
+Production separates the always-on catalog/web process from the on-demand GPU process. The web
+service is the only owner of SQLite and permanent workspace files. The processing service receives
+immutable typed job snapshots, downloads inputs through the authenticated internal API, and uploads
+checksum-verified artifacts before one atomic completion transaction makes them visible. It never
+mounts or opens the web workspace.
+
+The independent Docker build contexts are `web_service/` and `processing_service/`. For a local
+contract check, set a high-entropy `MOSHI_WORKER_TOKEN`, start the web service, and optionally enable
+the GPU profile:
+
+```powershell
+$env:MOSHI_WORKER_TOKEN = "replace-with-a-random-test-token"
+docker compose up --build web
+docker compose --profile gpu up --build
+```
+
+The AWS implementation, preflight, immutable image publishing flow, TLS cutover, backup restoration,
+and end-to-end acceptance procedure are documented in `deployment/README.md`. Terraform defaults to
+an always-on `t3.large` plus an intermittently running `g6.2xlarge`, with encrypted preserved data
+volumes and no inbound access to the GPU host. The exact implementation checklist and adopted v1
+deployment defaults are tracked in `PLAN.md`.
+
 ### Separation regression benchmark
 
 Keep a fixed set of real podcast mixtures, estimates, and—where available—clean
@@ -535,9 +559,11 @@ Run unit and integration tests plus static checks:
 ```powershell
 python -m pytest
 python -m ruff check .
-Set-Location web
+Set-Location web_service/frontend
 pnpm test
 pnpm run build
+docker compose config
+terraform -chdir=deployment/terraform validate
 ```
 
 The Python suite covers the existing pipeline plus channel classification and
@@ -557,7 +583,7 @@ moshi_data_pipeline/
 ├── segmentation/   # turn-window creation and rejection policy
 ├── output/         # official JSON, manifest, reports
 ├── review/         # loopback FastAPI server and offline browser UI
-├── studio/         # v3 catalog, API, durable worker, planning, export, React build
+├── studio/         # v3 catalog, lease API, lifecycle, planning, migration, export
 ├── schemas/        # JSON Schema documents
 ├── cache.py
 ├── cli.py
@@ -567,5 +593,6 @@ moshi_data_pipeline/
 └── synthetic.py
 ```
 
-The editable React/TypeScript source lives in `web/`; its production build is
-packaged under `moshi_data_pipeline/studio/static/` and served by FastAPI.
+The canonical editable React/TypeScript source for the production web image lives in
+`web_service/frontend/`; its production build is packaged under that service's
+`moshi_data_pipeline/studio/static/` directory and served by FastAPI.

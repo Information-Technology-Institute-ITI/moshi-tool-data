@@ -1,0 +1,51 @@
+name: moshi-two-service
+
+services:
+  web:
+    build:
+      context: ./web_service
+    environment:
+      MOSHI_WORKSPACE: /data/studio_workspace
+      MOSHI_WORKER_TOKEN: ${MOSHI_WORKER_TOKEN:?set MOSHI_WORKER_TOKEN}
+      MOSHI_DEPLOYMENT_GENERATION: ${MOSHI_BUILD_ID:-local}
+    volumes:
+      - ./local_data/studio_workspace:/data/studio_workspace
+    ports:
+      - "8765:8765"
+    networks:
+      - worker_private
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  processing:
+    profiles: ["gpu"]
+    build:
+      context: ./processing_service
+    environment:
+      MOSHI_WEB_INTERNAL_URL: http://web:8765
+      MOSHI_WORKER_TOKEN: ${MOSHI_WORKER_TOKEN:?set MOSHI_WORKER_TOKEN}
+      MOSHI_BUILD_ID: ${MOSHI_BUILD_ID:-local}
+      HF_TOKEN: ${HF_TOKEN:-}
+      MOSHI_WORKER_CACHE: /cache
+      HF_HOME: /cache/huggingface
+    volumes:
+      - ./local_data/worker_cache:/cache
+    networks:
+      - worker_private
+    depends_on:
+      web:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+networks:
+  worker_private:
+    driver: bridge

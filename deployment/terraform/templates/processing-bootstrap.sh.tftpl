@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec > >(tee /var/log/moshi-bootstrap.log | logger -t moshi-bootstrap -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y awscli docker.io
+systemctl enable --now docker
+command -v nvidia-smi >/dev/null || { echo "NVIDIA driver is unavailable"; exit 1; }
+command -v nvidia-ctk >/dev/null || { echo "NVIDIA Container Toolkit is unavailable"; exit 1; }
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+nvidia-smi
+
+volume_serial="$(printf '%s' '${cache_volume_id}' | tr -d '-')"
+device=""
+for attempt in $(seq 1 120); do
+  candidate="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${volume_serial}"
+  if [ -e "$${candidate}" ]; then
+    device="$${candidate}"
+    break
+  fi
+  device="$(lsblk -ndo PATH,SERIAL | awk -v serial="$${volume_serial}" '$2 == serial {print $1; exit}')"
+  [ -n "$${device}" ] && break
+  sleep 2
+done
+[ -n "$${device}" ] || { echo "Processing cache EBS volume did not appear"; exit 1; }
+
+if ! blkid "$${device}" >/dev/null 2>&1; then
+  mkfs.ext4 -L moshi-cache "$${device}"
+fi
+mkdir -p /cache
+volume_uuid="$(blkid -s UUID -o value "$${device}")"
+grep -q "UUID=$${volume_uuid} " /etc/fstab || \
+  printf 'UUID=%s /cache ext4 defaults,nofail 0 2\n' "$${volume_uuid}" >> /etc/fstab
+mountpoint -q /cache || mount /cache
+mkdir -p /cache/huggingface /cache/inputs /cache/attempts
+
+aws ecr get-login-password --region '${aws_region}' | \
+  docker login --username AWS --password-stdin '${registry_host}'
+worker_token="$(aws ssm get-parameter --region '${aws_region}' \
+  --name '${worker_token_parameter}' --with-decryption \
+  --query Parameter.Value --output text)"
+hf_token=""
+if [ -n '${hf_token_parameter_name}' ]; then
+  hf_token="$(aws ssm get-parameter --region '${aws_region}' \
+    --name '${hf_token_parameter_name}' --with-decryption \
+    --query Parameter.Value --output text)"
+fi
+
+umask 077
+printf 'MOSHI_WEB_INTERNAL_URL=${web_internal_url}\n' > /run/moshi-processing.env
+printf 'MOSHI_WORKER_TOKEN=%s\n' "$${worker_token}" >> /run/moshi-processing.env
+printf 'MOSHI_BUILD_ID=${image_tag}\n' >> /run/moshi-processing.env
+printf 'MOSHI_WORKER_CACHE=/cache\n' >> /run/moshi-processing.env
+printf 'HF_HOME=/cache/huggingface\n' >> /run/moshi-processing.env
+printf 'HF_TOKEN=%s\n' "$${hf_token}" >> /run/moshi-processing.env
+unset worker_token hf_token
+
+docker pull '${image}'
+docker rm -f moshi-processing >/dev/null 2>&1 || true
+docker run -d \
+  --name moshi-processing \
+  --restart unless-stopped \
+  --network host \
+  --gpus all \
+  --env-file /run/moshi-processing.env \
+  --volume /cache:/cache \
+  '${image}'
+
