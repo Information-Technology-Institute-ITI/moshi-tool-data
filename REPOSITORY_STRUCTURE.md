@@ -18,6 +18,7 @@ temporary execution state.
 | `compose.yaml` | Local two-service container composition and cache-volume wiring. It is not the EC2 production supervisor. |
 | `config.example.yaml` | Complete processing configuration with immutable model revisions. Do not silently change model settings between machines. |
 | `pyproject.toml` | Canonical Python package metadata, exact dependencies, tests, and lint configuration. |
+| `requirements.txt` | Generated pip-compatible GPU runtime export; regenerate from `uv.lock`, never edit it manually. |
 | `uv.lock` | Canonical reproducible Python dependency lock. |
 
 ## Tracked directories

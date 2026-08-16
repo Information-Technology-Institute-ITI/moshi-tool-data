@@ -22,6 +22,10 @@ Persist `/cache` on encrypted EBS. It holds the SHA-256 input cache and Hugging 
 model cache; per-attempt directories are disposable. The host requires the NVIDIA driver,
 Docker, and NVIDIA Container Toolkit.
 
+For the source-based Ubuntu deployment, the repository-root `requirements.txt` is generated from
+the frozen lock with the `ml`, `separation`, and `review` extras. `uv.lock` remains authoritative;
+do not hand-edit the requirements export or use `pip freeze` from a mutable environment.
+
 ```bash
 docker build -t moshi-processing ./processing_service
 docker run --rm --gpus all --network host \

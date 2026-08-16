@@ -1,6 +1,9 @@
 .venv/
 .downloads/
 .runtime/
+.cache/huggingface/
+huggingface/
+moshi-worker-cache/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

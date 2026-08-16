@@ -50,6 +50,41 @@ external dependencies, so unaligned words are reported, never timestamped by gue
 At load time, every Hugging Face model branch or tag is resolved to an immutable
 commit SHA and that SHA is recorded in stage output and exports.
 
+## Ubuntu GPU installation
+
+`uv.lock` is the canonical cross-platform dependency lock. The checked-in
+`requirements.txt` is a generated, pip-compatible export for the GPU runtime: it includes the
+`ml`, `separation`, and `review` extras, excludes development tools and the local project itself,
+and declares the CUDA 12.6 PyTorch wheel index. Do not edit it manually. Regenerate it after an
+intentional lock change with:
+
+```bash
+uv export --frozen --no-dev --extra ml --extra separation --extra review \
+  --no-emit-project --no-hashes --emit-index-url --format requirements.txt \
+  --output-file requirements.txt
+```
+
+Use this export with pip. Because the requirements format cannot preserve uv's per-package index
+pinning, uv users should install directly from the safer canonical lock with
+`uv sync --frozen --no-dev --extra ml --extra separation --extra review`.
+
+For a source deployment on Ubuntu with Python 3.11:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install --no-deps -e .
+```
+
+The EC2 GPU service does not store models in Git. Set `HF_HOME` to a persistent EBS path such as
+`/home/ubuntu/moshi-worker-cache/huggingface`. The pinned faster-whisper `large-v3` snapshot is
+`Systran/faster-whisper-large-v3` revision
+`edaa852ec7e145841d8ffdb056a99866b5f0a478`. On the current g4dn deployment it occupies about
+2.9 GiB under that external cache and has passed the CUDA functional check. The repository ignores
+`huggingface/`, `.cache/huggingface/`, and `moshi-worker-cache/` as defense in depth if a cache is
+accidentally created beneath the checkout. Never commit model weights, tokens, dispatch state,
+audio, or callback outbox data.
+
 ## Windows installation
 
 Create and activate an isolated environment:
