@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from moshi_data_pipeline.config import PipelineConfig, load_config
 from moshi_data_pipeline.studio.artifacts import UploadConflictError
 from moshi_data_pipeline.studio.catalog import (
     WORKER_PROTOCOL_VERSION,
+    GpuCheckRateLimitError,
     LeaseConflictError,
     ProtocolMismatchError,
     VersionConflictError,
@@ -28,6 +30,8 @@ from moshi_data_pipeline.studio.domain import (
     ProjectUpdate,
     SourceRights,
 )
+from moshi_data_pipeline.studio.gpu_dispatcher import GpuDispatcherSettings
+from moshi_data_pipeline.studio.gpu_status import public_gpu_check
 from moshi_data_pipeline.studio.lifecycle import LifecycleProvider
 from moshi_data_pipeline.studio.media import store_upload
 from moshi_data_pipeline.studio.protocol import (
@@ -51,6 +55,12 @@ def create_studio_app(
     lifecycle_provider: LifecycleProvider | None = None,
     deployment_generation: str = "local",
     metrics_publisher: Callable[[dict[str, Any]], None] | None = None,
+    gpu_dispatcher_settings: GpuDispatcherSettings | None = None,
+    gpu_dispatch_client: Any = None,
+    start_dispatcher: bool = True,
+    trusted_authenticated_user_header: str | None = None,
+    loopback_authenticated_user: str | None = None,
+    lifecycle_idle_seconds: int = 15 * 60,
 ):
     try:
         from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -74,6 +84,9 @@ def create_studio_app(
         deployment_generation=deployment_generation,
         enable_local_worker=start_worker,
         metrics_publisher=metrics_publisher,
+        gpu_dispatcher_settings=gpu_dispatcher_settings,
+        gpu_dispatch_client=gpu_dispatch_client,
+        lifecycle_idle_seconds=lifecycle_idle_seconds,
     )
     configured_worker_tokens = tuple(
         value
@@ -84,6 +97,54 @@ def create_studio_app(
         )
         if value
     )
+    worker_source_ips = {
+        value.strip()
+        for value in os.environ.get("MOSHI_WORKER_SOURCE_IPS", "").split(",")
+        if value.strip()
+    }
+    identity_header = (
+        trusted_authenticated_user_header
+        or os.environ.get("MOSHI_AUTHENTICATED_USER_HEADER", "")
+    ).strip()
+    if identity_header and not re.fullmatch(r"[A-Za-z0-9-]{1,80}", identity_header):
+        raise RuntimeError("MOSHI_AUTHENTICATED_USER_HEADER is invalid")
+    trust_proxy_identity = bool(
+        trusted_authenticated_user_header
+        or os.environ.get("MOSHI_TRUST_PROXY_AUTH", "").strip() == "1"
+    )
+    loopback_identity = (
+        loopback_authenticated_user
+        or os.environ.get("MOSHI_LOOPBACK_AUTHENTICATED_USER", "")
+    ).strip()
+    if (
+        len(loopback_identity) > 200
+        or any(ord(character) < 32 for character in loopback_identity)
+    ):
+        raise RuntimeError("MOSHI_LOOPBACK_AUTHENTICATED_USER is invalid")
+    trial_operator_ips: set[str] = set()
+    for value in os.environ.get("MOSHI_TRIAL_OPERATOR_IPS", "").split(","):
+        candidate = value.strip()
+        if not candidate:
+            continue
+        try:
+            trial_operator_ips.add(str(ipaddress.ip_address(candidate)))
+        except ValueError as exc:
+            raise RuntimeError(
+                "MOSHI_TRIAL_OPERATOR_IPS must contain exact IP addresses"
+            ) from exc
+    trial_operator_identity = os.environ.get(
+        "MOSHI_TRIAL_AUTHENTICATED_USER", ""
+    ).strip()
+    if bool(trial_operator_ips) != bool(trial_operator_identity):
+        raise RuntimeError(
+            "MOSHI_TRIAL_OPERATOR_IPS and MOSHI_TRIAL_AUTHENTICATED_USER "
+            "must be configured together"
+        )
+    if (
+        len(trial_operator_identity) > 200
+        or any(ord(character) < 32 for character in trial_operator_identity)
+    ):
+        raise RuntimeError("MOSHI_TRIAL_AUTHENTICATED_USER is invalid")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -91,9 +152,13 @@ def create_studio_app(
             service.worker.start()
         if start_lifecycle:
             service.lifecycle.start()
+        if start_dispatcher:
+            service.dispatcher.start()
         try:
             yield
         finally:
+            if start_dispatcher:
+                service.dispatcher.stop()
             if start_worker:
                 service.worker.stop()
             if start_lifecycle:
@@ -109,6 +174,13 @@ def create_studio_app(
 
     @app.middleware("http")
     async def enforce_trusted_origin(request: Request, call_next):
+        if request.url.path.startswith("/internal/v1/") and worker_source_ips:
+            source = request.client.host if request.client else ""
+            if source not in worker_source_ips:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Worker callback source is not allowed"},
+                )
         if (
             request.method not in {"GET", "HEAD", "OPTIONS"}
             and not request.url.path.startswith("/internal/")
@@ -121,10 +193,7 @@ def create_studio_app(
                     if value.strip()
                 }
                 if not configured:
-                    scheme = request.headers.get(
-                        "x-forwarded-proto", request.url.scheme
-                    ).split(",", 1)[0]
-                    configured = {f"{scheme}://{request.headers['host']}"}
+                    configured = {f"{request.url.scheme}://{request.headers['host']}"}
                 if origin.rstrip("/") not in configured:
                     return JSONResponse(
                         status_code=403,
@@ -162,6 +231,50 @@ def create_studio_app(
     async def upload_conflict_handler(_: Request, exc: UploadConflictError):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(GpuCheckRateLimitError)
+    async def gpu_check_rate_limit_handler(
+        _: Request, exc: GpuCheckRateLimitError
+    ):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": exc.reason},
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
+    def require_same_origin(request: Request) -> None:
+        origin = request.headers.get("origin")
+        if not origin:
+            raise HTTPException(status_code=403, detail="Origin is required")
+        configured = {
+            value.strip().rstrip("/")
+            for value in os.environ.get("MOSHI_TRUSTED_ORIGINS", "").split(",")
+            if value.strip()
+        }
+        if not configured:
+            configured = {f"{request.url.scheme}://{request.headers['host']}"}
+        if origin.rstrip("/") not in configured:
+            raise HTTPException(status_code=403, detail="Untrusted request origin")
+
+    def authenticated_user(request: Request) -> str:
+        source = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(source).is_loopback
+        except ValueError:
+            is_loopback = False
+        if loopback_identity and is_loopback:
+            return loopback_identity
+        if trial_operator_identity and source in trial_operator_ips:
+            return trial_operator_identity
+        if not trust_proxy_identity or not identity_header:
+            raise HTTPException(
+                status_code=503,
+                detail="Trusted website authentication identity is not configured",
+            )
+        value = request.headers.get(identity_header, "").strip()
+        if not value or len(value) > 200 or any(ord(character) < 32 for character in value):
+            raise HTTPException(status_code=401, detail="Authenticated user is required")
+        return value
+
     def require_worker_token(authorization: str | None) -> None:
         if not configured_worker_tokens:
             raise HTTPException(status_code=503, detail="Worker API is not configured")
@@ -191,7 +304,7 @@ def create_studio_app(
         authorization: str | None = Header(default=None),
     ):
         worker_auth(authorization)
-        return service.catalog.record_worker_state(
+        state = service.catalog.record_worker_state(
             payload.worker_id,
             boot_id=payload.boot_id,
             protocol_version=payload.protocol_version,
@@ -201,6 +314,9 @@ def create_studio_app(
             current_job_id=payload.current_job_id,
             details=payload.details,
         )
+        service.lifecycle.wake()
+        service.dispatcher.wake()
+        return state
 
     @app.post("/internal/v1/jobs/claim")
     def claim_remote_job(
@@ -430,7 +546,7 @@ def create_studio_app(
         x_lease_token: str | None = Header(default=None),
     ):
         worker_auth(authorization)
-        return service.complete_remote_job(
+        job = service.complete_remote_job(
             job_id,
             payload.worker_id,
             require_lease_token(x_lease_token),
@@ -439,6 +555,9 @@ def create_studio_app(
             result_value=payload.result,
             produced_artifacts=payload.artifacts,
         )
+        service.lifecycle.wake()
+        service.dispatcher.wake()
+        return job
 
     @app.post("/internal/v1/jobs/{job_id}/fail")
     def fail_remote_job(
@@ -448,7 +567,7 @@ def create_studio_app(
         x_lease_token: str | None = Header(default=None),
     ):
         worker_auth(authorization)
-        return service.catalog.fail_leased_job(
+        job = service.catalog.fail_leased_job(
             job_id,
             payload.worker_id,
             require_lease_token(x_lease_token),
@@ -456,6 +575,9 @@ def create_studio_app(
             failure_class=payload.failure_class,
             retryable=payload.retryable,
         )
+        service.lifecycle.wake()
+        service.dispatcher.wake()
+        return job
 
     @app.get("/api/health")
     def health():
@@ -474,6 +596,35 @@ def create_studio_app(
     @app.post("/api/system/worker/retry-startup", status_code=202)
     def retry_worker_startup():
         return service.lifecycle.retry_blocked()
+
+    @app.get("/api/system/gpu")
+    def gpu_status():
+        return service.gpu_status()
+
+    @app.get("/api/system/gpu/checks")
+    def gpu_check_history(limit: int = 10):
+        return {
+            "checks": [
+                public_gpu_check(check)
+                for check in service.catalog.list_gpu_checks(limit=limit)
+            ]
+        }
+
+    @app.post("/api/system/gpu/checks")
+    def trigger_gpu_check(request: Request):
+        require_same_origin(request)
+        user = authenticated_user(request)
+        if service.gpu_settings is None:
+            raise HTTPException(status_code=503, detail="GPU push dispatch is not configured")
+        check, created = service.request_gpu_check(user)
+        return JSONResponse(
+            status_code=202 if created else 200,
+            content={
+                "check": check,
+                "created": created,
+                "cost_notice": "Starting a stopped GPU incurs cost.",
+            },
+        )
 
     @app.get("/api/projects")
     def list_projects():
@@ -711,6 +862,8 @@ def create_studio_app(
                 status="queued",
             )
         service.worker.wake()
+        service.lifecycle.wake()
+        service.dispatcher.wake()
         return job
 
     @app.get("/api/jobs/{job_id}/events")
@@ -844,11 +997,15 @@ def create_studio_app(
 def serve_studio(
     workspace: Path,
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int | None = None,
     *,
     config_path: Path | None = None,
     allow_remote: bool = False,
 ) -> None:
+    if port is None:
+        from moshi_data_pipeline.studio.web_main import web_port_from_environment
+
+        port = web_port_from_environment()
     if host not in {"127.0.0.1", "localhost", "::1"} and not allow_remote:
         raise ValueError("Non-loopback studio hosting requires --allow-remote")
     try:

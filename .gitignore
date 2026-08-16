@@ -17,5 +17,6 @@ web/vite.config.js
 web/vite.config.d.ts
 web_service/.venv/
 web_service/frontend/node_modules/
+web_service/frontend/*.tsbuildinfo
 processing_service/.venv/
 local_data/

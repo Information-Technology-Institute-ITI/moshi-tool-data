@@ -2,8 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Region,
-    [string]$ProcessingInstanceType = "g6.2xlarge",
+    [Parameter(Mandatory = $true)]
+    [string]$ProcessingInstanceType,
     [string]$WorkerTokenParameter = "/moshi/worker-token",
+    [string]$DispatchTokenParameter = "/moshi/dispatch-token",
     [string]$HfTokenParameter = "",
     [string]$ProcessingAmiParameter = "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 )
@@ -67,6 +69,14 @@ if ($workerParameter.Parameter.Type -ne "SecureString") {
     throw "$WorkerTokenParameter must be an SSM SecureString."
 }
 
+$dispatchParameter = Invoke-AwsJson ssm get-parameter `
+    --region $Region `
+    --name $DispatchTokenParameter `
+    --output json
+if ($dispatchParameter.Parameter.Type -ne "SecureString") {
+    throw "$DispatchTokenParameter must be an SSM SecureString."
+}
+
 if ($HfTokenParameter) {
     $hfParameter = Invoke-AwsJson ssm get-parameter `
         --region $Region `
@@ -86,6 +96,7 @@ if ($HfTokenParameter) {
     AvailabilityZones = ($offerings.InstanceTypeOfferings.Location -join ", ")
     ProcessingAmi = $ami.Parameter.Value
     WorkerToken = "SecureString present"
+    DispatchToken = "SecureString present"
     HfToken = if ($HfTokenParameter) { "SecureString present" } else { "not configured" }
 } | Format-List
 

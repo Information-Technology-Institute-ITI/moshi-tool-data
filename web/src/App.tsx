@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, jsonRequest, seconds, watchJob } from "./api";
+import GpuStatusPage from "./components/GpuStatusPage";
 import JobProgress from "./components/JobProgress";
 import StereoPlayer from "./components/StereoPlayer";
 import WaveformEditor from "./components/WaveformEditor";
@@ -95,6 +96,7 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [page, setPage] = useState<"workspace" | "gpu">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
 
   useEffect(() => {
@@ -159,7 +161,9 @@ function App() {
     if (next) monitor(next);
   }
 
-  const view = source ? (
+  const view = page === "gpu" ? (
+    <GpuStatusPage />
+  ) : source ? (
     <Studio
       detail={source}
       project={project!}
@@ -189,6 +193,7 @@ function App() {
         <button
           className="brand"
           onClick={() => {
+            setPage("workspace");
             setProject(null);
             setSource(null);
           }}
@@ -199,9 +204,19 @@ function App() {
             <small>Human-guided full-duplex audio</small>
           </span>
         </button>
-        <div className="top-meta">
-          <span className="status-dot" />
-          Local workspace
+        <div className="top-actions">
+          <button
+            className={`system-nav ${page === "gpu" ? "active" : ""}`}
+            type="button"
+            aria-current={page === "gpu" ? "page" : undefined}
+            onClick={() => setPage("gpu")}
+          >
+            GPU status
+          </button>
+          <div className="top-meta">
+            <span className="status-dot" />
+            Local workspace
+          </div>
         </div>
       </header>
       {error && <div className="banner error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}

@@ -4,8 +4,22 @@ import os
 from pathlib import Path
 
 from moshi_data_pipeline.config import load_config
+from moshi_data_pipeline.studio.gpu_dispatcher import GpuDispatcherSettings
 from moshi_data_pipeline.studio.lifecycle import Ec2LifecycleProvider, LocalLifecycleProvider
 from moshi_data_pipeline.studio.server import create_studio_app
+
+
+def _positive_integer(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return parsed
 
 
 def build_app():
@@ -21,6 +35,7 @@ def build_app():
         if instance_id
         else LocalLifecycleProvider()
     )
+    dispatcher_settings = GpuDispatcherSettings.from_environment()
     return create_studio_app(
         workspace,
         load_config(config_path),
@@ -28,6 +43,8 @@ def build_app():
         start_lifecycle=True,
         lifecycle_provider=provider,
         deployment_generation=os.environ.get("MOSHI_DEPLOYMENT_GENERATION", "local"),
+        gpu_dispatcher_settings=dispatcher_settings,
+        lifecycle_idle_seconds=_positive_integer("MOSHI_GPU_IDLE_SECONDS", 15 * 60),
     )
 
 

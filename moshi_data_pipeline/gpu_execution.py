@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from moshi_data_pipeline.callback_contract import CALLBACK_PROTOCOL_VERSION
 from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
+from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS, JobContext
 from moshi_data_pipeline.remote_worker import (
     HttpWorkerApi,
     WorkerIdentity,
@@ -20,7 +22,6 @@ from moshi_data_pipeline.remote_worker import (
     sha256_file,
 )
 from moshi_data_pipeline.studio.execution_runtime import ContextJobExecutor, ExecutionOutput
-from moshi_data_pipeline.studio.protocol import JOB_KINDS, WORKER_PROTOCOL_VERSION, JobContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ def _safe_output_name(value: str, ordinal: int) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -184,8 +187,9 @@ class GpuJobRunner:
             destination = artifact_root / _safe_output_name(source.name, ordinal)
             os.replace(source, destination)
             destination.chmod(0o600)
-            with destination.open("rb") as stream:
-                os.fsync(stream.fileno())
+            if os.name != "nt":
+                with destination.open("rb") as stream:
+                    os.fsync(stream.fileno())
             persisted.append(
                 {
                     "role": artifact.role,
@@ -291,6 +295,7 @@ class GpuJobRunner:
             output = executor.execute(context, inputs, progress)
             if cancelled:
                 raise ExecutionCancelledError(cancelled[0])
+            progress(1.0, "GPU execution complete")
             self._persist_output(record, context, attempt_root, output)
             if auth_failed.is_set():
                 self.store.block_callback_auth(dispatch_id)
@@ -479,7 +484,7 @@ class GpuExecutionCoordinator:
             "callback_uploading",
         } else "idle"
         return {
-            "protocol_version": WORKER_PROTOCOL_VERSION,
+            "protocol_version": CALLBACK_PROTOCOL_VERSION,
             "worker_id": self.identity.worker_id,
             "boot_id": self.identity.boot_id,
             "build_id": self.identity.build_id,

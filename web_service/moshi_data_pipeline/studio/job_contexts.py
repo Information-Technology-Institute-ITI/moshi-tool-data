@@ -86,11 +86,20 @@ class JobContextBuilder:
                 )
             )
         else:
-            candidates.append(("source.canonical", self.paths.canonical_audio(source_id), None, None))
-            candidates.append(("source.channels", self.paths.canonical_channels(source_id), None, None))
+            candidates.append(
+                ("source.canonical", self.paths.canonical_audio(source_id), None, None)
+            )
+            candidates.append(
+                ("source.channels", self.paths.canonical_channels(source_id), None, None)
+            )
         if kind in {"realign", "review_transcript"}:
             candidates.append(
-                ("analysis.raw_transcript", self.paths.artifact(source_id, "raw_transcript.json"), None, None)
+                (
+                    "analysis.raw_transcript",
+                    self.paths.artifact(source_id, "raw_transcript.json"),
+                    None,
+                    None,
+                )
             )
         records = self.catalog.overlap_recoveries(source_id)
         if kind in {"transcribe_overlap", "generate", "export"}:
@@ -126,8 +135,7 @@ class JobContextBuilder:
                             )
                         )
         registered_by_role = {
-            str(item["role"]): item
-            for item in self.catalog.list_artifacts(source_id=source_id)
+            str(item["role"]): item for item in self.catalog.list_artifacts(source_id=source_id)
         }
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -152,7 +160,10 @@ class JobContextBuilder:
             relevant = (
                 role.startswith("source.")
                 or (kind in {"realign", "review_transcript"} and role.startswith("analysis."))
-                or (kind in {"transcribe_overlap", "generate", "export"} and role.startswith("overlap."))
+                or (
+                    kind in {"transcribe_overlap", "generate", "export"}
+                    and role.startswith("overlap.")
+                )
                 or (kind == "export" and role.startswith("clip."))
             )
             if relevant:
@@ -225,15 +236,22 @@ class JobContextBuilder:
                 )
                 artifacts.extend(self._source_inputs(kind, source))
             preconditions["sources"] = sources
-        artifact_snapshot = [
-            {
-                "artifact_id": value["id"],
-                "role": value["role"],
-                "sha256": value["sha256"],
-                "size_bytes": value["size_bytes"],
-            }
-            for value in artifacts
-        ]
+        artifact_snapshot = sorted(
+            (
+                {
+                    "artifact_id": value["id"],
+                    "role": value["role"],
+                    "sha256": value["sha256"],
+                    "size_bytes": value["size_bytes"],
+                    "media_type": value["media_type"],
+                    "filename": safe_filename(Path(str(value["relative_path"])).name),
+                    "project_id": value.get("project_id"),
+                    "source_id": value.get("source_id"),
+                }
+                for value in artifacts
+            ),
+            key=lambda value: str(value["artifact_id"]),
+        )
         preconditions["input_artifacts"] = artifact_snapshot
         fingerprint = canonical_sha256(
             {
@@ -247,29 +265,52 @@ class JobContextBuilder:
         return preconditions, artifacts, fingerprint
 
     def create_context(self, job: dict[str, Any]) -> JobContext:
-        artifact_ids = [
-            str(value["artifact_id"])
-            for value in job["preconditions"].get("input_artifacts", [])
-        ]
+        artifact_snapshots = sorted(
+            job["preconditions"].get("input_artifacts", []),
+            key=lambda value: str(value["artifact_id"]),
+        )
         inputs: list[ArtifactRef] = []
-        for artifact_id in artifact_ids:
+        for snapshot in artifact_snapshots:
+            artifact_id = str(snapshot["artifact_id"])
             artifact = self.catalog.get_artifact(artifact_id)
+            if artifact["state"] != "active":
+                raise ValueError("Job input artifact is no longer active")
+            expected_fields = {
+                "role": str(snapshot["role"]),
+                "sha256": str(snapshot["sha256"]),
+                "size_bytes": int(snapshot["size_bytes"]),
+            }
+            for optional in ("media_type", "project_id", "source_id"):
+                if optional in snapshot:
+                    expected_fields[optional] = snapshot[optional]
+            if any(artifact[key] != value for key, value in expected_fields.items()):
+                raise ValueError("Job input artifact metadata changed after enqueue")
+            path = self.paths.resolve_relative(str(artifact["relative_path"]))
+            if not path.is_file():
+                raise ValueError("Job input artifact is missing")
+            if path.stat().st_size != int(snapshot["size_bytes"]):
+                raise ValueError("Job input artifact size changed after enqueue")
+            if file_sha256(path) != str(snapshot["sha256"]):
+                raise ValueError("Job input artifact checksum changed after enqueue")
+            filename = str(snapshot.get("filename") or safe_filename(path.name))
+            if filename != safe_filename(path.name):
+                raise ValueError("Job input artifact filename changed after enqueue")
             inputs.append(
                 ArtifactRef(
                     artifact_id=artifact_id,
-                    role=str(artifact["role"]),
-                    sha256=str(artifact["sha256"]),
-                    size_bytes=int(artifact["size_bytes"]),
-                    media_type=str(artifact["media_type"]),
-                    filename=safe_filename(Path(str(artifact["relative_path"])).name),
+                    role=str(snapshot["role"]),
+                    sha256=str(snapshot["sha256"]),
+                    size_bytes=int(snapshot["size_bytes"]),
+                    media_type=str(snapshot.get("media_type") or artifact["media_type"]),
+                    filename=filename,
                     project_id=(
-                        str(artifact["project_id"])
-                        if artifact.get("project_id")
+                        str(snapshot.get("project_id") or artifact["project_id"])
+                        if snapshot.get("project_id") or artifact.get("project_id")
                         else None
                     ),
                     source_id=(
-                        str(artifact["source_id"])
-                        if artifact.get("source_id")
+                        str(snapshot.get("source_id") or artifact["source_id"])
+                        if snapshot.get("source_id") or artifact.get("source_id")
                         else None
                     ),
                 )
@@ -288,10 +329,41 @@ class JobContextBuilder:
         )
 
     def current_fingerprint(self, job: dict[str, Any]) -> str:
-        _, _, fingerprint = self.snapshot(
+        preconditions, _, fingerprint = self.snapshot(
             project_id=str(job["project_id"]),
             kind=str(job["kind"]),
             source_id=str(job["source_id"]) if job.get("source_id") else None,
             payload=dict(job["payload"]),
         )
+        frozen_inputs = job.get("preconditions", {}).get("input_artifacts", [])
+        if frozen_inputs:
+            frozen_keys = {str(value["artifact_id"]): set(value) for value in frozen_inputs}
+            current_inputs = preconditions.get("input_artifacts", [])
+            current_by_id = {
+                str(value["artifact_id"]): value for value in current_inputs
+            }
+            ordered_ids = [str(value["artifact_id"]) for value in frozen_inputs]
+            ordered_ids.extend(
+                str(value["artifact_id"])
+                for value in current_inputs
+                if str(value["artifact_id"]) not in frozen_keys
+            )
+            preconditions["input_artifacts"] = [
+                {
+                    key: value
+                    for key, value in current_by_id[artifact_id].items()
+                    if key in frozen_keys.get(artifact_id, set(current_by_id[artifact_id]))
+                }
+                for artifact_id in ordered_ids
+                if artifact_id in current_by_id
+            ]
+            fingerprint = canonical_sha256(
+                {
+                    "kind": str(job["kind"]),
+                    "project_id": str(job["project_id"]),
+                    "source_id": (str(job["source_id"]) if job.get("source_id") else None),
+                    "payload": dict(job["payload"]),
+                    "preconditions": preconditions,
+                }
+            )
         return fingerprint

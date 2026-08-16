@@ -362,17 +362,19 @@ def web_command(
     workspace: Path = typer.Option(Path("studio_workspace"), "--workspace"),
     config: Path | None = typer.Option(None, "--config", exists=True, dir_okay=False),
     host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8765, "--port", min=1, max=65_535),
+    port: int | None = typer.Option(None, "--port", min=1, max=65_535),
     allow_remote: bool = typer.Option(False, "--allow-remote"),
 ) -> None:
     """Start the local v3 upload, annotation, review, and export studio."""
     from moshi_data_pipeline.studio.server import serve_studio
+    from moshi_data_pipeline.studio.web_main import web_port_from_environment
 
     try:
+        resolved_port = port if port is not None else web_port_from_environment()
         serve_studio(
             workspace,
             host,
-            port,
+            resolved_port,
             config_path=config,
             allow_remote=allow_remote,
         )

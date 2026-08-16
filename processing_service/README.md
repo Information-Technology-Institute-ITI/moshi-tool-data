@@ -1,93 +1,124 @@
-# Moshi processing service
+# Moshi GPU processing service
 
-This is the independent CUDA build context. Two entrypoints coexist during the push-dispatch
-migration:
-
-- `python -m moshi_data_pipeline.remote_worker_main` is the existing protocol 1.0 pull worker.
-- `python -m moshi_data_pipeline.gpu_intake_main` is the protocol 2.0 private push intake.
-
-Run exactly one mode. The pull worker remains available for rollback until the m8i dispatcher has
-passed cold-start acceptance. The push service durably receives inputs, runs the existing job
-executor after validating the m8i lease, and retains a resumable callback outbox until m8i
-acknowledges completion.
-
-Required runtime variables:
-
-- `MOSHI_WEB_INTERNAL_URL`, for example `http://10.0.1.10:8765`.
-- `MOSHI_WORKER_TOKEN`, shared through SSM Parameter Store or Secrets Manager.
-- `MOSHI_BUILD_ID`, normally the deployed Git commit SHA.
-- `HF_TOKEN` for gated models.
-
-Persist `/cache` on encrypted EBS. It holds the SHA-256 input cache and Hugging Face
-model cache; per-attempt directories are disposable. The host requires the NVIDIA driver,
-Docker, and NVIDIA Container Toolkit.
-
-```bash
-docker build -t moshi-processing ./processing_service
-docker run --rm --gpus all --network host \
-  -e MOSHI_WEB_INTERNAL_URL=http://10.0.1.10:8765 \
-  -e MOSHI_WORKER_TOKEN=replace-with-the-same-random-secret \
-  -e MOSHI_BUILD_ID=$(git rev-parse HEAD) \
-  -e HF_TOKEN \
-  -v moshi-worker-cache:/cache \
-  moshi-processing
-```
-
-The image retains the legacy `python -m moshi_data_pipeline` CLI. The default container command
-remains the pull worker during this migration.
-
-## Private push intake (protocol 2.0)
-
-The intake listens on TCP 8766. Restrict the AWS security-group rule to the m8i security group and
-the host-firewall rule to the m8i private address. Never publish this port to the internet. Every
-`/internal/v2/*` request additionally requires a high-entropy `MOSHI_DISPATCH_TOKEN`; this is a
-different credential from the callback `MOSHI_WORKER_TOKEN`.
-
-Required variables:
-
-- `MOSHI_DISPATCH_TOKEN`, loaded from a mode-0600 environment file.
-- `MOSHI_WORKER_TOKEN`, the separate Bearer credential for callbacks to m8i.
-- `MOSHI_WEB_INTERNAL_URL=http://<m8i-private-ip>`; callbacks use m8i port 80 initially.
-- `MOSHI_BUILD_ID`, the exact immutable commit deployed on both machines.
-- `MOSHI_WORKER_CACHE=/home/ubuntu/moshi-worker-cache` for this source deployment.
-
-Optional variables include `MOSHI_DISPATCH_TOKEN_NEXT` for rotation,
-`MOSHI_GPU_INTAKE_PORT` (default 8766), `MOSHI_GPU_MAX_INPUT_BYTES` (default 20 GiB), and
-`MOSHI_GPU_MIN_FREE_BYTES` (default 10 GiB).
-
-Configure the functional check with `MOSHI_CONFIG` and `MOSHI_SELF_TEST_METADATA`. Both must be
-present or both absent. The metadata names a fixed local audio file, expected SHA-256, reference
-text, language, source, and license. `POST /internal/v2/self-checks` runs the exact configured
-WhisperX model on CUDA. Its pass is reused for the current host boot/build/model/fixture for six
-hours by default. The API stores CER, timings, model revision, GPU name, and output hash but never
-stores or returns the decoded or reference transcript. Manual forced checks have a ten-minute
-GPU-side cooldown; the m8i API will add per-user rate limits.
-
-The intake accepts a manifest only when protocol and build match exactly. It then accepts
-sequential `Content-Range` uploads, permits byte-identical retries, rejects gaps and conflicting
-replays, verifies the full SHA-256, and atomically promotes content into the persistent cache.
-One active dispatch is allowed. The fixed callback origin comes from the host environment and is
-never accepted from a request.
-
-After `start`, the service verifies a current functional pass and a recent authenticated callback
-heartbeat. It then validates the lease with m8i before touching the model. Interrupted execution is
-requeued on service restart. Successful outputs are moved atomically into the EBS outbox; failed
-jobs also create a durable callback record. Artifact upload IDs and offsets survive restart, and
-ambiguous completion responses are retried idempotently. HTTP 401 enters `auth_blocked` and stops
-retrying until an operator corrects the token and restarts the service. HTTP 409 fences out the old
-attempt. The GPU never writes or mounts m8i SQLite.
-
-Persistent files are rooted under `MOSHI_WORKER_CACHE`:
+This folder is the independent CUDA build context for g4dn. Push intake is the production mode:
 
 ```text
-state/dispatch.sqlite3       durable dispatch, input, and service state
-incoming/<dispatch>/*.part  resumable input transfers
-inputs/sha256/<prefix>/<sha> verified content-addressed inputs
-attempts/                    isolated, disposable active execution directories
-outbox/                      results retained until m8i acknowledges them
-logs/gpu-intake.log          intake process log (never contains credentials)
+python -m moshi_data_pipeline.gpu_intake_main
+systemd service: moshi-gpu-intake.service
+private intake: 172.31.26.80:8766
+callback origin: http://172.31.52.46
 ```
 
-The cache and state directories are mode 0700; the database, partial inputs, verified inputs, and
-logs are mode 0600. Use persistent encrypted EBS, not `/opt/dlami/nvme`. See
-`deployment/GPU_PUSH_WORKSTREAM.md` and the provided systemd unit for the source-host deployment.
+The legacy `remote_worker_main` protocol 1.0 pull process is rollback-only. Never run it at the
+same time as `gpu_intake_main`. The checked-in container command may remain pull-mode until an
+explicit container cutover; override it with `python -m moshi_data_pipeline.gpu_intake_main` for
+push testing. The source-host production service uses the checked-in systemd unit.
+
+## Trust boundary and credentials
+
+The GPU accepts m8i dispatch requests only on private TCP 8766. The security-group source must be
+the m8i security group and the host-firewall source must be `172.31.52.46`. Never publish this
+port to the internet.
+
+Every `/internal/v2/*` request requires `MOSHI_DISPATCH_TOKEN`. The GPU uses a different
+`MOSHI_WORKER_TOKEN` for callbacks to m8i `/internal/v1/*` on port 80. Protocol 2.0 dispatch and
+protocol 1.0 callback are independent contracts; do not give them a common version or token.
+
+Store both credentials in protected files or a managed secret store. Do not place them in unit
+files, command lines, source control, container layers, URLs, or logs. The dispatcher token supports
+a bounded rotation overlap through `MOSHI_DISPATCH_TOKEN_NEXT`.
+
+Port 80 is plaintext in the agreed initial topology. It does not protect audio, result artifacts,
+or Bearer credentials from network observation. HTTPS 443 or private TLS/mTLS is required
+hardening.
+
+## Push-mode configuration
+
+Required nonsecret values for the deployed service are:
+
+```dotenv
+MOSHI_WEB_INTERNAL_URL=http://172.31.52.46
+MOSHI_BUILD_ID=b86e2016dbc31058408dc7b3b3ac241397b8a828
+MOSHI_WORKER_CACHE=/home/ubuntu/moshi-worker-cache
+MOSHI_CONFIG=<absolute processing config path>
+MOSHI_SELF_TEST_METADATA=<absolute functional-fixture metadata path>
+```
+
+Separate protected files supply the names `MOSHI_DISPATCH_TOKEN`, `MOSHI_WORKER_TOKEN`, and, when
+required, `HF_TOKEN`; documentation and example files leave their values empty.
+
+`MOSHI_BUILD_ID` identifies the GPU deployable. It must equal m8i's
+`MOSHI_GPU_REQUIRED_BUILD_ID`; it must not be replaced with m8i's
+`MOSHI_DEPLOYMENT_GENERATION`.
+
+Optional settings include `MOSHI_GPU_INTAKE_PORT` (default 8766),
+`MOSHI_GPU_MAX_INPUT_BYTES` (default 20 GiB), `MOSHI_GPU_MIN_FREE_BYTES` (default 10 GiB),
+callback/job heartbeat intervals, and functional-check validity/cooldown settings.
+
+## Intake, execution, and restart behavior
+
+The protocol 2.0 intake provides unauthenticated liveness only at `GET /health/live`. Status,
+readiness, functional checks, dispatch creation, resumable input upload, start, and cancel are
+authenticated under `/internal/v2/*`.
+
+Receipt is at-least-once and idempotent:
+
+- an identical dispatch ID and manifest returns the durable receipt;
+- conflicting content for an existing ID returns 409;
+- uploads resume from `X-Accepted-Offset` and require `Content-Range`;
+- input SHA-256 is verified before start;
+- lost responses are reconciled with GET or HEAD, never by inventing a new attempt;
+- one dispatch executes at a time.
+
+Execution starts only after the exact protocol/build match, a current boot/build/model functional
+pass, a recent callback heartbeat, and validation of the m8i lease. Restarted running work is fenced
+through m8i before model execution resumes.
+
+Results remain in the persistent callback outbox until m8i acknowledges the typed, checksum-verified
+atomic commit. Callback 401 enters an authentication-blocked alarm and is not retried. Callback 409
+fences the obsolete attempt. The GPU never mounts or writes m8i SQLite.
+
+## Functional check
+
+The fixture is fixed licensed or synthetic audio on persistent encrypted EBS. It runs real CUDA
+WhisperX load and inference. A pass is reusable only for the same host boot, service boot, GPU build,
+dispatch protocol, model/config fingerprint, fixture hash, and check definition, and only until its
+validity deadline.
+
+Stored and returned health data includes bounded identifiers, CER, threshold, timing, GPU device,
+and sanitized failure details. It excludes transcripts, real user audio, private paths, raw stack
+traces, and credentials.
+
+## Persistent layout
+
+```text
+/home/ubuntu/moshi-worker-cache/
+  state/dispatch.sqlite3
+  state/self-check.sqlite3
+  incoming/
+  inputs/sha256/
+  attempts/
+  outbox/
+  huggingface/
+  self-test/v1/
+  logs/gpu-intake.log
+```
+
+Use encrypted persistent EBS with restrictive ownership and modes. Do not use
+`/opt/dlami/nvme` for state that must survive EC2 stop/start. Do not mount the m8i workspace.
+
+## Source-host service
+
+Review the repository and cache paths in
+`processing_service/systemd/moshi-gpu-intake.service`, then install it as
+`moshi-gpu-intake.service`. Load nonsecret settings and each protected credential from the
+separate files documented in `REPOSITORY_STRUCTURE.md`. Do not start the unit until any legacy
+pull worker is stopped and both private directions are verified.
+
+A bounded data-plane liveness check from m8i is:
+
+```powershell
+curl.exe --fail --silent --show-error --max-time 5 http://172.31.26.80:8766/health/live
+```
+
+Run authenticated readiness only from a secure terminal without echoing or logging the token.

@@ -228,3 +228,164 @@ export interface ProjectValidation {
     messages: string[];
   }[];
 }
+
+export type GpuTopLevelState =
+  | "OFF"
+  | "STARTING"
+  | "CHECKING"
+  | "READY"
+  | "BUSY"
+  | "DEGRADED"
+  | "INCOMPATIBLE"
+  | "BLOCKED"
+  | "ERROR"
+  | "BLOCKED/ERROR"
+  | "STOPPING"
+  | "UNKNOWN";
+
+export type GpuInstanceState =
+  | "pending"
+  | "running"
+  | "shutting-down"
+  | "terminated"
+  | "stopping"
+  | "stopped"
+  | "unknown";
+
+export type GpuDesiredState = "running" | "stopped" | "unknown";
+
+export type GpuServiceState =
+  | "offline"
+  | "starting"
+  | "online"
+  | "busy"
+  | "draining"
+  | "stale"
+  | "incompatible"
+  | "error"
+  | "unknown";
+
+export type GpuCheckStatus =
+  | "never"
+  | "requested"
+  | "queued"
+  | "starting"
+  | "waiting"
+  | "running"
+  | "passed"
+  | "failed"
+  | "timed_out"
+  | "stale"
+  | "cancelled";
+
+export type GpuCheckTrigger = "manual" | "job_preflight";
+
+export type GpuDispatcherState =
+  | "idle"
+  | "claimed"
+  | "prepared"
+  | "creating"
+  | "uploading"
+  | "starting"
+  | "accepted"
+  | "running"
+  | "completion_pending"
+  | "cancel_requested"
+  | "complete"
+  | "failed"
+  | "cancelled"
+  | "fenced"
+  | "blocked"
+  | "error"
+  | "unknown";
+
+export interface GpuCheck {
+  id: string;
+  gpu_check_id: string | null;
+  instance_id: string | null;
+  trigger: GpuCheckTrigger;
+  requested_by: string | null;
+  status: GpuCheckStatus;
+  requirement_key: string | null;
+  host_boot_id: string | null;
+  service_boot_id: string | null;
+  dispatch_protocol: string | null;
+  worker_protocol: string | null;
+  actual_build_id: string | null;
+  expected_build_id: string | null;
+  model_revision: string | null;
+  config_fingerprint: string | null;
+  fixture_id: string | null;
+  fixture_hash_prefix: string | null;
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  valid_until: string | null;
+  updated_at: string;
+  gpu_name: string | null;
+  device: string | null;
+  segment_count: number | null;
+  cer: number | null;
+  cer_threshold: number | null;
+  model_load_ms: number | null;
+  inference_ms: number | null;
+  total_ms: number | null;
+  failure_class: string | null;
+  failure_summary: string | null;
+}
+
+export interface GpuMachineStatus {
+  instance_id: string | null;
+  instance_state: GpuInstanceState;
+  desired_state: GpuDesiredState;
+  last_aws_observation: string | null;
+  observation_age_seconds: number | null;
+  last_transition_at: string | null;
+  last_error: string | null;
+  idle_stop_at: string | null;
+}
+
+export interface GpuServiceStatus {
+  state: GpuServiceState;
+  last_intake_observation: string | null;
+  observation_age_seconds: number | null;
+  last_worker_heartbeat: string | null;
+  worker_age_seconds: number | null;
+  current_job_id: string | null;
+  gpu_name: string | null;
+  dispatch_protocol_version: string | null;
+  expected_dispatch_protocol_version: string;
+  worker_protocol_version: string | null;
+  expected_worker_protocol_version: string;
+  build_id: string | null;
+  expected_build_id: string;
+  queue_count: number;
+  running_count: number;
+  accepting_dispatches: boolean;
+  callback_ready: boolean;
+  operational_ready: boolean;
+}
+
+export interface GpuDispatcherStatus {
+  state: GpuDispatcherState;
+  active_dispatch_id: string | null;
+  last_error: string | null;
+}
+
+export interface GpuSystemStatus {
+  state: GpuTopLevelState;
+  machine: GpuMachineStatus;
+  service: GpuServiceStatus;
+  functional_check: GpuCheck | null;
+  dispatcher: GpuDispatcherStatus;
+}
+
+export interface GpuCheckHistory {
+  checks: GpuCheck[];
+}
+
+export interface GpuCheckTriggerResult {
+  check: GpuCheck;
+  created: boolean;
+  cost_notice: string;
+}

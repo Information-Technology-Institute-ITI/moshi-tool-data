@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const rootDirectory = path.dirname(fileURLToPath(import.meta.url));
+const webPort = process.env.MOSHI_WEB_PORT || process.env.web_port;
+const backend = webPort ? `http://127.0.0.1:${webPort}` : undefined;
 
 export default defineConfig({
   plugins: [react()],
@@ -11,10 +13,10 @@ export default defineConfig({
     outDir: path.resolve(rootDirectory, "../moshi_data_pipeline/studio/static"),
     emptyOutDir: true,
   },
-  server: {
+  server: backend ? {
     proxy: {
-      "/api": "http://127.0.0.1:8765",
-      "/media": "http://127.0.0.1:8765",
+      "/api": backend,
+      "/media": backend,
     },
-  },
+  } : undefined,
 });

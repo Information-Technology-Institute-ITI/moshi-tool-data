@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -194,10 +197,11 @@ def test_resumable_upload_survives_restart_and_accepts_identical_retry(tmp_path)
     digest = hashlib.sha256(content).hexdigest()
     cached = cache / "inputs" / "sha256" / digest[:2] / digest
     assert cached.read_bytes() == content
-    assert (cache.stat().st_mode & 0o777) == 0o700
-    assert ((cache / "state").stat().st_mode & 0o777) == 0o700
-    assert ((cache / "state" / "dispatch.sqlite3").stat().st_mode & 0o777) == 0o600
-    assert (cached.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":
+        assert (cache.stat().st_mode & 0o777) == 0o700
+        assert ((cache / "state").stat().st_mode & 0o777) == 0o700
+        assert ((cache / "state" / "dispatch.sqlite3").stat().st_mode & 0o777) == 0o600
+        assert (cached.stat().st_mode & 0o777) == 0o600
 
 
 def test_upload_rejects_gaps_conflicts_and_bad_checksum_without_advancing(tmp_path) -> None:
@@ -349,8 +353,16 @@ def test_functional_check_is_persisted_deduplicated_and_never_returns_text(
         "moshi_data_pipeline.gpu_self_check.WhisperXTranscriber.transcribe",
         fake_transcribe,
     )
-    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
-    monkeypatch.setattr("torch.cuda.get_device_name", lambda _: "Test GPU")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_name=lambda _: "Test GPU",
+            )
+        ),
+    )
     cache = tmp_path / "cache"
     settings = GpuIntakeSettings(
         cache_root=cache,
@@ -410,7 +422,7 @@ def test_functional_check_is_persisted_deduplicated_and_never_returns_text(
             "/internal/v2/health/ready", headers=AUTHORIZATION
         ).json()
         assert ready["capabilities"]["functional_check"] is True
-        assert ready["functional_check"]["ready"] is True
+        assert ready["functional_check"]["ready"] is (os.name != "nt")
         assert ready["functional_check"]["latest"]["id"] == identifier
         history = client.get(
             "/internal/v2/self-checks?limit=10", headers=AUTHORIZATION

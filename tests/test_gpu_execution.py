@@ -7,9 +7,9 @@ from pathlib import Path
 from moshi_data_pipeline.gpu_dispatch_protocol import DispatchCreate, DispatchStart
 from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
 from moshi_data_pipeline.gpu_execution import GpuJobRunner, GpuOutboxSender
+from moshi_data_pipeline.gpu_job_protocol import ArtifactRef, JobContext
 from moshi_data_pipeline.remote_worker import WorkerIdentity, WorkerTransportError
 from moshi_data_pipeline.studio.execution_runtime import ExecutionOutput, ProducedFile
-from moshi_data_pipeline.studio.protocol import ArtifactRef, JobContext
 
 
 class FakeCallbackApi:

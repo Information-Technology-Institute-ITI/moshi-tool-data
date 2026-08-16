@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from moshi_data_pipeline.studio.catalog import LeaseConflictError, StudioCatalog
+from moshi_data_pipeline.studio.catalog import (
+    ArtifactUploadManifestConflictError,
+    LeaseConflictError,
+    StudioCatalog,
+)
 from moshi_data_pipeline.studio.media import StudioPaths, safe_filename
 from moshi_data_pipeline.studio.protocol import ProducedArtifact, UploadCreate
 
@@ -41,11 +45,29 @@ class ArtifactStore:
         *,
         ttl_hours: int = 24,
     ) -> dict[str, Any]:
-        self.catalog.assert_current_lease(job_id, payload.worker_id, lease_token)
+        job = self.catalog.assert_current_lease(job_id, payload.worker_id, lease_token)
+        now = datetime.now(UTC)
+        expired_staging: list[tuple[str, str]] = []
+        for existing in self.catalog.list_artifact_uploads(
+            job_id, attempt=int(job["attempt"])
+        ):
+            if existing["role"] != payload.role or existing["state"] not in {
+                "open",
+                "verified",
+            }:
+                continue
+            try:
+                expired = datetime.fromisoformat(str(existing["expires_at"])) <= now
+            except ValueError:
+                expired = False
+            if expired:
+                expired_staging.append(
+                    (str(existing["id"]), str(existing["staging_path"]))
+                )
         staging = self._staging_file(uuid4().hex)
         staging.parent.mkdir(parents=True, exist_ok=True)
         staging.touch(exist_ok=False)
-        expires_at = (datetime.now(UTC) + timedelta(hours=ttl_hours)).isoformat()
+        expires_at = (now + timedelta(hours=ttl_hours)).isoformat()
         try:
             upload = self.catalog.create_artifact_upload(
                 job_id,
@@ -59,17 +81,22 @@ class ArtifactStore:
                 filename=safe_filename(payload.filename),
                 expires_at=expires_at,
             )
-            if payload.size_bytes == 0:
+            for expired_id, expired_path in expired_staging:
+                if self.catalog.get_artifact_upload(expired_id)["state"] == "discarded":
+                    self.paths.resolve_relative(expired_path).unlink(missing_ok=True)
+            if self.paths.resolve_relative(str(upload["staging_path"])) != staging:
+                staging.unlink(missing_ok=True)
+            if payload.size_bytes == 0 and upload["state"] == "open":
                 empty_hash = hashlib.sha256(b"").hexdigest()
                 if payload.sha256 != empty_hash:
-                    self.catalog.update_artifact_upload(
-                        str(upload["id"]), state="discarded"
-                    )
+                    self.catalog.update_artifact_upload(str(upload["id"]), state="discarded")
                     raise ValueError("Empty upload checksum does not match")
-                upload = self.catalog.update_artifact_upload(
-                    str(upload["id"]), state="verified"
-                )
+                upload = self.catalog.update_artifact_upload(str(upload["id"]), state="verified")
             return upload
+        except ArtifactUploadManifestConflictError as exc:
+            if staging.exists():
+                staging.unlink()
+            raise UploadConflictError(str(exc)) from exc
         except Exception:
             if staging.exists():
                 staging.unlink()
@@ -82,19 +109,14 @@ class ArtifactStore:
         lease_token: str,
     ) -> dict[str, Any]:
         upload = self.catalog.get_artifact_upload(upload_id)
-        job = self.catalog.assert_current_lease(
-            str(upload["job_id"]), worker_id, lease_token
-        )
+        job = self.catalog.assert_current_lease(str(upload["job_id"]), worker_id, lease_token)
         if int(upload["attempt"]) != int(job["attempt"]):
             raise LeaseConflictError("Upload belongs to an obsolete attempt")
-        if (
-            upload["state"] not in {"committed", "discarded"}
-            and datetime.fromisoformat(str(upload["expires_at"])) <= datetime.now(UTC)
-        ):
+        if upload["state"] not in {"committed", "discarded"} and datetime.fromisoformat(
+            str(upload["expires_at"])
+        ) <= datetime.now(UTC):
             self.catalog.update_artifact_upload(upload_id, state="discarded")
-            self._staging_file(Path(str(upload["staging_path"])).stem).unlink(
-                missing_ok=True
-            )
+            self._staging_file(Path(str(upload["staging_path"])).stem).unlink(missing_ok=True)
             raise UploadConflictError("Upload has expired")
         return upload
 
@@ -215,11 +237,7 @@ class ArtifactStore:
             ):
                 raise ValueError("Completion artifact does not match its verified upload")
             selected.append((upload, item))
-        final_root = (
-            self.paths.worker_artifacts
-            / str(job["id"])
-            / f"attempt_{int(job['attempt'])}"
-        )
+        final_root = self.paths.worker_artifacts / str(job["id"]) / f"attempt_{int(job['attempt'])}"
         final_root.mkdir(parents=True, exist_ok=True)
         entries: list[dict[str, Any]] = []
         for upload, _ in selected:
@@ -237,9 +255,7 @@ class ArtifactStore:
                     "source_exists": source.exists(),
                 }
             )
-        commit = self.catalog.create_artifact_commit(
-            str(job["id"]), int(job["attempt"]), entries
-        )
+        commit = self.catalog.create_artifact_commit(str(job["id"]), int(job["attempt"]), entries)
         registered: list[dict[str, Any]] = []
         moved: list[tuple[Path, Path]] = []
         try:

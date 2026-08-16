@@ -26,8 +26,7 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     MOSHI_WORKSPACE=/data/studio_workspace
 
 VOLUME ["/data/studio_workspace"]
-EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=4)"
+  CMD python -c "import os, urllib.request; urllib.request.urlopen(f\"http://127.0.0.1:{os.environ['MOSHI_WEB_PORT']}/api/health\", timeout=4)"
 
-CMD ["uvicorn", "moshi_data_pipeline.studio.asgi:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "1", "--proxy-headers"]
+CMD ["python", "-m", "moshi_data_pipeline.studio.web_main"]

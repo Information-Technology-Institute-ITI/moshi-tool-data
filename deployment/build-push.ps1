@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern("^[A-Za-z0-9_.-]{7,128}$")]
-    [string]$ImageTag,
+    [string]$WebGeneration,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern("^[0-9a-f]{40}$")]
+    [string]$GpuBuildId,
     [Parameter(Mandatory = $true)]
     [string]$Region,
     [Parameter(Mandatory = $true)]
@@ -20,8 +23,8 @@ foreach ($command in @("aws", "docker")) {
         throw "$command is required and was not found in PATH."
     }
 }
-if ($ImageTag -eq "latest") {
-    throw "Use an immutable Git SHA or build ID, not latest."
+if ($WebGeneration -eq "latest" -or $GpuBuildId -eq "latest") {
+    throw "Use immutable deployment identifiers, not latest."
 }
 
 $WebRepository = $WebRepository.TrimEnd("/")
@@ -37,8 +40,8 @@ foreach ($registry in $registries) {
 }
 
 $repoRoot = (Resolve-Path "$PSScriptRoot/..").Path
-$webImage = "${WebRepository}:$ImageTag"
-$processingImage = "${ProcessingRepository}:$ImageTag"
+$webImage = "${WebRepository}:$WebGeneration"
+$processingImage = "${ProcessingRepository}:$GpuBuildId"
 
 docker build --pull --platform $Platform --tag $webImage "$repoRoot/web_service"
 if ($LASTEXITCODE -ne 0) { throw "Web image build failed." }
@@ -52,3 +55,5 @@ if ($LASTEXITCODE -ne 0) { throw "Processing image push failed." }
 
 Write-Host "Published $webImage"
 Write-Host "Published $processingImage"
+Write-Host "Configure MOSHI_DEPLOYMENT_GENERATION=$WebGeneration on m8i."
+Write-Host "Configure MOSHI_GPU_REQUIRED_BUILD_ID=$GpuBuildId on m8i and MOSHI_BUILD_ID=$GpuBuildId on g4dn."

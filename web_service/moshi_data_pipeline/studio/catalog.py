@@ -16,6 +16,20 @@ from moshi_data_pipeline.studio.domain import AnnotationDocument, ClipPlanDocume
 from moshi_data_pipeline.studio.migrations import apply_migrations
 
 WORKER_PROTOCOL_VERSION = "1.0"
+GPU_DISPATCH_PROTOCOL_VERSION = "2.0"
+GPU_CHECK_ACTIVE_STATES = ("requested", "starting", "waiting", "queued", "running")
+GPU_DISPATCH_ACTIVE_STATES = (
+    "claimed",
+    "prepared",
+    "creating",
+    "uploading",
+    "starting",
+    "accepted",
+    "running",
+    "completion_pending",
+    "cancel_requested",
+    "blocked",
+)
 
 
 def utc_now() -> str:
@@ -40,6 +54,17 @@ class LeaseConflictError(RuntimeError):
 
 class ProtocolMismatchError(RuntimeError):
     pass
+
+
+class ArtifactUploadManifestConflictError(RuntimeError):
+    pass
+
+
+class GpuCheckRateLimitError(RuntimeError):
+    def __init__(self, retry_after: int, reason: str) -> None:
+        self.retry_after = max(1, int(retry_after))
+        self.reason = reason
+        super().__init__(reason)
 
 
 class StudioCatalog:
@@ -67,9 +92,9 @@ class StudioCatalog:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         try:
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA busy_timeout = 30000")
             with connection:
                 yield connection
         finally:
@@ -189,8 +214,14 @@ class StudioCatalog:
             "CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at)",
         ]
         with self.connect() as connection:
-            for statement in statements:
-                connection.execute(statement)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    connection.execute(statement)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
             apply_migrations(connection)
             # Local in-process claims intentionally have no lease. They cannot survive
             # a process restart and are safe to recover. Remote claims retain valid leases.
@@ -239,16 +270,12 @@ class StudioCatalog:
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM projects WHERE id=?", (project_id,)
-            ).fetchone()
+            row = connection.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if row is None:
             raise KeyError(project_id)
         return dict(row)
 
-    def update_project(
-        self, project_id: str, *, name: str, language: str
-    ) -> dict[str, Any]:
+    def update_project(self, project_id: str, *, name: str, language: str) -> dict[str, Any]:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("Project name cannot be blank")
@@ -292,9 +319,7 @@ class StudioCatalog:
                     now,
                 ),
             )
-            connection.execute(
-                "UPDATE projects SET updated_at=? WHERE id=?", (now, project_id)
-            )
+            connection.execute("UPDATE projects SET updated_at=? WHERE id=?", (now, project_id))
         return self.get_source(source_id)
 
     def list_sources(self, project_id: str) -> list[dict[str, Any]]:
@@ -307,9 +332,7 @@ class StudioCatalog:
 
     def get_source(self, source_id: str) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM sources WHERE id=?", (source_id,)
-            ).fetchone()
+            row = connection.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
         if row is None:
             raise KeyError(source_id)
         return self._decode_source(dict(row))
@@ -416,9 +439,7 @@ class StudioCatalog:
                     f"Expected annotation version {expected_version}, current version is {current}"
                 )
             next_version = current + 1
-            value = annotation.model_copy(
-                update={"source_id": source_id, "version": next_version}
-            )
+            value = annotation.model_copy(update={"source_id": source_id, "version": next_version})
             now = utc_now()
             connection.execute(
                 """
@@ -437,9 +458,7 @@ class StudioCatalog:
             )
             connection.execute("DELETE FROM clip_plans WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
-            connection.execute(
-                "DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,)
-            )
+            connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
             connection.commit()
         return value
 
@@ -475,9 +494,7 @@ class StudioCatalog:
                 """,
                 (now, plan.source_id),
             )
-            connection.execute(
-                "DELETE FROM clip_decisions WHERE source_id=?", (plan.source_id,)
-            )
+            connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (plan.source_id,))
         return plan
 
     def get_clip_plan(self, source_id: str) -> ClipPlanDocument | None:
@@ -485,11 +502,7 @@ class StudioCatalog:
             row = connection.execute(
                 "SELECT plan_json FROM clip_plans WHERE source_id=?", (source_id,)
             ).fetchone()
-        return (
-            ClipPlanDocument.model_validate_json(row["plan_json"])
-            if row is not None
-            else None
-        )
+        return ClipPlanDocument.model_validate_json(row["plan_json"]) if row is not None else None
 
     def save_clip_decision(
         self, source_id: str, clip_id: str, decision: str, auditioned: bool
@@ -533,9 +546,7 @@ class StudioCatalog:
         self, source_id: str, annotation_version: int, records: list[dict[str, Any]]
     ) -> None:
         with self.connect() as connection:
-            connection.execute(
-                "DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,)
-            )
+            connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
             for record in records:
                 connection.execute(
                     """
@@ -565,9 +576,7 @@ class StudioCatalog:
                 """,
                 (utc_now(), source_id),
             )
-            connection.execute(
-                "DELETE FROM clip_decisions WHERE source_id=?", (source_id,)
-            )
+            connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
 
     def overlap_recoveries(self, source_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -608,13 +617,9 @@ class StudioCatalog:
                 """,
                 (utc_now(), source_id),
             )
-            connection.execute(
-                "DELETE FROM clip_decisions WHERE source_id=?", (source_id,)
-            )
+            connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
         return next(
-            value
-            for value in self.overlap_recoveries(source_id)
-            if value["region_id"] == region_id
+            value for value in self.overlap_recoveries(source_id) if value["region_id"] == region_id
         )
 
     def update_overlap_details(
@@ -634,9 +639,7 @@ class StudioCatalog:
             if cursor.rowcount != 1:
                 raise KeyError(region_id)
         return next(
-            value
-            for value in self.overlap_recoveries(source_id)
-            if value["region_id"] == region_id
+            value for value in self.overlap_recoveries(source_id) if value["region_id"] == region_id
         )
 
     def create_job(
@@ -673,7 +676,20 @@ class StudioCatalog:
             input_fingerprint = hashlib.sha256(canonical).hexdigest()
         if len(input_fingerprint) != 64:
             raise ValueError("input_fingerprint must be a SHA-256 hex digest")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE input_fingerprint=? AND project_id=? AND kind=?
+                    AND source_id IS ? AND status IN ('queued','running')
+                ORDER BY created_at,id LIMIT 1
+                """,
+                (input_fingerprint, project_id, kind, source_id),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return self._decode_job(dict(existing))
             connection.execute(
                 """
                 INSERT INTO jobs(
@@ -696,6 +712,7 @@ class StudioCatalog:
                     now,
                 ),
             )
+            connection.commit()
         return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> dict[str, Any]:
@@ -863,8 +880,7 @@ class StudioCatalog:
     ) -> dict[str, Any] | None:
         if protocol_version != WORKER_PROTOCOL_VERSION:
             raise ProtocolMismatchError(
-                f"Worker protocol {protocol_version} is incompatible with "
-                f"{WORKER_PROTOCOL_VERSION}"
+                f"Worker protocol {protocol_version} is incompatible with {WORKER_PROTOCOL_VERSION}"
             )
         if not worker_id.strip() or not worker_build_id.strip():
             raise ValueError("worker_id and worker_build_id are required")
@@ -1097,9 +1113,7 @@ class StudioCatalog:
                 )
                 connection.execute("DELETE FROM clip_plans WHERE source_id=?", (source_id,))
                 connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
-                connection.execute(
-                    "DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,)
-                )
+                connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
                 return value.version
 
             if kind == "initialize":
@@ -1154,9 +1168,7 @@ class StudioCatalog:
                 ).fetchone()
                 if row is None or int(row["active_annotation_version"]) != expected:
                     raise VersionConflictError("Recovery annotation revision changed")
-                connection.execute(
-                    "DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,)
-                )
+                connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
                 for record in mutation["recoveries"]:
                     connection.execute(
                         """
@@ -1200,10 +1212,8 @@ class StudioCatalog:
                     """,
                     (source_id, mutation["region_id"]),
                 ).fetchone()
-                if (
-                    row is None
-                    or int(row["annotation_version"])
-                    != int(mutation["expected_annotation_version"])
+                if row is None or int(row["annotation_version"]) != int(
+                    mutation["expected_annotation_version"]
                 ):
                     raise VersionConflictError("Overlap recovery revision changed")
                 details = _loads(row["details_json"], {})
@@ -1222,10 +1232,8 @@ class StudioCatalog:
                     "SELECT active_annotation_version FROM sources WHERE id=?",
                     (source_id,),
                 ).fetchone()
-                if (
-                    row is None
-                    or int(row["active_annotation_version"])
-                    != int(mutation["expected_annotation_version"])
+                if row is None or int(row["active_annotation_version"]) != int(
+                    mutation["expected_annotation_version"]
                 ):
                     raise VersionConflictError("Generation annotation revision changed")
                 connection.execute(
@@ -1341,9 +1349,7 @@ class StudioCatalog:
         clean_class = self._bounded_text(failure_class, 120)
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT * FROM jobs WHERE id=?", (job_id,)
-            ).fetchone()
+            existing = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if (
                 existing is not None
                 and existing["status"] == "failed"
@@ -1654,9 +1660,7 @@ class StudioCatalog:
 
     def get_lifecycle_state(self) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM lifecycle_state WHERE id=1"
-            ).fetchone()
+            row = connection.execute("SELECT * FROM lifecycle_state WHERE id=1").fetchone()
         if row is None:
             raise RuntimeError("Lifecycle state is not initialized")
         return dict(row)
@@ -1664,9 +1668,14 @@ class StudioCatalog:
     def update_lifecycle_state(self, **values: Any) -> dict[str, Any]:
         allowed = {
             "provider",
+            "instance_id",
             "instance_state",
             "desired_state",
             "last_transition_at",
+            "last_aws_observation_at",
+            "last_aws_error_at",
+            "draining",
+            "idle_stop_at",
             "startup_deadline",
             "recovery_count",
             "blocked_reason",
@@ -1684,6 +1693,1029 @@ class StudioCatalog:
                 tuple(updates.values()),
             )
         return self.get_lifecycle_state()
+
+    @staticmethod
+    def _decode_gpu_runtime_state(value: dict[str, Any]) -> dict[str, Any]:
+        for field in (
+            "draining",
+            "intake_reachable",
+            "callback_ready",
+            "functional_check_ready",
+            "operational_ready",
+            "accepting_dispatches",
+            "safe_to_stop",
+        ):
+            value[field] = bool(value[field])
+        value["details"] = _loads(value.pop("details_json"), {})
+        return value
+
+    def get_gpu_runtime_state(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM gpu_runtime_state WHERE id=1").fetchone()
+        if row is None:
+            raise RuntimeError("GPU runtime state is not initialized")
+        return self._decode_gpu_runtime_state(dict(row))
+
+    def update_gpu_runtime_state(self, **values: Any) -> dict[str, Any]:
+        allowed = {
+            "instance_id",
+            "instance_state",
+            "desired_state",
+            "draining",
+            "last_aws_observation_at",
+            "last_aws_error_at",
+            "last_aws_error",
+            "last_intake_observation_at",
+            "intake_reachable",
+            "intake_status",
+            "dispatch_protocol",
+            "worker_protocol",
+            "actual_build_id",
+            "expected_build_id",
+            "host_boot_id",
+            "service_boot_id",
+            "callback_ready",
+            "functional_check_ready",
+            "operational_ready",
+            "accepting_dispatches",
+            "safe_to_stop",
+            "current_dispatch_id",
+            "queued_count",
+            "running_count",
+            "last_worker_heartbeat_at",
+            "last_functional_check_at",
+            "last_transition_at",
+            "idle_stop_at",
+            "details",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unknown GPU runtime fields: {sorted(unknown)}")
+        updates: dict[str, Any] = {}
+        boolean_fields = {
+            "draining",
+            "intake_reachable",
+            "callback_ready",
+            "functional_check_ready",
+            "operational_ready",
+            "accepting_dispatches",
+            "safe_to_stop",
+        }
+        for key, value in values.items():
+            if key == "details":
+                updates["details_json"] = _json(value or {})
+            elif key in boolean_fields:
+                updates[key] = int(bool(value))
+            elif key in {"last_aws_error", "intake_status"}:
+                updates[key] = self._bounded_text(value, 1_000) if value else None
+            else:
+                updates[key] = value
+        updates["updated_at"] = self._now()
+        assignments = ",".join(f"{key}=?" for key in updates)
+        with self.connect() as connection:
+            connection.execute(
+                f"UPDATE gpu_runtime_state SET {assignments} WHERE id=1",
+                tuple(updates.values()),
+            )
+        return self.get_gpu_runtime_state()
+
+    def get_gpu_dispatch_leader(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM gpu_dispatch_leader WHERE id=1").fetchone()
+        if row is None:
+            raise RuntimeError("GPU dispatcher leadership is not initialized")
+        return dict(row)
+
+    def acquire_gpu_dispatch_leader(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: int = 30,
+    ) -> dict[str, Any] | None:
+        if not owner_id.strip():
+            raise ValueError("Leader owner_id is required")
+        if lease_seconds < 1:
+            raise ValueError("Leader lease must be positive")
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM gpu_dispatch_leader WHERE id=1").fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError("GPU dispatcher leadership is not initialized")
+            current_owner = row["owner_id"]
+            current_expiry = str(row["lease_expires_at"] or "")
+            if current_owner and current_owner != owner_id and current_expiry > now:
+                connection.commit()
+                return None
+            continuing = current_owner == owner_id and current_expiry > now
+            epoch = int(row["fencing_epoch"]) if continuing else int(row["fencing_epoch"]) + 1
+            acquired_at = str(row["acquired_at"]) if continuing else now
+            connection.execute(
+                """
+                UPDATE gpu_dispatch_leader
+                SET owner_id=?,fencing_epoch=?,acquired_at=?,heartbeat_at=?,
+                    lease_expires_at=?,updated_at=? WHERE id=1
+                """,
+                (owner_id, epoch, acquired_at, now, expires, now),
+            )
+            result = connection.execute("SELECT * FROM gpu_dispatch_leader WHERE id=1").fetchone()
+            connection.commit()
+        return dict(result)
+
+    def renew_gpu_dispatch_leader(
+        self,
+        owner_id: str,
+        epoch: int,
+        *,
+        lease_seconds: int = 30,
+    ) -> dict[str, Any]:
+        if lease_seconds < 1:
+            raise ValueError("Leader lease must be positive")
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE gpu_dispatch_leader
+                SET heartbeat_at=?,lease_expires_at=?,updated_at=?
+                WHERE id=1 AND owner_id=? AND fencing_epoch=?
+                    AND lease_expires_at>?
+                """,
+                (now, expires, now, owner_id, epoch, now),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise LeaseConflictError("GPU dispatcher leadership was fenced")
+            row = connection.execute("SELECT * FROM gpu_dispatch_leader WHERE id=1").fetchone()
+            connection.commit()
+        return dict(row)
+
+    def release_gpu_dispatch_leader(self, owner_id: str, epoch: int) -> bool:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE gpu_dispatch_leader
+                SET owner_id=NULL,acquired_at=NULL,heartbeat_at=NULL,
+                    lease_expires_at=NULL,updated_at=?
+                WHERE id=1 AND owner_id=? AND fencing_epoch=?
+                """,
+                (now, owner_id, epoch),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _decode_gpu_check(value: dict[str, Any]) -> dict[str, Any]:
+        value["cold_start"] = bool(value["cold_start"])
+        return value
+
+    def get_gpu_check(self, check_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM gpu_checks WHERE id=?", (check_id,)).fetchone()
+        if row is None:
+            raise KeyError(check_id)
+        return self._decode_gpu_check(dict(row))
+
+    def get_gpu_check_by_remote_id(self, gpu_check_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM gpu_checks WHERE gpu_check_id=?
+                ORDER BY requested_at DESC,id DESC LIMIT 1
+                """,
+                (gpu_check_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(gpu_check_id)
+        return self._decode_gpu_check(dict(row))
+
+    def active_gpu_check(self) -> dict[str, Any] | None:
+        placeholders = ",".join("?" for _ in GPU_CHECK_ACTIVE_STATES)
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM gpu_checks WHERE status IN ({placeholders})
+                ORDER BY requested_at,id LIMIT 1
+                """,
+                GPU_CHECK_ACTIVE_STATES,
+            ).fetchone()
+        return self._decode_gpu_check(dict(row)) if row is not None else None
+
+    def list_gpu_checks(self, limit: int = 10) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 100:
+            raise ValueError("GPU check history limit must be between 1 and 100")
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM gpu_checks ORDER BY requested_at DESC,id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._decode_gpu_check(dict(row)) for row in rows]
+
+    def request_gpu_check(
+        self,
+        trigger: str,
+        *,
+        requested_by: str | None = None,
+        instance_id: str | None = None,
+        cold_start: bool = False,
+        expected_build_id: str | None = None,
+        dispatch_protocol: str = GPU_DISPATCH_PROTOCOL_VERSION,
+        worker_protocol: str = WORKER_PROTOCOL_VERSION,
+    ) -> tuple[dict[str, Any], bool]:
+        if trigger not in {"manual", "job_preflight"}:
+            raise ValueError("GPU check trigger must be manual or job_preflight")
+        requester = requested_by.strip() if requested_by else None
+        if trigger == "manual" and not requester:
+            raise ValueError("Manual GPU checks require an authenticated requester")
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        placeholders = ",".join("?" for _ in GPU_CHECK_ACTIVE_STATES)
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                f"""
+                SELECT * FROM gpu_checks WHERE status IN ({placeholders})
+                ORDER BY requested_at,id LIMIT 1
+                """,
+                GPU_CHECK_ACTIVE_STATES,
+            ).fetchone()
+            if active is not None:
+                connection.commit()
+                return self._decode_gpu_check(dict(active)), False
+            if trigger == "manual":
+                latest = connection.execute(
+                    """
+                    SELECT requested_at FROM gpu_checks
+                    WHERE trigger='manual' AND requested_by=?
+                    ORDER BY requested_at DESC LIMIT 1
+                    """,
+                    (requester,),
+                ).fetchone()
+                if latest is not None:
+                    available = datetime.fromisoformat(str(latest["requested_at"])) + timedelta(
+                        minutes=10
+                    )
+                    if available > now_dt:
+                        retry = int((available - now_dt).total_seconds()) + 1
+                        connection.rollback()
+                        raise GpuCheckRateLimitError(retry, "Manual GPU check cooldown")
+                hour_cutoff = (now_dt - timedelta(hours=1)).isoformat()
+                recent = connection.execute(
+                    """
+                    SELECT requested_at FROM gpu_checks
+                    WHERE trigger='manual' AND requested_by=? AND requested_at>?
+                    ORDER BY requested_at
+                    """,
+                    (requester, hour_cutoff),
+                ).fetchall()
+                if len(recent) >= 3:
+                    available = datetime.fromisoformat(str(recent[0]["requested_at"])) + timedelta(
+                        hours=1
+                    )
+                    retry = int((available - now_dt).total_seconds()) + 1
+                    connection.rollback()
+                    raise GpuCheckRateLimitError(retry, "Manual GPU check hourly limit")
+                if cold_start:
+                    latest_cold = connection.execute(
+                        """
+                        SELECT requested_at FROM gpu_checks
+                        WHERE trigger='manual' AND cold_start=1
+                        ORDER BY requested_at DESC LIMIT 1
+                        """
+                    ).fetchone()
+                    if latest_cold is not None:
+                        available = datetime.fromisoformat(
+                            str(latest_cold["requested_at"])
+                        ) + timedelta(minutes=30)
+                        if available > now_dt:
+                            retry = int((available - now_dt).total_seconds()) + 1
+                            connection.rollback()
+                            raise GpuCheckRateLimitError(retry, "Manual GPU cold-start cooldown")
+            check_id = new_id("gpucheck")
+            connection.execute(
+                """
+                INSERT INTO gpu_checks(
+                    id,instance_id,trigger,requested_by,cold_start,status,
+                    dispatch_protocol,worker_protocol,expected_build_id,
+                    requested_at,updated_at
+                ) VALUES(?,?,?,?,?,'requested',?,?,?,?,?)
+                """,
+                (
+                    check_id,
+                    instance_id,
+                    trigger,
+                    requester,
+                    int(cold_start),
+                    dispatch_protocol,
+                    worker_protocol,
+                    expected_build_id,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM gpu_checks WHERE id=?", (check_id,)).fetchone()
+            connection.commit()
+        return self._decode_gpu_check(dict(row)), True
+
+    def update_gpu_check(self, check_id: str, **values: Any) -> dict[str, Any]:
+        allowed = {
+            "gpu_check_id",
+            "instance_id",
+            "status",
+            "requirement_key",
+            "host_boot_id",
+            "service_boot_id",
+            "dispatch_protocol",
+            "worker_protocol",
+            "actual_build_id",
+            "expected_build_id",
+            "model_revision",
+            "config_fingerprint",
+            "fixture_id",
+            "fixture_hash_prefix",
+            "started_at",
+            "finished_at",
+            "valid_until",
+            "gpu_name",
+            "device",
+            "segment_count",
+            "cer",
+            "cer_threshold",
+            "model_load_ms",
+            "inference_ms",
+            "total_ms",
+            "failure_class",
+            "failure_summary",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unknown GPU check fields: {sorted(unknown)}")
+        updates = dict(values)
+        for field, limit in (("failure_class", 120), ("failure_summary", 1_000)):
+            if field in updates:
+                updates[field] = (
+                    self._bounded_text(updates[field], limit) if updates[field] else None
+                )
+        updates["updated_at"] = self._now()
+        assignments = ",".join(f"{key}=?" for key in updates)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE gpu_checks SET {assignments} WHERE id=?",
+                (*updates.values(), check_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(check_id)
+        return self.get_gpu_check(check_id)
+
+    @staticmethod
+    def _decode_gpu_dispatch(value: dict[str, Any]) -> dict[str, Any]:
+        value["manifest"] = _loads(value.pop("manifest_json"), None)
+        value["context"] = _loads(value.pop("context_json"), None)
+        return value
+
+    @staticmethod
+    def _stable_gpu_dispatch_id(job_id: str, attempt: int) -> str:
+        digest = hashlib.sha256(f"{job_id}\0{attempt}".encode()).hexdigest()
+        return f"gpu:{digest}"
+
+    def _assert_gpu_leader(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: str,
+        epoch: int,
+        now: str,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM gpu_dispatch_leader
+            WHERE id=1 AND owner_id=? AND fencing_epoch=? AND lease_expires_at>?
+            """,
+            (owner_id, epoch, now),
+        ).fetchone()
+        if row is None:
+            raise LeaseConflictError("GPU dispatcher leadership was fenced")
+
+    def claim_job_for_gpu_dispatch(
+        self,
+        worker_id: str,
+        *,
+        protocol_version: str,
+        worker_build_id: str,
+        token_factory: Callable[[str, int], str],
+        required_build_id: str,
+        dispatch_protocol: str = GPU_DISPATCH_PROTOCOL_VERSION,
+        supported_kinds: Sequence[str] | None = None,
+        lease_seconds: int = 120,
+        leader_owner_id: str | None = None,
+        leader_epoch: int | None = None,
+    ) -> dict[str, Any] | None:
+        if protocol_version != WORKER_PROTOCOL_VERSION:
+            raise ProtocolMismatchError(
+                f"Worker protocol {protocol_version} is incompatible with {WORKER_PROTOCOL_VERSION}"
+            )
+        if dispatch_protocol != GPU_DISPATCH_PROTOCOL_VERSION:
+            raise ProtocolMismatchError(
+                f"GPU dispatch protocol {dispatch_protocol} is incompatible with "
+                f"{GPU_DISPATCH_PROTOCOL_VERSION}"
+            )
+        if not worker_id.strip() or not worker_build_id.strip() or not required_build_id.strip():
+            raise ValueError("Worker identity and required build are required")
+        if lease_seconds < 30:
+            raise ValueError("lease_seconds must be at least 30")
+        if (leader_owner_id is None) != (leader_epoch is None):
+            raise ValueError("Leader owner and epoch must be supplied together")
+        kinds = tuple(dict.fromkeys(supported_kinds or ()))
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        active_placeholders = ",".join("?" for _ in GPU_DISPATCH_ACTIVE_STATES)
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if leader_owner_id is not None and leader_epoch is not None:
+                self._assert_gpu_leader(connection, leader_owner_id, leader_epoch, now)
+            active = connection.execute(
+                f"""
+                SELECT d.*,j.status AS job_status,j.lease_owner,j.lease_token_hash,
+                    j.lease_expires_at,j.protocol_version AS job_protocol
+                FROM gpu_dispatches d JOIN jobs j ON j.id=d.job_id
+                WHERE d.state IN ({active_placeholders})
+                ORDER BY d.created_at,d.id LIMIT 1
+                """,
+                GPU_DISPATCH_ACTIVE_STATES,
+            ).fetchone()
+            if active is not None:
+                active_job_id = str(active["job_id"])
+                active_attempt = int(active["attempt"])
+                lease_valid = (
+                    active["job_status"] == "running"
+                    and bool(active["lease_token_hash"])
+                    and str(active["lease_expires_at"] or "") > now
+                )
+                if lease_valid and active["lease_owner"] != worker_id:
+                    connection.commit()
+                    return None
+                if lease_valid:
+                    token = str(token_factory(active_job_id, active_attempt))
+                    if len(token) < 32:
+                        connection.rollback()
+                        raise ValueError("Derived lease token must contain at least 32 characters")
+                    if not hmac.compare_digest(
+                        str(active["lease_token_hash"] or ""), self._token_hash(token)
+                    ):
+                        connection.rollback()
+                        raise LeaseConflictError(
+                            "Derived lease token does not match active attempt"
+                        )
+                    job_row = connection.execute(
+                        "SELECT * FROM jobs WHERE id=?", (active_job_id,)
+                    ).fetchone()
+                    dispatch_row = connection.execute(
+                        "SELECT * FROM gpu_dispatches WHERE id=?", (active["id"],)
+                    ).fetchone()
+                    connection.commit()
+                    return {
+                        "job": self._decode_job(dict(job_row)),
+                        "lease_token": token,
+                        "dispatch": self._decode_gpu_dispatch(dict(dispatch_row)),
+                        "recovered": True,
+                    }
+                terminal_state = (
+                    "complete"
+                    if active["job_status"] == "complete"
+                    else "failed"
+                    if active["job_status"] == "failed"
+                    else "fenced"
+                )
+                connection.execute(
+                    """
+                    UPDATE gpu_dispatches SET state=?,finished_at=?,updated_at=?
+                    WHERE id=?
+                    """,
+                    (terminal_state, now, now, active["id"]),
+                )
+            self._expire_leases(connection, now)
+            parameters: list[Any] = [protocol_version]
+            kind_filter = ""
+            if kinds:
+                placeholders = ",".join("?" for _ in kinds)
+                kind_filter = f" AND kind IN ({placeholders})"
+                parameters.extend(kinds)
+            row = connection.execute(
+                f"""
+                SELECT id,attempt,input_fingerprint FROM jobs
+                WHERE status='queued' AND protocol_version=?
+                    AND input_fingerprint IS NOT NULL
+                    AND attempt < max_attempts {kind_filter}
+                ORDER BY created_at,id LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            attempt = int(row["attempt"]) + 1
+            token = str(token_factory(str(row["id"]), attempt))
+            if len(token) < 32:
+                connection.rollback()
+                raise ValueError("Derived lease token must contain at least 32 characters")
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET status='running',attempt=?,progress=0,
+                    message='Preparing GPU dispatch',lease_owner=?,lease_token_hash=?,
+                    lease_expires_at=?,worker_build_id=?,retryable=0,
+                    started_at=COALESCE(started_at,?),finished_at=NULL,
+                    failure_class=NULL,updated_at=?
+                WHERE id=? AND status='queued'
+                """,
+                (
+                    attempt,
+                    worker_id,
+                    self._token_hash(token),
+                    expires_at,
+                    worker_build_id,
+                    now,
+                    now,
+                    row["id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise LeaseConflictError("Job was claimed concurrently")
+            connection.execute(
+                """
+                INSERT INTO job_attempts(
+                    job_id,attempt,worker_id,worker_build_id,
+                    lease_started_at,lease_expires_at,status
+                ) VALUES(?,?,?,?,?,?,'running')
+                """,
+                (row["id"], attempt, worker_id, worker_build_id, now, expires_at),
+            )
+            dispatch_id = self._stable_gpu_dispatch_id(str(row["id"]), attempt)
+            connection.execute(
+                """
+                INSERT INTO gpu_dispatches(
+                    id,job_id,attempt,state,worker_id,worker_build_id,
+                    dispatch_protocol,required_build_id,input_fingerprint,
+                    leader_epoch,created_at,updated_at
+                ) VALUES(?,?,?,'claimed',?,?,?,?,?,?,?,?)
+                """,
+                (
+                    dispatch_id,
+                    row["id"],
+                    attempt,
+                    worker_id,
+                    worker_build_id,
+                    dispatch_protocol,
+                    required_build_id,
+                    row["input_fingerprint"],
+                    leader_epoch,
+                    now,
+                    now,
+                ),
+            )
+            job_row = connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+            dispatch_row = connection.execute(
+                "SELECT * FROM gpu_dispatches WHERE id=?", (dispatch_id,)
+            ).fetchone()
+            connection.commit()
+        return {
+            "job": self._decode_job(dict(job_row)),
+            "lease_token": token,
+            "dispatch": self._decode_gpu_dispatch(dict(dispatch_row)),
+            "recovered": False,
+        }
+
+    def get_gpu_dispatch(self, dispatch_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM gpu_dispatches WHERE id=?", (dispatch_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(dispatch_id)
+        return self._decode_gpu_dispatch(dict(row))
+
+    def get_gpu_dispatch_for_attempt(self, job_id: str, attempt: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM gpu_dispatches WHERE job_id=? AND attempt=?",
+                (job_id, attempt),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"{job_id}:{attempt}")
+        return self._decode_gpu_dispatch(dict(row))
+
+    def active_gpu_dispatch(self) -> dict[str, Any] | None:
+        placeholders = ",".join("?" for _ in GPU_DISPATCH_ACTIVE_STATES)
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM gpu_dispatches WHERE state IN ({placeholders})
+                ORDER BY created_at,id LIMIT 1
+                """,
+                GPU_DISPATCH_ACTIVE_STATES,
+            ).fetchone()
+        return self._decode_gpu_dispatch(dict(row)) if row is not None else None
+
+    def list_gpu_dispatches(self, limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 500:
+            raise ValueError("GPU dispatch limit must be between 1 and 500")
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM gpu_dispatches ORDER BY created_at DESC,id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._decode_gpu_dispatch(dict(row)) for row in rows]
+
+    def configure_gpu_dispatch(
+        self,
+        dispatch_id: str,
+        *,
+        manifest: dict[str, Any],
+        context: dict[str, Any],
+        inputs: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not 1 <= len(inputs) <= 16:
+            raise ValueError("GPU dispatch requires between 1 and 16 inputs")
+        manifest_json = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        context_json = json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        manifest_sha256 = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+        seen: set[str] = set()
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            dispatch = connection.execute(
+                """
+                SELECT d.*,j.status AS job_status,j.attempt AS job_attempt,
+                    j.lease_owner AS job_lease_owner,
+                    j.lease_token_hash AS job_lease_token_hash,
+                    j.lease_expires_at AS job_lease_expires_at,
+                    j.protocol_version AS job_protocol,j.kind AS job_kind,
+                    j.payload_json AS job_payload_json,
+                    j.preconditions_json AS job_preconditions_json
+                FROM gpu_dispatches d JOIN jobs j ON j.id=d.job_id
+                WHERE d.id=?
+                """,
+                (dispatch_id,),
+            ).fetchone()
+            if dispatch is None:
+                connection.rollback()
+                raise KeyError(dispatch_id)
+            if (
+                dispatch["state"] not in GPU_DISPATCH_ACTIVE_STATES
+                or dispatch["job_status"] != "running"
+                or int(dispatch["job_attempt"]) != int(dispatch["attempt"])
+                or dispatch["job_lease_owner"] != dispatch["worker_id"]
+                or not dispatch["job_lease_token_hash"]
+                or str(dispatch["job_lease_expires_at"] or "") <= now
+            ):
+                connection.rollback()
+                raise LeaseConflictError("GPU dispatch attempt is no longer current")
+            identity = {
+                "dispatch_id": dispatch_id,
+                "job_id": str(dispatch["job_id"]),
+                "attempt": int(dispatch["attempt"]),
+                "protocol_version": str(dispatch["dispatch_protocol"]),
+                "required_build_id": str(dispatch["required_build_id"]),
+                "input_fingerprint": str(dispatch["input_fingerprint"]),
+            }
+            if any(manifest.get(key) != value for key, value in identity.items()):
+                connection.rollback()
+                raise ValueError("GPU dispatch manifest does not match the claimed attempt")
+            if list(manifest.get("inputs") or []) != list(inputs):
+                connection.rollback()
+                raise ValueError("GPU dispatch manifest inputs are inconsistent")
+            context_value = context.get("context")
+            if not isinstance(context_value, dict) or any(
+                context_value.get(key) != identity[key]
+                for key in ("job_id", "attempt", "input_fingerprint")
+            ):
+                connection.rollback()
+                raise ValueError("GPU start context does not match the claimed attempt")
+            if (
+                context_value.get("protocol_version") != dispatch["job_protocol"]
+                or context_value.get("kind") != dispatch["job_kind"]
+                or context_value.get("payload")
+                != _loads(str(dispatch["job_payload_json"]), {})
+                or context_value.get("preconditions")
+                != _loads(str(dispatch["job_preconditions_json"]), {})
+            ):
+                connection.rollback()
+                raise ValueError("GPU start context differs from the immutable job")
+            context_inputs = context_value.get("inputs")
+            input_fields = (
+                "artifact_id",
+                "role",
+                "sha256",
+                "size_bytes",
+                "media_type",
+                "filename",
+            )
+            if not isinstance(context_inputs, list) or any(
+                not isinstance(item, dict) or any(field not in item for field in input_fields)
+                for item in context_inputs
+            ):
+                connection.rollback()
+                raise ValueError("GPU start context has invalid immutable inputs")
+            context_manifest_inputs = [
+                {field: item[field] for field in input_fields} for item in context_inputs
+            ]
+            if context_manifest_inputs != list(inputs):
+                connection.rollback()
+                raise ValueError("GPU start context inputs differ from the manifest")
+            if dispatch["manifest_sha256"]:
+                if (
+                    dispatch["manifest_sha256"] != manifest_sha256
+                    or dispatch["manifest_json"] != manifest_json
+                    or dispatch["context_json"] != context_json
+                ):
+                    connection.rollback()
+                    raise ValueError("GPU dispatch is already configured differently")
+                connection.commit()
+                return self.get_gpu_dispatch(dispatch_id)
+            if dispatch["state"] != "claimed":
+                connection.rollback()
+                raise LeaseConflictError("GPU dispatch cannot be configured in its current state")
+            for ordinal, item in enumerate(inputs):
+                artifact_id = str(item["artifact_id"])
+                if artifact_id in seen:
+                    connection.rollback()
+                    raise ValueError("GPU dispatch input artifact IDs must be unique")
+                seen.add(artifact_id)
+                size = int(item["size_bytes"])
+                if size < 1:
+                    connection.rollback()
+                    raise ValueError("GPU dispatch inputs cannot be empty")
+                filename = str(item["filename"])
+                if filename in {"", ".", ".."} or "/" in filename or "\\" in filename:
+                    connection.rollback()
+                    raise ValueError("GPU dispatch filename must be a safe basename")
+                artifact = connection.execute(
+                    "SELECT * FROM artifacts WHERE id=? AND state='active'",
+                    (artifact_id,),
+                ).fetchone()
+                if artifact is None:
+                    connection.rollback()
+                    raise ValueError("GPU dispatch input is not an active catalog artifact")
+                expected = {
+                    "role": str(item["role"]),
+                    "sha256": str(item["sha256"]),
+                    "size_bytes": size,
+                    "media_type": str(item["media_type"]),
+                }
+                if any(artifact[key] != value for key, value in expected.items()):
+                    connection.rollback()
+                    raise ValueError("GPU dispatch input no longer matches the catalog")
+                connection.execute(
+                    """
+                    INSERT INTO gpu_dispatch_inputs(
+                        dispatch_id,artifact_id,ordinal,role,sha256,size_bytes,
+                        media_type,filename,accepted_offset,state,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,0,'pending',?)
+                    """,
+                    (
+                        dispatch_id,
+                        artifact_id,
+                        ordinal,
+                        expected["role"],
+                        expected["sha256"],
+                        size,
+                        expected["media_type"],
+                        filename,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE gpu_dispatches SET state='prepared',manifest_sha256=?,
+                    manifest_json=?,context_json=?,updated_at=? WHERE id=?
+                """,
+                (manifest_sha256, manifest_json, context_json, now, dispatch_id),
+            )
+            connection.commit()
+        return self.get_gpu_dispatch(dispatch_id)
+
+    def update_gpu_dispatch(
+        self,
+        dispatch_id: str,
+        *,
+        expected_states: Sequence[str] | None = None,
+        **values: Any,
+    ) -> dict[str, Any]:
+        allowed = {
+            "state",
+            "remote_state",
+            "check_id",
+            "requirement_key",
+            "leader_epoch",
+            "retry_count",
+            "next_retry_at",
+            "last_http_status",
+            "last_error_class",
+            "last_error_summary",
+            "accepted_at",
+            "finished_at",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unknown GPU dispatch fields: {sorted(unknown)}")
+        updates = dict(values)
+        for field, limit in (("last_error_class", 120), ("last_error_summary", 1_000)):
+            if field in updates:
+                updates[field] = (
+                    self._bounded_text(updates[field], limit) if updates[field] else None
+                )
+        if (
+            updates.get("state")
+            in {
+                "complete",
+                "failed",
+                "cancelled",
+                "fenced",
+            }
+            and "finished_at" not in updates
+        ):
+            updates["finished_at"] = self._now()
+        updates["updated_at"] = self._now()
+        assignments = ",".join(f"{key}=?" for key in updates)
+        where = "id=?"
+        parameters: list[Any] = [*updates.values(), dispatch_id]
+        if expected_states:
+            placeholders = ",".join("?" for _ in expected_states)
+            where += f" AND state IN ({placeholders})"
+            parameters.extend(expected_states)
+        if updates.get("state") in GPU_DISPATCH_ACTIVE_STATES:
+            active_placeholders = ",".join("?" for _ in GPU_DISPATCH_ACTIVE_STATES)
+            where += f" AND state IN ({active_placeholders})"
+            parameters.extend(GPU_DISPATCH_ACTIVE_STATES)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE gpu_dispatches SET {assignments} WHERE {where}",
+                parameters,
+            )
+            if cursor.rowcount != 1:
+                existing = connection.execute(
+                    "SELECT 1 FROM gpu_dispatches WHERE id=?", (dispatch_id,)
+                ).fetchone()
+                if existing is None:
+                    raise KeyError(dispatch_id)
+                raise LeaseConflictError("GPU dispatch state changed concurrently")
+        return self.get_gpu_dispatch(dispatch_id)
+
+    def list_gpu_dispatch_inputs(self, dispatch_id: str) -> list[dict[str, Any]]:
+        self.get_gpu_dispatch(dispatch_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM gpu_dispatch_inputs
+                WHERE dispatch_id=? ORDER BY ordinal,artifact_id
+                """,
+                (dispatch_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_gpu_dispatch_input(
+        self,
+        dispatch_id: str,
+        artifact_id: str,
+        *,
+        accepted_offset: int | None = None,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        now = self._now()
+        values: dict[str, Any] = {"updated_at": now}
+        if accepted_offset is not None and accepted_offset < 0:
+            raise ValueError("GPU input offset cannot be negative")
+        if state is not None and state not in {
+            "pending",
+            "uploading",
+            "verified",
+            "failed",
+            "cancelled",
+        }:
+            raise ValueError(f"Invalid GPU dispatch input state: {state}")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """
+                SELECT i.*,d.state AS dispatch_state,d.attempt AS dispatch_attempt,
+                    d.worker_id,j.status AS job_status,j.attempt AS job_attempt,
+                    j.lease_owner,j.lease_token_hash,j.lease_expires_at
+                FROM gpu_dispatch_inputs i
+                JOIN gpu_dispatches d ON d.id=i.dispatch_id
+                JOIN jobs j ON j.id=d.job_id
+                WHERE i.dispatch_id=? AND i.artifact_id=?
+                """,
+                (dispatch_id, artifact_id),
+            ).fetchone()
+            if current is None:
+                connection.rollback()
+                raise KeyError(f"{dispatch_id}:{artifact_id}")
+            if (
+                current["dispatch_state"] not in GPU_DISPATCH_ACTIVE_STATES
+                or current["job_status"] != "running"
+                or int(current["job_attempt"]) != int(current["dispatch_attempt"])
+                or current["lease_owner"] != current["worker_id"]
+                or not current["lease_token_hash"]
+                or str(current["lease_expires_at"] or "") <= now
+            ):
+                connection.rollback()
+                raise LeaseConflictError("GPU dispatch attempt is no longer current")
+            effective_offset = (
+                accepted_offset
+                if accepted_offset is not None
+                else int(current["accepted_offset"])
+            )
+            if effective_offset > int(current["size_bytes"]):
+                connection.rollback()
+                raise ValueError("GPU input offset exceeds the registered size")
+            if state == "verified" and effective_offset != int(current["size_bytes"]):
+                connection.rollback()
+                raise ValueError("A verified GPU input must acknowledge its complete size")
+            if accepted_offset is not None:
+                values["accepted_offset"] = accepted_offset
+            if state is not None:
+                values["state"] = state
+            assignments = ",".join(f"{key}=?" for key in values)
+            cursor = connection.execute(
+                f"""
+                UPDATE gpu_dispatch_inputs SET {assignments}
+                WHERE dispatch_id=? AND artifact_id=?
+                """,
+                (*values.values(), dispatch_id, artifact_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise KeyError(f"{dispatch_id}:{artifact_id}")
+            row = connection.execute(
+                """
+                SELECT * FROM gpu_dispatch_inputs
+                WHERE dispatch_id=? AND artifact_id=?
+                """,
+                (dispatch_id, artifact_id),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def gpu_demand_summary(self) -> dict[str, int]:
+        now = self._now()
+        dispatch_placeholders = ",".join("?" for _ in GPU_DISPATCH_ACTIVE_STATES)
+        check_placeholders = ",".join("?" for _ in GPU_CHECK_ACTIVE_STATES)
+        with self.connect() as connection:
+            queued = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM jobs
+                    WHERE status='queued' AND protocol_version=?
+                        AND input_fingerprint IS NOT NULL AND attempt < max_attempts
+                    """,
+                    (WORKER_PROTOCOL_VERSION,),
+                ).fetchone()[0]
+            )
+            leases = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM jobs
+                    WHERE status='running' AND lease_token_hash IS NOT NULL
+                        AND lease_expires_at>?
+                    """,
+                    (now,),
+                ).fetchone()[0]
+            )
+            dispatches = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM gpu_dispatches WHERE state IN ({dispatch_placeholders})",
+                    GPU_DISPATCH_ACTIVE_STATES,
+                ).fetchone()[0]
+            )
+            checks = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM gpu_checks WHERE status IN ({check_placeholders})",
+                    GPU_CHECK_ACTIVE_STATES,
+                ).fetchone()[0]
+            )
+            acknowledgements = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM gpu_dispatches WHERE state='completion_pending'"
+                ).fetchone()[0]
+            )
+        return {
+            "runnable_jobs": queued,
+            "valid_leases": leases,
+            "active_dispatches": dispatches,
+            "active_checks": checks,
+            "pending_acknowledgements": acknowledgements,
+        }
 
     def assert_current_lease(
         self,
@@ -1723,9 +2755,7 @@ class StudioCatalog:
             and row["status"] == status
             and row["lease_owner"] == worker_id
             and row["lease_token_hash"]
-            and hmac.compare_digest(
-                str(row["lease_token_hash"]), self._token_hash(lease_token)
-            )
+            and hmac.compare_digest(str(row["lease_token_hash"]), self._token_hash(lease_token))
         )
 
     def create_artifact_upload(
@@ -1749,6 +2779,38 @@ class StudioCatalog:
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = self._leased_row(connection, job_id, worker_id, lease_token, now)
+            connection.execute(
+                """
+                UPDATE artifact_uploads SET state='discarded',updated_at=?
+                WHERE job_id=? AND attempt=? AND role=?
+                    AND state IN ('open','verified') AND expires_at<=?
+                """,
+                (now, job_id, job["attempt"], role, now),
+            )
+            existing = connection.execute(
+                """
+                SELECT * FROM artifact_uploads
+                WHERE job_id=? AND attempt=? AND role=?
+                    AND state IN ('open','verified','committed')
+                    AND (state='committed' OR expires_at>?)
+                ORDER BY created_at,id LIMIT 1
+                """,
+                (job_id, job["attempt"], role, now),
+            ).fetchone()
+            if existing is not None:
+                identical = (
+                    existing["expected_sha256"] == expected_sha256
+                    and int(existing["expected_size"]) == expected_size
+                    and existing["media_type"] == media_type
+                    and existing["filename"] == filename
+                )
+                if not identical:
+                    connection.rollback()
+                    raise ArtifactUploadManifestConflictError(
+                        "An upload for this attempt and role already has different content"
+                    )
+                connection.commit()
+                return dict(existing)
             connection.execute(
                 """
                 INSERT INTO artifact_uploads(
@@ -1931,9 +2993,7 @@ class StudioCatalog:
             ).fetchone()
         return int(row["value"])
 
-    def create_export(
-        self, project_id: str, name: str, version: int
-    ) -> dict[str, Any]:
+    def create_export(self, project_id: str, name: str, version: int) -> dict[str, Any]:
         export_id = new_id("export")
         with self.connect() as connection:
             connection.execute(
@@ -1947,9 +3007,7 @@ class StudioCatalog:
 
     def get_export(self, export_id: str) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM exports WHERE id=?", (export_id,)
-            ).fetchone()
+            row = connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone()
         if row is None:
             raise KeyError(export_id)
         value = dict(row)

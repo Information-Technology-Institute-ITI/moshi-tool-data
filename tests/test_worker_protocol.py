@@ -21,7 +21,7 @@ WEB_SCHEMA = ROOT / "web_service" / "protocol" / "worker_protocol.schema.json"
 PROCESSING_SCHEMA = (
     ROOT / "processing_service" / "protocol" / "worker_protocol.schema.json"
 )
-EXPECTED_SCHEMA_SHA256 = "68557758c9a2ce8235c35e68a557e46de9a3ba1e700a18858c83447d2ce92210"
+EXPECTED_SCHEMA_SHA256 = "bd390dc8f225f286bbb1924efbea24234db5f5fc745f3f9c0ad010a70aeade18"
 
 
 class MutableClock:

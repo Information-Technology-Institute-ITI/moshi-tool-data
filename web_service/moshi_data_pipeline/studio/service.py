@@ -16,6 +16,11 @@ from moshi_data_pipeline.studio.domain import (
     SourceRights,
 )
 from moshi_data_pipeline.studio.exporter import validate_project_export
+from moshi_data_pipeline.studio.gpu_dispatcher import (
+    GpuDispatcherSettings,
+    GpuPushDispatcher,
+)
+from moshi_data_pipeline.studio.gpu_status import gpu_status_payload, public_gpu_check
 from moshi_data_pipeline.studio.job_contexts import JobContextBuilder
 from moshi_data_pipeline.studio.job_contracts import (
     AnnotationResult,
@@ -53,6 +58,17 @@ class _DisabledLocalWorker:
         pass
 
 
+class _DisabledGpuDispatcher:
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def wake(self) -> None:
+        pass
+
+
 class StudioService:
     def __init__(
         self,
@@ -63,7 +79,12 @@ class StudioService:
         deployment_generation: str = "local",
         enable_local_worker: bool = True,
         metrics_publisher: Callable[[dict[str, Any]], None] | None = None,
+        gpu_dispatcher_settings: GpuDispatcherSettings | None = None,
+        gpu_dispatch_client: Any = None,
+        lifecycle_idle_seconds: int = 15 * 60,
     ):
+        if enable_local_worker and gpu_dispatcher_settings is not None:
+            raise ValueError("The local worker and GPU push dispatcher cannot run together")
         self.config = config
         self.paths = StudioPaths(workspace)
         self.catalog = StudioCatalog(self.paths.database)
@@ -94,7 +115,21 @@ class StudioService:
             self.catalog,
             lifecycle_provider or LocalLifecycleProvider(),
             generation=deployment_generation,
+            idle_seconds=lifecycle_idle_seconds,
             metrics_publisher=metrics_publisher,
+        )
+        self.gpu_settings = gpu_dispatcher_settings
+        self.dispatcher: Any = (
+            GpuPushDispatcher(
+                self.catalog,
+                self.paths,
+                self.contexts,
+                gpu_dispatcher_settings,
+                lifecycle_wake=self.lifecycle.wake,
+                client=gpu_dispatch_client,
+            )
+            if gpu_dispatcher_settings is not None
+            else _DisabledGpuDispatcher()
         )
 
     def active_artifact_path(
@@ -160,7 +195,46 @@ class StudioService:
         )
         self.worker.wake()
         self.lifecycle.wake()
+        self.dispatcher.wake()
         return job
+
+    def gpu_status(self) -> dict[str, Any]:
+        expected_build = (
+            self.gpu_settings.required_build_id
+            if self.gpu_settings is not None
+            else str(self.catalog.get_gpu_runtime_state().get("expected_build_id") or "")
+        )
+        instance_id = (
+            self.gpu_settings.instance_id
+            if self.gpu_settings is not None
+            else self.catalog.get_lifecycle_state().get("instance_id")
+        )
+        return gpu_status_payload(
+            self.catalog,
+            instance_id=str(instance_id) if instance_id else None,
+            expected_build_id=expected_build,
+        )
+
+    def request_gpu_check(self, authenticated_user: str) -> tuple[dict[str, Any], bool]:
+        if self.gpu_settings is None:
+            raise RuntimeError("GPU push dispatch is not configured")
+        lifecycle = self.catalog.get_lifecycle_state()
+        check, created = self.catalog.request_gpu_check(
+            "manual",
+            requested_by=authenticated_user,
+            instance_id=self.gpu_settings.instance_id,
+            cold_start=lifecycle.get("instance_state") != "running",
+            expected_build_id=self.gpu_settings.required_build_id,
+        )
+        if created:
+            self.catalog.update_lifecycle_state(
+                blocked_reason=None,
+                last_error=None,
+                recovery_count=0,
+                startup_deadline=None,
+            )
+        self.dispatcher.wake()
+        return public_gpu_check(check) or {}, created
 
     def source_detail(self, source_id: str) -> dict[str, Any]:
         source = self.catalog.get_source(source_id)
