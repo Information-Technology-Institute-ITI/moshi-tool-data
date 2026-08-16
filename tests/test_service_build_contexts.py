@@ -42,6 +42,11 @@ def test_processing_runtime_contracts_do_not_import_web_state() -> None:
     }
     root = ROOT / "processing_service/moshi_data_pipeline"
     for relative in (
+        "gpu_dispatch_protocol.py",
+        "gpu_dispatch_state.py",
+        "gpu_intake.py",
+        "gpu_intake_main.py",
+        "gpu_self_check.py",
         "remote_worker.py",
         "remote_worker_main.py",
         "studio/execution_runtime.py",
@@ -80,6 +85,21 @@ def test_service_protocol_files_are_byte_identical() -> None:
         ROOT / "processing_service/protocol/worker_protocol.schema.json"
     ).read_bytes()
     assert web == processing
+
+
+def test_gpu_intake_sources_match_processing_build_context() -> None:
+    for relative in (
+        "gpu_dispatch_protocol.py",
+        "gpu_dispatch_state.py",
+        "gpu_intake.py",
+        "gpu_intake_main.py",
+        "gpu_self_check.py",
+    ):
+        root = (ROOT / "moshi_data_pipeline" / relative).read_bytes()
+        processing = (
+            ROOT / "processing_service" / "moshi_data_pipeline" / relative
+        ).read_bytes()
+        assert root == processing, f"{relative} is out of sync"
 
 
 def test_root_compose_does_not_mount_web_data_into_worker() -> None:
