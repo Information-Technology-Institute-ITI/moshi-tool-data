@@ -228,11 +228,11 @@ docker compose up --build web
 docker compose --profile gpu up --build
 ```
 
-The AWS implementation, preflight, immutable image publishing flow, TLS cutover, backup restoration,
-and end-to-end acceptance procedure are documented in `deployment/README.md`. Terraform defaults to
-an always-on `t3.large` plus an intermittently running `g6.2xlarge`, with encrypted preserved data
-volumes and no inbound access to the GPU host. The exact implementation checklist and adopted v1
-deployment defaults are tracked in `PLAN.md`.
+The manual AWS implementation, preflight, immutable image publishing flow, EC2 setup, TLS cutover,
+backup restoration, and end-to-end acceptance procedure are documented in `deployment/README.md`.
+The recommended topology uses an always-on `t3.large` plus an intermittently running
+`g6.2xlarge`, with encrypted preserved data volumes and no inbound access to the GPU host. The
+exact implementation checklist and adopted v1 deployment defaults are tracked in `PLAN.md`.
 
 ### Separation regression benchmark
 
@@ -563,7 +563,6 @@ Set-Location web_service/frontend
 pnpm test
 pnpm run build
 docker compose config
-terraform -chdir=deployment/terraform validate
 ```
 
 The Python suite covers the existing pipeline plus channel classification and

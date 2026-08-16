@@ -65,8 +65,8 @@ The following are defaults for implementation and can be changed before the name
 4. Retain processing CLI commands `process`, `batch`, `inspect`, `extract`, `rebuild-manifest`,
    `approve-review`, `review`, `benchmark`, `stages`, and `evaluate-separation`. The `web` command
    moves to `web_service` and is not exposed by the processing image.
-5. Use Terraform for reproducible AWS infrastructure unless manual provisioning is explicitly
-   selected before Phase 7.
+5. Provision AWS resources manually through the AWS Console, following the checked-in deployment
+   runbook and recording the selected resource IDs and settings for repeatability.
 6. Use On-Demand EC2 for the first rollout. Spot is a later optimization after lease recovery has
    been proven under forced interruption.
 
@@ -101,7 +101,9 @@ Decisions still requiring confirmation are collected at the end of this document
 ├── contract_tests/
 │   └── test_worker_protocol_sync.py
 └── deployment/
-    └── terraform/
+    ├── build-push.ps1
+    ├── preflight.ps1
+    └── README.md
 ```
 
 `deployment/` is infrastructure only, not a third runtime package. Each Docker build uses its
@@ -365,8 +367,8 @@ queue, and atomicity tests must still pass with a deterministic fake executor.
 - Record the nine current job paths, their catalog reads/writes, files, and invalidation behavior.
 - Add characterization fixtures for current job results and public API responses.
 - Record baseline test, workspace-count, toolchain, Docker, GPU, and media preflight commands.
-- Write short architecture decisions for authentication scope, protocol versioning, Terraform,
-  network/TLS, and retry classifications.
+- Write short architecture decisions for authentication scope, protocol versioning, manual AWS
+  provisioning, network/TLS, and retry classifications.
 
 Gate: all existing tests still pass and every current job mutation is represented in a contract
 table or characterization test.
@@ -503,8 +505,8 @@ memory, which is materially safer for this workload than the 6 GB local card.
 - The processing container starts at EC2 boot, verifies CUDA/model-cache readiness, reports ready,
   then drains the queue.
 - Store worker tokens and deployment secrets in SSM Parameter Store or Secrets Manager. Store Nginx
-  Basic Auth hashes outside the image. Never place Hugging Face tokens in Terraform state or user
-  data.
+  Basic Auth hashes outside the image. Never place Hugging Face tokens in source control, image
+  layers, shell history, or EC2 user data.
 - Grant both machines `AmazonSSMManagedInstanceCore` or an equivalent least-privilege custom role.
   The web role gets only describe plus start/stop permissions described above; the GPU role has no
   EC2 lifecycle permission.
@@ -567,22 +569,23 @@ intentionally incompatible protocol build to verify the visible blocked/cost-gua
 
 Phases 0-7 are implemented in this repository: protocol/migrations/leases, typed execution seams,
 authenticated internal transfer APIs, remote worker, independent build contexts, lifecycle cost
-guards, workspace migration, and Terraform deployment assets. Phase 8 is deliberately an operator
+guards, workspace migration, and manual deployment assets. Phase 8 is deliberately an operator
 cutover because it changes live AWS resources, DNS, certificates, credentials, and production data.
 
 The implementation adopts these v1 defaults:
 
 1. **AWS region and domain:** supplied as deployment variables. The read-only preflight rejects a
    region without the required G/VT quota, a G6 offering, the DLAMI parameter, or SecureStrings.
-2. **Infrastructure:** Terraform 1.7+ with the AWS provider and independent immutable ECR images.
+2. **Infrastructure:** manually provisioned AWS resources with settings recorded in the deployment
+   runbook and independent immutable ECR images.
 3. **GPU egress:** public IPv4 with no inbound security-group rules, avoiding standing NAT cost.
 4. **Private API:** security-group-restricted VPC HTTP plus a rotated bearer token and per-lease
    capability token. Public Nginx rejects the entire `/internal/*` namespace.
 5. **User authentication:** Nginx Basic Auth with individual account hashes outside images and
-   Terraform; v1 does not claim per-user edit attribution. Browser mutations enforce same-origin.
-6. **Backup retention:** 14 daily SQLite backups and AWS Backup EBS recovery points by default,
-   configurable in Terraform. Restoration to a separate volume remains a production acceptance
-   gate.
+   infrastructure configuration; v1 does not claim per-user edit attribution. Browser mutations
+   enforce same-origin.
+6. **Backup retention:** configure 14 daily SQLite backups and AWS Backup EBS recovery points
+   manually. Restoration to a separate volume remains a production acceptance gate.
 
 Before Phase 8, the operator still selects the concrete region/AZ/domain, verifies live G6 capacity
 and price, installs trusted TLS and Basic Auth material, rehearses migration on a workspace copy,

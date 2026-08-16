@@ -1,29 +1,47 @@
-# AWS deployment
+# Manual AWS deployment
 
-This package provisions the two-machine production design in one Availability Zone:
+This project uses two manually provisioned EC2 machines. It does not require an infrastructure-as-
+code tool:
 
-- an always-on `t3.large` web host with an Elastic IP and a preserved 500 GiB workspace EBS volume;
-- an on-demand `g6.2xlarge` NVIDIA L4 worker with no inbound rules and a preserved 150 GiB cache volume;
-- immutable ECR repositories, least-privilege instance roles, IMDSv2, KMS encryption, daily AWS
-  Backup recovery points, daily SQLite backups, and EC2 status alarms.
+- an always-on `t3.large` web host with a public Elastic IP and a persistent workspace volume;
+- an on-demand `g6.2xlarge` NVIDIA L4 worker with a persistent model/cache volume.
 
-The default worker design uses a public IPv4 address with zero inbound security-group rules. This
-avoids permanent NAT Gateway cost for an intermittent machine. Only the web host receives public
-traffic, and only on 443; worker traffic reaches private port 8765 from the processing security
-group. Administration is through Systems Manager Session Manager.
+Only the web host receives public traffic. The processing host has no inbound public rules and
+reaches the web service over the VPC private network. Use Systems Manager Session Manager for
+administration where possible.
 
-## Prerequisites
+## 1. Create the AWS resources
 
-Install AWS CLI v2, Terraform 1.7 or newer, Docker, and PowerShell 7. Authenticate the AWS CLI to
-the target account. In the SSM Parameter Store console, create a high-entropy worker token and the
-Hugging Face token as `SecureString` parameters before Terraform. Their names, but never their
-values, go in `terraform.tfvars`. Do not place the values in Terraform state, shell history, user
-data, or build arguments.
+Create these resources manually in one AWS region and Availability Zone:
 
-Copy `terraform/terraform.tfvars.example` to the ignored `terraform/terraform.tfvars`, choose a
-region and AZ, and supply an existing SNS topic with a confirmed on-call subscription. Then run the
-read-only preflight. It verifies credentials, the current DLAMI public
-parameter, G6 offerings, the G/VT On-Demand vCPU quota, and both parameter types:
+1. Two immutable private ECR repositories, one for `moshi-web` and one for `moshi-processing`.
+2. A VPC/subnet arrangement that gives both machines outbound HTTPS access. A public IPv4 address
+   with no inbound rules is acceptable for the intermittent worker and avoids a permanent NAT
+   Gateway charge.
+3. A web security group allowing public HTTPS on port 443 and private TCP 8765 only from the
+   processing security group.
+4. A processing security group with no inbound rules.
+5. An Ubuntu x86-64 `t3.large` web instance, an Elastic IP, and an encrypted persistent workspace
+   EBS volume (500 GiB recommended).
+6. An x86-64 `g6.2xlarge` instance based on the AWS Deep Learning Base OSS NVIDIA Driver GPU AMI,
+   plus an encrypted persistent cache EBS volume (150 GiB recommended).
+7. Two SSM `SecureString` parameters: a high-entropy shared worker token and the Hugging Face token.
+8. An SNS topic with a confirmed operator subscription, CloudWatch alarms, and AWS Backup plans for
+   the persistent volumes.
+
+Attach instance profiles that permit SSM Session Manager, ECR image pulls, and decryption of only
+the parameters each machine needs. The web role also needs `ec2:DescribeInstances`, plus
+`ec2:StartInstances` and `ec2:StopInstances` restricted to the exact processing instance. Require
+IMDSv2 on both machines. Do not give the processing role EC2 lifecycle permissions.
+
+Record the region, account ID, ECR URLs, instance IDs, private IP addresses, security-group IDs,
+volume IDs, parameter names, domain, and immutable image tag in the team's secure operations notes.
+
+## 2. Run the preflight
+
+Install AWS CLI v2, Docker, and PowerShell 7 on the build machine and authenticate to the target
+account. The read-only preflight checks credentials, the GPU AMI, G6 offerings, quota, and SSM
+parameter types:
 
 ```powershell
 ./deployment/preflight.ps1 -Region eu-central-1 `
@@ -31,50 +49,126 @@ parameter, G6 offerings, the G/VT On-Demand vCPU quota, and both parameter types
   -HfTokenParameter /moshi/production/huggingface-token
 ```
 
-An advertised offering and sufficient quota do not guarantee live On-Demand capacity. Confirm the
-selected AZ with a short smoke deployment before production cutover.
+An advertised offering and sufficient quota do not guarantee current On-Demand capacity. Confirm
+the selected Availability Zone with a short processing-machine test.
 
-## Provision and publish
+## 3. Build and publish the images
 
-ECR must exist before images can be pushed. Initialize Terraform, create only the two repositories,
-publish both build contexts under the same immutable tag, and then apply the complete graph:
+The AWS operator supplies the two ECR repository URLs directly. Use one immutable tag for both
+images; a commit SHA is preferred:
 
 ```powershell
-terraform -chdir=deployment/terraform init
-terraform -chdir=deployment/terraform fmt -check
-terraform -chdir=deployment/terraform validate
-terraform -chdir=deployment/terraform apply `
-  -target=aws_ecr_repository.web -target=aws_ecr_repository.processing
-./deployment/build-push.ps1 -ImageTag 0123456789abcdef0123456789abcdef01234567 `
-  -Region eu-central-1
-terraform -chdir=deployment/terraform apply
+./deployment/build-push.ps1 `
+  -ImageTag 0123456789abcdef0123456789abcdef01234567 `
+  -Region eu-central-1 `
+  -WebRepository 123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-web `
+  -ProcessingRepository 123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-processing
 ```
 
-Both data volumes have Terraform `prevent_destroy` guards and survive EC2 replacement. Removing the
-stack therefore intentionally requires an explicit data-retention decision and a separate edit.
-If `image_tag` changes, Terraform replaces the instances because their bootstrap data is immutable;
-the two separately attached guarded volumes are reattached to the replacements. During a rollout,
-leave the old processing image in ECR until all outstanding leases from that build have ended.
+The script builds Linux AMD64 images from the independent `web_service/` and
+`processing_service/` contexts, logs in to ECR, and pushes both images. It never sends the root
+`.env` file or local workspace to either build context. Never use `latest` as the only deployment
+identifier, and retain the previous processing image until its outstanding leases have ended.
 
-The bootstrap scripts mount data volumes by EBS volume ID and then persist their filesystem UUIDs
-in `fstab`. The web container runs with one Uvicorn worker. The processing container uses the NVIDIA
-runtime, reports protocol/build compatibility, processes one leased job at a time, and is stopped by
-the web lifecycle controller only after the queue is empty and no valid leases exist for 15 minutes.
+## 4. Configure the web machine
 
-## DNS, HTTPS, and Basic Auth
+Install `awscli`, `docker.io`, `nginx`, and `sqlite3`. Format and mount the workspace EBS volume at
+`/data`, persist it in `/etc/fstab` by filesystem UUID, and create:
 
-Point the domain A record at Terraform's `web_elastic_ip` output. Through an SSM session, install a
-trusted certificate and private key under `/etc/letsencrypt/live/<domain>/`, create individual
-accounts with `htpasswd /etc/nginx/moshi.htpasswd <username>`, and copy
-`web_service/nginx/moshi.conf` to `/etc/nginx/sites-enabled/moshi` after replacing the placeholder
-domain. Remove the default site, run `nginx -t`, and enable Nginx. The shipped configuration rejects
-all `/internal/*` requests at the public listener and disables proxy buffering for job event streams.
-TLS and password hashes are deliberately outside Terraform and container images.
+```text
+/data/studio_workspace
+/data/backups
+```
 
-## Cutover and recovery
+Use the instance role to authenticate to ECR and retrieve the worker token from SSM. Create a
+root-readable-only environment file such as `/run/moshi-web.env`:
 
-Before the first production start, stop the old application and run the migration against the
-mounted workspace from the new web image:
+```dotenv
+MOSHI_WORKER_TOKEN=<value read from SSM>
+MOSHI_WORKSPACE=/data/studio_workspace
+MOSHI_GPU_INSTANCE_ID=<processing instance ID>
+MOSHI_DEPLOYMENT_GENERATION=<immutable image tag>
+MOSHI_TRUSTED_ORIGINS=https://studio.example.com
+MOSHI_CLOUDWATCH_NAMESPACE=Moshi/Studio
+MOSHI_BACKUP_DIRECTORY=/data/backups
+AWS_REGION=eu-central-1
+```
+
+Pull and run the pinned web image:
+
+```bash
+aws ecr get-login-password --region eu-central-1 | \
+  docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-central-1.amazonaws.com
+docker pull 123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-web:IMAGE_TAG
+docker rm -f moshi-web 2>/dev/null || true
+docker run -d \
+  --name moshi-web \
+  --restart unless-stopped \
+  --network host \
+  --env-file /run/moshi-web.env \
+  --volume /data/studio_workspace:/data/studio_workspace \
+  123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-web:IMAGE_TAG
+```
+
+Configure a daily systemd timer that uses SQLite's `.backup` command, verifies
+`PRAGMA integrity_check`, writes a SHA-256 sidecar, and removes backups older than the agreed
+retention period. Test restoration rather than assuming snapshots are usable.
+
+## 5. Configure the processing machine
+
+Install `awscli` and `docker.io`. Confirm that `nvidia-smi` and `nvidia-ctk` are available, then
+configure Docker's NVIDIA runtime:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+nvidia-smi
+```
+
+Format and mount the cache EBS volume at `/cache`, persist it in `/etc/fstab` by filesystem UUID,
+and create `/cache/huggingface`, `/cache/inputs`, and `/cache/attempts`. Retrieve both SecureStrings
+through the instance role and create `/run/moshi-processing.env` with mode `0600`:
+
+```dotenv
+MOSHI_WEB_INTERNAL_URL=http://<web private IP>:8765
+MOSHI_WORKER_TOKEN=<same value used by the web machine>
+MOSHI_BUILD_ID=<same immutable image tag>
+MOSHI_WORKER_CACHE=/cache
+HF_HOME=/cache/huggingface
+HF_TOKEN=<value read from SSM>
+```
+
+Pull and run the pinned processing image:
+
+```bash
+aws ecr get-login-password --region eu-central-1 | \
+  docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-central-1.amazonaws.com
+docker pull 123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-processing:IMAGE_TAG
+docker rm -f moshi-processing 2>/dev/null || true
+docker run -d \
+  --name moshi-processing \
+  --restart unless-stopped \
+  --network host \
+  --gpus all \
+  --env-file /run/moshi-processing.env \
+  --volume /cache:/cache \
+  123456789012.dkr.ecr.eu-central-1.amazonaws.com/moshi-processing:IMAGE_TAG
+```
+
+The restart policy starts the worker container when EC2 starts. The web lifecycle controller uses
+the configured processing instance ID and its instance role to start and stop that EC2 machine.
+
+## 6. DNS, HTTPS, and Basic Auth
+
+Point the domain A record at the web Elastic IP. Install a trusted certificate and private key,
+create individual Basic Auth accounts with `htpasswd`, and install
+`web_service/nginx/moshi.conf` after replacing the placeholder domain. Remove the default Nginx
+site, run `nginx -t`, and enable Nginx. Keep port 8765 closed to the public internet; the supplied
+configuration rejects `/internal/*` on the public listener.
+
+## 7. Cutover and acceptance
+
+Before opening production, run the workspace migration from the new web image:
 
 ```bash
 python -m moshi_data_pipeline migrate-workspace --workspace /data/studio_workspace
@@ -82,10 +176,7 @@ python -m moshi_data_pipeline migrate-workspace --workspace /data/studio_workspa
 python -m moshi_data_pipeline migrate-workspace --workspace /data/studio_workspace --verify
 ```
 
-Retain the migration's SQLite backup and take a matching EBS recovery point. Never run the old binary
-against the migrated catalog. Test restoration by restoring the workspace recovery point to a new
-volume and verifying the latest `/data/backups/catalog-*.sqlite3` checksum and SQLite integrity.
-
-The deployment is not accepted until a queued job starts a stopped GPU, completes through the remote
-protocol, drains the queue, and stops the GPU after the full idle window. Also force one worker
-interruption and one incompatible protocol build to verify recovery and the visible cost guard.
+Retain the migration backup and take a matching EBS recovery point. Never run the old binary against
+the migrated catalog. Submit a job while the GPU instance is stopped and verify queueing, EC2 start,
+worker readiness, processing, atomic result visibility, complete drain, and automatic stop after the
+full idle interval. Also test a forced worker interruption and an incompatible protocol build.

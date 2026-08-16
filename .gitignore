@@ -19,10 +19,3 @@ web_service/.venv/
 web_service/frontend/node_modules/
 processing_service/.venv/
 local_data/
-.terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
-terraform.tfvars
-*.auto.tfvars
-!terraform.tfvars.example
