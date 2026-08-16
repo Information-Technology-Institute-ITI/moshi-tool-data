@@ -468,10 +468,13 @@ class SelfCheckCoordinator:
         self,
         runner: FunctionalCheckRunner,
         repository: SelfCheckRepository,
+        *,
+        compute_lock: asyncio.Lock | None = None,
     ) -> None:
         self.runner = runner
         self.repository = repository
         self._lock = asyncio.Lock()
+        self._compute_lock = compute_lock or asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
 
     async def trigger(
@@ -489,15 +492,16 @@ class SelfCheckCoordinator:
             return record, created
 
     async def _execute(self, identifier: str) -> None:
-        self.repository.mark_running(identifier)
-        try:
-            result = await asyncio.to_thread(self.runner.run)
-        except Exception as exc:
-            self.repository.fail_check(identifier, exc)
-        else:
-            self.repository.pass_check(
-                identifier, result, self.runner.definition.validity_hours
-            )
+        async with self._compute_lock:
+            self.repository.mark_running(identifier)
+            try:
+                result = await asyncio.to_thread(self.runner.run)
+            except Exception as exc:
+                self.repository.fail_check(identifier, exc)
+            else:
+                self.repository.pass_check(
+                    identifier, result, self.runner.definition.validity_hours
+                )
 
     async def stop(self) -> None:
         if self._task is not None and not self._task.done():

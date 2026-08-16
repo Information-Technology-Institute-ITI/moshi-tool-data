@@ -6,9 +6,10 @@ migration:
 - `python -m moshi_data_pipeline.remote_worker_main` is the existing protocol 1.0 pull worker.
 - `python -m moshi_data_pipeline.gpu_intake_main` is the protocol 2.0 private push intake.
 
-Run exactly one mode. The pull worker remains available for rollback until the m8i dispatcher and
-GPU execution/outbox loop have passed cold-start acceptance. The intake milestone durably receives
-and queues work; it does not yet consume queued work with WhisperX.
+Run exactly one mode. The pull worker remains available for rollback until the m8i dispatcher has
+passed cold-start acceptance. The push service durably receives inputs, runs the existing job
+executor after validating the m8i lease, and retains a resumable callback outbox until m8i
+acknowledges completion.
 
 Required runtime variables:
 
@@ -45,6 +46,7 @@ different credential from the callback `MOSHI_WORKER_TOKEN`.
 Required variables:
 
 - `MOSHI_DISPATCH_TOKEN`, loaded from a mode-0600 environment file.
+- `MOSHI_WORKER_TOKEN`, the separate Bearer credential for callbacks to m8i.
 - `MOSHI_WEB_INTERNAL_URL=http://<m8i-private-ip>`; callbacks use m8i port 80 initially.
 - `MOSHI_BUILD_ID`, the exact immutable commit deployed on both machines.
 - `MOSHI_WORKER_CACHE=/home/ubuntu/moshi-worker-cache` for this source deployment.
@@ -67,13 +69,22 @@ replays, verifies the full SHA-256, and atomically promotes content into the per
 One active dispatch is allowed. The fixed callback origin comes from the host environment and is
 never accepted from a request.
 
+After `start`, the service verifies a current functional pass and a recent authenticated callback
+heartbeat. It then validates the lease with m8i before touching the model. Interrupted execution is
+requeued on service restart. Successful outputs are moved atomically into the EBS outbox; failed
+jobs also create a durable callback record. Artifact upload IDs and offsets survive restart, and
+ambiguous completion responses are retried idempotently. HTTP 401 enters `auth_blocked` and stops
+retrying until an operator corrects the token and restarts the service. HTTP 409 fences out the old
+attempt. The GPU never writes or mounts m8i SQLite.
+
 Persistent files are rooted under `MOSHI_WORKER_CACHE`:
 
 ```text
 state/dispatch.sqlite3       durable dispatch, input, and service state
 incoming/<dispatch>/*.part  resumable input transfers
 inputs/sha256/<prefix>/<sha> verified content-addressed inputs
-outbox/                      reserved for durable result callbacks
+attempts/                    isolated, disposable active execution directories
+outbox/                      results retained until m8i acknowledges them
 logs/gpu-intake.log          intake process log (never contains credentials)
 ```
 

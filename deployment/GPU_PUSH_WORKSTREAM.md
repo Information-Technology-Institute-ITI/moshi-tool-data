@@ -46,20 +46,20 @@ SHA-256 verified and atomically moved to the content-addressed cache. SQLite use
 foreign-key enforcement, a busy timeout, and full synchronous writes. The service records host
 boot ID, service boot ID, exact build, protocol, fixed callback origin, and a persistent heartbeat.
 
-This phase can persist a `queued` dispatch, but it does not yet launch WhisperX or send a result.
-Do not cut m8i over to push dispatch or advertise model-ready status until Phase 2 is complete.
+This phase originally stopped at a durable `queued` dispatch. Phase 2 now consumes that state.
 
 ## Phase 2: execution and durable callback outbox
 
-The next g4dn phase will consume one queued attempt at a time through the existing
-`ContextJobExecutor`. It must keep the general service heartbeat alive while busy, persist result
-manifests before callback, upload through the m8i API, retry ambiguous network failures
-idempotently, and retain output until m8i acknowledges the atomic commit. A 401 must enter
-`auth_blocked` without retrying or exposing either credential. Interrupted `running` state must be
-reconciled against the m8i lease before rerun.
+The g4dn phase is implemented. It consumes one queued attempt at a time through the existing
+`ContextJobExecutor`, keeps general and lease heartbeats alive while busy, persists result manifests
+before callback, resumes artifact uploads, and retains outputs until m8i acknowledges the atomic
+commit. A 401 enters `auth_blocked`; a 409 fences the old attempt; transport failures use persisted
+bounded backoff. Interrupted `running` work is requeued but must pass an m8i lease heartbeat before
+the model runs again.
 
-Only after that phase should the m8i dispatcher be enabled. The legacy pull worker and the push
-intake must never run simultaneously.
+The remaining work is the m8i dispatcher and callback exposure on port 80. Until that is deployed,
+the GPU reports callback readiness false and will not start normal jobs. The legacy pull worker and
+the push intake must never run simultaneously.
 
 ## Phase 3: functional check and status integration
 
@@ -76,9 +76,9 @@ records in its local SQLite database.
 
 The g4dn portion is implemented as authenticated `GET/POST /internal/v2/self-checks`. Results are
 durable in `state/self-check.sqlite3`; decoded/reference text is deliberately excluded. The
-current readiness payload distinguishes `functional_check` from normal job `execution` and the
-callback `outbox`. The latter two remain false until the next workstream connects execution and
-m8i result delivery.
+current readiness payload distinguishes installed capabilities from operational readiness.
+`execution` and `callback_outbox` describe available GPU code; `callback.ready`,
+`functional_check.ready`, and `operational_ready` describe whether work may run now.
 
 ## Source-host service
 

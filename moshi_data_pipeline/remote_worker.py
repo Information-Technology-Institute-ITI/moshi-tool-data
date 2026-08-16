@@ -25,7 +25,9 @@ from moshi_data_pipeline.studio.protocol import (
 
 
 class WorkerTransportError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class JobExecutor(Protocol):
@@ -139,7 +141,8 @@ class HttpWorkerApi:
         except urllib.error.HTTPError as exc:
             detail = exc.read(4_096).decode("utf-8", errors="replace")
             raise WorkerTransportError(
-                f"Worker API {method} {path} returned HTTP {exc.code}: {detail}"
+                f"Worker API {method} {path} returned HTTP {exc.code}: {detail}",
+                status_code=exc.code,
             ) from exc
         except (OSError, urllib.error.URLError) as exc:
             raise WorkerTransportError(
@@ -231,7 +234,8 @@ class HttpWorkerApi:
         except urllib.error.HTTPError as exc:
             detail = exc.read(4_096).decode("utf-8", errors="replace")
             raise WorkerTransportError(
-                f"Artifact download returned HTTP {exc.code}: {detail}"
+                f"Artifact download returned HTTP {exc.code}: {detail}",
+                status_code=exc.code,
             ) from exc
         except (OSError, urllib.error.URLError) as exc:
             raise WorkerTransportError(
@@ -257,28 +261,19 @@ class HttpWorkerApi:
         size_bytes: int,
         media_type: str,
     ) -> ProducedArtifact:
-        upload = self._json(
-            "POST",
-            f"/internal/v1/jobs/{urllib.parse.quote(job_id)}/uploads",
-            payload={
-                "worker_id": worker_id,
-                "role": role,
-                "sha256": sha256,
-                "size_bytes": size_bytes,
-                "media_type": media_type,
-                "filename": path.name,
-            },
-            lease_token=lease_token,
+        upload = self.create_artifact_upload(
+            job_id,
+            worker_id,
+            lease_token,
+            role=role,
+            filename=path.name,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            media_type=media_type,
         )
         upload_id = str(upload["id"])
         if size_bytes:
-            query = urllib.parse.urlencode({"worker_id": worker_id})
-            _, headers, _ = self._request(
-                "HEAD",
-                f"/internal/v1/uploads/{urllib.parse.quote(upload_id)}?{query}",
-                lease_token=lease_token,
-            )
-            offset = int(headers.get("upload-offset", "0"))
+            offset = self.artifact_upload_offset(upload_id, worker_id, lease_token)
             with path.open("rb") as stream:
                 stream.seek(offset)
                 while offset < size_bytes:
@@ -286,15 +281,14 @@ class HttpWorkerApi:
                     if not chunk:
                         raise WorkerTransportError("Output file ended during upload")
                     end = offset + len(chunk) - 1
-                    self._request(
-                        "PUT",
-                        f"/internal/v1/uploads/{urllib.parse.quote(upload_id)}?{query}",
+                    self.append_artifact_upload(
+                        upload_id,
+                        worker_id,
+                        lease_token,
                         body=chunk,
-                        lease_token=lease_token,
-                        headers={
-                            "Content-Type": "application/octet-stream",
-                            "Content-Range": f"bytes {offset}-{end}/{size_bytes}",
-                        },
+                        start=offset,
+                        end=end,
+                        total=size_bytes,
                     )
                     offset = end + 1
         return ProducedArtifact(
@@ -303,6 +297,66 @@ class HttpWorkerApi:
             sha256=sha256,
             size_bytes=size_bytes,
             media_type=media_type,
+        )
+
+    def create_artifact_upload(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        *,
+        role: str,
+        filename: str,
+        sha256: str,
+        size_bytes: int,
+        media_type: str,
+    ) -> dict[str, Any]:
+        return self._json(
+            "POST",
+            f"/internal/v1/jobs/{urllib.parse.quote(job_id)}/uploads",
+            payload={
+                "worker_id": worker_id,
+                "role": role,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "media_type": media_type,
+                "filename": filename,
+            },
+            lease_token=lease_token,
+        )
+
+    def artifact_upload_offset(
+        self, upload_id: str, worker_id: str, lease_token: str
+    ) -> int:
+        query = urllib.parse.urlencode({"worker_id": worker_id})
+        _, headers, _ = self._request(
+            "HEAD",
+            f"/internal/v1/uploads/{urllib.parse.quote(upload_id)}?{query}",
+            lease_token=lease_token,
+        )
+        return int(headers.get("upload-offset", "0"))
+
+    def append_artifact_upload(
+        self,
+        upload_id: str,
+        worker_id: str,
+        lease_token: str,
+        *,
+        body: bytes,
+        start: int,
+        end: int,
+        total: int,
+    ) -> None:
+        query = urllib.parse.urlencode({"worker_id": worker_id})
+        self._request(
+            "PUT",
+            f"/internal/v1/uploads/{urllib.parse.quote(upload_id)}?{query}",
+            body=body,
+            lease_token=lease_token,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {start}-{end}/{total}",
+            },
         )
 
     def complete(

@@ -9,7 +9,7 @@ import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +100,7 @@ class GpuDispatchStore:
         self._prepare_directories()
         self._initialize()
         self.reconcile_files()
+        self.recover_execution_state()
 
     def _prepare_directories(self) -> None:
         for path in (
@@ -134,7 +135,7 @@ class GpuDispatchStore:
     def _initialize(self) -> None:
         with self.connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 1:
+            if version > 2:
                 raise RuntimeError(f"Unsupported GPU dispatch database version {version}")
             if version == 0:
                 connection.executescript(
@@ -197,6 +198,49 @@ class GpuDispatchStore:
                     );
 
                     PRAGMA user_version = 1;
+                    """
+                )
+            if version <= 1:
+                connection.executescript(
+                    """
+                    ALTER TABLE dispatches ADD COLUMN progress REAL NOT NULL DEFAULT 0;
+                    ALTER TABLE dispatches ADD COLUMN progress_message TEXT;
+                    ALTER TABLE dispatches ADD COLUMN execution_retry_count INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE dispatches ADD COLUMN next_execution_at TEXT;
+                    ALTER TABLE dispatches ADD COLUMN outbox_kind TEXT;
+                    ALTER TABLE dispatches ADD COLUMN outbox_payload_json TEXT;
+                    ALTER TABLE dispatches ADD COLUMN callback_retry_count INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE dispatches ADD COLUMN next_callback_at TEXT;
+                    ALTER TABLE dispatches ADD COLUMN last_callback_error TEXT;
+                    ALTER TABLE dispatches ADD COLUMN callback_http_status INTEGER;
+
+                    CREATE TABLE dispatch_outputs (
+                        dispatch_id TEXT NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
+                        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                        role TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        filename TEXT NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                        media_type TEXT NOT NULL,
+                        upload_id TEXT,
+                        state TEXT NOT NULL CHECK (state IN ('pending','uploaded')),
+                        PRIMARY KEY(dispatch_id, ordinal)
+                    );
+
+                    CREATE TABLE callback_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        auth_blocked INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_at TEXT,
+                        last_success_at TEXT,
+                        last_http_status INTEGER,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        next_retry_at TEXT,
+                        last_error_class TEXT
+                    );
+                    INSERT OR IGNORE INTO callback_state(singleton) VALUES (1);
+
+                    PRAGMA user_version = 2;
                     """
                 )
         self.database.chmod(0o600)
@@ -442,6 +486,14 @@ class GpuDispatchStore:
             "queued_at": row["queued_at"],
             "finished_at": row["finished_at"],
             "last_error": row["last_error"],
+            "progress": float(row["progress"]),
+            "progress_message": row["progress_message"],
+            "execution_retry_count": int(row["execution_retry_count"]),
+            "callback_retry_count": int(row["callback_retry_count"]),
+            "next_execution_at": row["next_execution_at"],
+            "next_callback_at": row["next_callback_at"],
+            "last_callback_error": row["last_callback_error"],
+            "callback_http_status": row["callback_http_status"],
             "inputs": [dict(item) for item in inputs],
         }
 
@@ -585,7 +637,11 @@ class GpuDispatchStore:
         dispatch = connection.execute(
             "SELECT state, start_payload_json FROM dispatches WHERE id=?", (dispatch_id,)
         ).fetchone()
-        if dispatch is None or str(dispatch["state"]) in TERMINAL_STATES:
+        if dispatch is None or str(dispatch["state"]) not in {
+            "receiving",
+            "verified",
+            "queued",
+        }:
             return
         incomplete = connection.execute(
             """
@@ -701,10 +757,415 @@ class GpuDispatchStore:
                 incoming.rmdir()
         return result, True
 
+    def recover_execution_state(self) -> None:
+        """Make interrupted local work safely eligible after an operator restart."""
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='queued', next_execution_at=?, updated_at=?,
+                    last_error='GPU service restarted during execution'
+                WHERE state='running'
+                """,
+                (timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                UPDATE dispatches SET state='outbox_pending', next_callback_at=?, updated_at=?
+                WHERE state='callback_uploading'
+                """,
+                (timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state=CASE WHEN outbox_kind IS NULL THEN 'queued' ELSE 'outbox_pending' END,
+                    next_execution_at=CASE WHEN outbox_kind IS NULL THEN ? ELSE next_execution_at END,
+                    next_callback_at=CASE WHEN outbox_kind IS NULL THEN next_callback_at ELSE ? END,
+                    updated_at=?
+                WHERE state='auth_blocked'
+                """,
+                (timestamp, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                UPDATE callback_state
+                SET auth_blocked=0, next_retry_at=?, last_error_class=NULL
+                WHERE singleton=1
+                """,
+                (timestamp,),
+            )
+
+    def _execution_record(
+        self, connection: sqlite3.Connection, dispatch_id: str
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM dispatches WHERE id=?", (dispatch_id,)
+        ).fetchone()
+        if row is None:
+            raise DispatchNotFoundError("Dispatch does not exist")
+        inputs = [
+            dict(value)
+            for value in connection.execute(
+                """
+                SELECT artifact_id, role, expected_sha256 AS sha256,
+                       expected_size AS size_bytes, media_type, filename,
+                       state, cache_path
+                FROM dispatch_inputs WHERE dispatch_id=? ORDER BY artifact_id
+                """,
+                (dispatch_id,),
+            ).fetchall()
+        ]
+        outputs = [
+            dict(value)
+            for value in connection.execute(
+                """
+                SELECT ordinal, role, path, filename, sha256, size_bytes,
+                       media_type, upload_id, state
+                FROM dispatch_outputs WHERE dispatch_id=? ORDER BY ordinal
+                """,
+                (dispatch_id,),
+            ).fetchall()
+        ]
+        return {
+            "dispatch_id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "attempt": int(row["attempt"]),
+            "state": str(row["state"]),
+            "input_fingerprint": str(row["input_fingerprint"]),
+            "context": (
+                json.loads(str(row["start_payload_json"]))
+                if row["start_payload_json"]
+                else None
+            ),
+            "lease_token": row["lease_token"],
+            "outbox_kind": row["outbox_kind"],
+            "outbox_payload": (
+                json.loads(str(row["outbox_payload_json"]))
+                if row["outbox_payload_json"]
+                else None
+            ),
+            "inputs": inputs,
+            "outputs": outputs,
+            "execution_retry_count": int(row["execution_retry_count"]),
+            "callback_retry_count": int(row["callback_retry_count"]),
+        }
+
+    def claim_queued_dispatch(self) -> dict[str, Any] | None:
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id FROM dispatches
+                WHERE state='queued'
+                  AND (next_execution_at IS NULL OR next_execution_at<=?)
+                ORDER BY queued_at, created_at LIMIT 1
+                """,
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                return None
+            dispatch_id = str(row["id"])
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='running', progress=0, progress_message='Starting',
+                    next_execution_at=NULL, updated_at=?
+                WHERE id=? AND state='queued'
+                """,
+                (timestamp, dispatch_id),
+            )
+            return self._execution_record(connection, dispatch_id)
+
+    def defer_execution(
+        self,
+        dispatch_id: str,
+        *,
+        delay_seconds: int,
+        error_summary: str,
+        http_status: int | None = None,
+    ) -> None:
+        next_attempt = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='queued', execution_retry_count=execution_retry_count+1,
+                    next_execution_at=?, last_error=?, callback_http_status=?, updated_at=?
+                WHERE id=? AND state='running'
+                """,
+                (next_attempt, error_summary[:300], http_status, _now(), dispatch_id),
+            )
+
+    def abandon_running(
+        self,
+        dispatch_id: str,
+        *,
+        state: str,
+        error_summary: str,
+        http_status: int | None = None,
+    ) -> None:
+        if state not in {"orphaned", "rejected"}:
+            raise ValueError("Invalid abandoned dispatch state")
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state=?, lease_token=NULL, lease_token_sha256=NULL,
+                    last_error=?, callback_http_status=?, finished_at=?, updated_at=?
+                WHERE id=? AND state='running'
+                """,
+                (
+                    state,
+                    error_summary[:300],
+                    http_status,
+                    timestamp,
+                    timestamp,
+                    dispatch_id,
+                ),
+            )
+
+    def update_progress(self, dispatch_id: str, value: float, message: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches SET progress=?, progress_message=?, updated_at=?
+                WHERE id=? AND state='running'
+                """,
+                (max(0.0, min(1.0, value)), message[:1000], _now(), dispatch_id),
+            )
+
+    def record_execution_success(
+        self,
+        dispatch_id: str,
+        completion_payload: dict[str, Any],
+        outputs: list[dict[str, Any]],
+    ) -> None:
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM dispatches WHERE id=?", (dispatch_id,)
+            ).fetchone()
+            if row is None or str(row["state"]) != "running":
+                raise DispatchConflictError("Dispatch is no longer running")
+            connection.execute(
+                "DELETE FROM dispatch_outputs WHERE dispatch_id=?", (dispatch_id,)
+            )
+            for ordinal, output in enumerate(outputs):
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_outputs(
+                        dispatch_id, ordinal, role, path, filename, sha256,
+                        size_bytes, media_type, state
+                    ) VALUES (?,?,?,?,?,?,?,?, 'pending')
+                    """,
+                    (
+                        dispatch_id,
+                        ordinal,
+                        output["role"],
+                        output["path"],
+                        output["filename"],
+                        output["sha256"],
+                        output["size_bytes"],
+                        output["media_type"],
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='outbox_pending', outbox_kind='complete',
+                    outbox_payload_json=?, progress=1, progress_message='Result pending callback',
+                    next_callback_at=?, callback_retry_count=0,
+                    last_callback_error=NULL, callback_http_status=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(completion_payload, ensure_ascii=False, separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                    dispatch_id,
+                ),
+            )
+
+    def record_execution_failure(
+        self, dispatch_id: str, failure_payload: dict[str, Any]
+    ) -> None:
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                "DELETE FROM dispatch_outputs WHERE dispatch_id=?", (dispatch_id,)
+            )
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='outbox_pending', outbox_kind='fail', outbox_payload_json=?,
+                    progress_message='Failure pending callback', next_callback_at=?,
+                    callback_retry_count=0, last_callback_error=NULL,
+                    callback_http_status=NULL, updated_at=?
+                WHERE id=? AND state='running'
+                """,
+                (
+                    json.dumps(failure_payload, ensure_ascii=False, separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                    dispatch_id,
+                ),
+            )
+
+    def claim_pending_callback(self) -> dict[str, Any] | None:
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id FROM dispatches
+                WHERE state='outbox_pending'
+                  AND (next_callback_at IS NULL OR next_callback_at<=?)
+                ORDER BY updated_at LIMIT 1
+                """,
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                return None
+            dispatch_id = str(row["id"])
+            connection.execute(
+                "UPDATE dispatches SET state='callback_uploading', updated_at=? WHERE id=?",
+                (timestamp, dispatch_id),
+            )
+            return self._execution_record(connection, dispatch_id)
+
+    def set_output_upload_id(
+        self, dispatch_id: str, ordinal: int, upload_id: str
+    ) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatch_outputs SET upload_id=?
+                WHERE dispatch_id=? AND ordinal=? AND upload_id IS NULL
+                """,
+                (upload_id, dispatch_id, ordinal),
+            )
+
+    def mark_output_uploaded(self, dispatch_id: str, ordinal: int) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatch_outputs SET state='uploaded'
+                WHERE dispatch_id=? AND ordinal=?
+                """,
+                (dispatch_id, ordinal),
+            )
+
+    def retry_callback(
+        self,
+        dispatch_id: str,
+        *,
+        delay_seconds: int,
+        error_class: str,
+        http_status: int | None,
+    ) -> None:
+        next_attempt = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='outbox_pending', callback_retry_count=callback_retry_count+1,
+                    next_callback_at=?, last_callback_error=?, callback_http_status=?,
+                    updated_at=?
+                WHERE id=? AND state='callback_uploading'
+                """,
+                (next_attempt, error_class[:120], http_status, _now(), dispatch_id),
+            )
+
+    def block_callback_auth(self, dispatch_id: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state='auth_blocked', last_callback_error='authentication_failed',
+                    callback_http_status=401, updated_at=?
+                WHERE id=?
+                """,
+                (_now(), dispatch_id),
+            )
+            connection.execute(
+                """
+                UPDATE callback_state SET auth_blocked=1, last_http_status=401,
+                    last_attempt_at=?, consecutive_failures=consecutive_failures+1,
+                    next_retry_at=NULL, last_error_class='authentication_failed'
+                WHERE singleton=1
+                """,
+                (_now(),),
+            )
+
+    def finish_callback(self, dispatch_id: str, state: str) -> None:
+        if state not in {"acknowledged", "orphaned", "rejected"}:
+            raise ValueError("Invalid terminal callback state")
+        timestamp = _now()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE dispatches
+                SET state=?, lease_token=NULL, lease_token_sha256=NULL,
+                    outbox_payload_json=NULL, next_callback_at=NULL,
+                    progress_message=?, finished_at=?, updated_at=?
+                WHERE id=? AND state='callback_uploading'
+                """,
+                (state, state.replace("_", " ").title(), timestamp, timestamp, dispatch_id),
+            )
+
+    def record_callback_health(
+        self,
+        *,
+        success: bool,
+        http_status: int | None,
+        error_class: str | None,
+        next_retry_seconds: int | None = None,
+    ) -> None:
+        timestamp = _now()
+        next_retry = (
+            (datetime.now(UTC) + timedelta(seconds=next_retry_seconds)).isoformat()
+            if next_retry_seconds is not None
+            else None
+        )
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE callback_state
+                SET last_attempt_at=?, last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END,
+                    last_http_status=?, consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures+1 END,
+                    next_retry_at=?, last_error_class=?, auth_blocked=CASE WHEN ?=401 THEN 1 ELSE auth_blocked END
+                WHERE singleton=1
+                """,
+                (
+                    timestamp,
+                    int(success),
+                    timestamp,
+                    http_status,
+                    int(success),
+                    next_retry,
+                    error_class,
+                    http_status,
+                ),
+            )
+
+    def callback_auth_blocked(self) -> bool:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT auth_blocked FROM callback_state WHERE singleton=1"
+            ).fetchone()
+            return bool(row["auth_blocked"])
+
     def status(self) -> dict[str, Any]:
         with self._lock, self.connect() as connection:
             service = connection.execute(
                 "SELECT * FROM service_state WHERE singleton=1"
+            ).fetchone()
+            callback = connection.execute(
+                "SELECT * FROM callback_state WHERE singleton=1"
             ).fetchone()
             counts = {
                 str(row["state"]): int(row["count"])
@@ -724,6 +1185,7 @@ class GpuDispatchStore:
         service_data = dict(service) if service is not None else None
         return {
             "service": service_data,
+            "callback": dict(callback) if callback is not None else None,
             "accepting_dispatches": active is None,
             "safe_to_stop": active is None,
             "current_dispatch": current,

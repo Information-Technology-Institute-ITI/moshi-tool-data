@@ -5,7 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -27,6 +27,10 @@ from moshi_data_pipeline.gpu_dispatch_state import (
     DispatchStorageError,
     GpuDispatchStore,
 )
+from moshi_data_pipeline.gpu_execution import (
+    GpuExecutionCoordinator,
+    default_worker_identity,
+)
 from moshi_data_pipeline.gpu_self_check import (
     FunctionalCheckRunner,
     SelfCheckCoordinator,
@@ -34,6 +38,7 @@ from moshi_data_pipeline.gpu_self_check import (
     SelfCheckRateLimitError,
     SelfCheckRepository,
 )
+from moshi_data_pipeline.remote_worker import HttpWorkerApi
 
 
 def _positive_integer(name: str, default: int) -> int:
@@ -106,6 +111,9 @@ class GpuIntakeSettings:
     self_check_max_cer: float = 0.20
     self_check_validity_hours: int = 6
     self_check_manual_cooldown_seconds: int = 600
+    callback_token: str | None = None
+    callback_timeout_seconds: int = 15
+    job_heartbeat_seconds: int = 15
 
     @classmethod
     def from_environment(cls) -> GpuIntakeSettings:
@@ -118,6 +126,9 @@ class GpuIntakeSettings:
             raise RuntimeError("MOSHI_BUILD_ID is required")
         if not callback:
             raise RuntimeError("MOSHI_WEB_INTERNAL_URL is required")
+        callback_token = os.environ.get("MOSHI_WORKER_TOKEN", "")
+        if not callback_token:
+            raise RuntimeError("MOSHI_WORKER_TOKEN is required")
         return cls(
             cache_root=Path(os.environ.get("MOSHI_WORKER_CACHE", "/cache")),
             build_id=build_id,
@@ -144,6 +155,11 @@ class GpuIntakeSettings:
             self_check_manual_cooldown_seconds=_positive_integer(
                 "MOSHI_SELF_TEST_MANUAL_COOLDOWN_SECONDS", 600
             ),
+            callback_token=callback_token,
+            callback_timeout_seconds=_positive_integer(
+                "MOSHI_CALLBACK_TIMEOUT_SECONDS", 15
+            ),
+            job_heartbeat_seconds=_positive_integer("MOSHI_JOB_HEARTBEAT_SECONDS", 15),
         )
 
 
@@ -155,6 +171,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
     )
     service_boot_id = uuid4().hex
     host_boot_id = _host_boot_id()
+    compute_lock = asyncio.Lock()
     if bool(settings.config_path) != bool(settings.self_check_metadata):
         raise RuntimeError(
             "MOSHI_CONFIG and MOSHI_SELF_TEST_METADATA must be configured together"
@@ -175,10 +192,36 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         self_check = SelfCheckCoordinator(
             runner,
             SelfCheckRepository(store.state_root),
+            compute_lock=compute_lock,
+        )
+    execution: GpuExecutionCoordinator | None = None
+    if settings.callback_token:
+        callback_api = HttpWorkerApi(
+            settings.callback_origin,
+            settings.callback_token,
+            timeout_seconds=settings.callback_timeout_seconds,
+        )
+        execution = GpuExecutionCoordinator(
+            store,
+            callback_api,
+            default_worker_identity(settings.build_id, host_boot_id),
+            compute_lock=compute_lock,
+            heartbeat_seconds=settings.job_heartbeat_seconds,
         )
 
     def combined_status() -> dict[str, Any]:
         value = store.status()
+        callback = value.get("callback") or {}
+        last_callback_success = callback.get("last_success_at")
+        callback_ready = bool(
+            execution is not None
+            and not callback.get("auth_blocked")
+            and last_callback_success
+            and datetime.fromisoformat(str(last_callback_success))
+            > datetime.now(UTC) - timedelta(seconds=45)
+        )
+        callback["ready"] = callback_ready
+        value["callback"] = callback
         if self_check is None:
             value["functional_check"] = {
                 "available": False,
@@ -186,22 +229,27 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
                 "requirement_key": None,
                 "latest": None,
             }
-            return value
-        latest = self_check.latest()
-        requirement_key = self_check.runner.requirement_key
-        functional_ready = bool(
-            latest
-            and latest["requirement_key"] == requirement_key
-            and latest["status"] == "passed"
-            and latest["valid_until"]
-            and datetime.fromisoformat(str(latest["valid_until"])) > datetime.now(UTC)
+            functional_ready = False
+        else:
+            latest = self_check.latest()
+            requirement_key = self_check.runner.requirement_key
+            functional_ready = bool(
+                latest
+                and latest["requirement_key"] == requirement_key
+                and latest["status"] == "passed"
+                and latest["valid_until"]
+                and datetime.fromisoformat(str(latest["valid_until"]))
+                > datetime.now(UTC)
+            )
+            value["functional_check"] = {
+                "available": True,
+                "ready": functional_ready,
+                "requirement_key": requirement_key,
+                "latest": latest,
+            }
+        value["operational_ready"] = bool(
+            execution is not None and callback_ready and functional_ready
         )
-        value["functional_check"] = {
-            "available": True,
-            "ready": functional_ready,
-            "requirement_key": requirement_key,
-            "latest": latest,
-        }
         return value
 
     async def heartbeat_loop() -> None:
@@ -218,10 +266,14 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
             build_id=settings.build_id,
             callback_origin=settings.callback_origin,
         )
+        if execution is not None:
+            execution.start()
         task = asyncio.create_task(heartbeat_loop())
         try:
             yield
         finally:
+            if execution is not None:
+                await execution.stop()
             if self_check is not None:
                 await self_check.stop()
             task.cancel()
@@ -290,13 +342,13 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
     async def ready() -> dict[str, Any]:
         value = combined_status()
         return {
-            "status": "intake_ready",
+            "status": "ready" if value["operational_ready"] else "intake_ready",
             "protocol_version": GPU_DISPATCH_PROTOCOL_VERSION,
             "build_id": settings.build_id,
             "capabilities": {
                 "input_receipt": True,
-                "execution": False,
-                "callback_outbox": False,
+                "execution": execution is not None,
+                "callback_outbox": execution is not None,
                 "functional_check": self_check is not None,
             },
             **value,
@@ -320,6 +372,9 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
     ) -> dict[str, Any]:
         if self_check is None:
             raise HTTPException(status_code=503, detail="Functional check is not configured")
+        current = store.status().get("current_dispatch")
+        if current and current["state"] == "running":
+            raise HTTPException(status_code=409, detail="GPU is processing a job")
         record, created = await self_check.trigger(payload.trigger, payload.force)
         response.status_code = 202 if created else 200
         return record
@@ -383,6 +438,17 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         response: Response,
         x_lease_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
+        readiness = combined_status()
+        if execution is not None and not readiness["callback"]["ready"]:
+            raise HTTPException(
+                status_code=503,
+                detail="The m8i callback API has not passed a recent authenticated heartbeat",
+            )
+        if self_check is not None and not readiness["functional_check"]["ready"]:
+            raise HTTPException(
+                status_code=409,
+                detail="A current functional check must pass before GPU execution",
+            )
         try:
             value, queued = store.start_dispatch(
                 dispatch_id, payload, x_lease_token or ""

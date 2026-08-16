@@ -44,6 +44,7 @@ def test_processing_runtime_contracts_do_not_import_web_state() -> None:
     for relative in (
         "gpu_dispatch_protocol.py",
         "gpu_dispatch_state.py",
+        "gpu_execution.py",
         "gpu_intake.py",
         "gpu_intake_main.py",
         "gpu_self_check.py",
@@ -91,6 +92,7 @@ def test_gpu_intake_sources_match_processing_build_context() -> None:
     for relative in (
         "gpu_dispatch_protocol.py",
         "gpu_dispatch_state.py",
+        "gpu_execution.py",
         "gpu_intake.py",
         "gpu_intake_main.py",
         "gpu_self_check.py",
