@@ -14,5 +14,4 @@ dist/
 .env
 raw/
 studio_workspace/
-processing_service/.venv/
 local_data/

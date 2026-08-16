@@ -58,38 +58,36 @@ The source-host service entrypoint is:
 python -m moshi_data_pipeline.gpu_intake_main
 ```
 
-The container entrypoint is defined by `processing_service/Dockerfile`. For local container validation, populate `.env` from `.env.example` and run:
+For an Ubuntu source deployment:
 
 ```bash
-docker compose up --build
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install --no-deps -e .
+sudo install -o root -g root -m 0644 \
+  systemd/moshi-gpu-intake.service \
+  /etc/systemd/system/moshi-gpu-intake.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now moshi-gpu-intake.service
 ```
 
-The Compose service uses host networking so the private intake is reachable on the g4dn host. AWS security groups and the host firewall must restrict TCP 8766 to the m8i private address.
+The service expects protected environment files in `/home/ubuntu/.config/moshi/`
+and persistent state in `/home/ubuntu/moshi-gpu-cache/`. AWS security groups and
+the host firewall must restrict TCP 8766 to the m8i private address.
 
 ## Layout
 
-- `moshi_data_pipeline/`: canonical Python implementation used by source deployments and tests.
-- `processing_service/`: independent CUDA/WhisperX Docker build context.
-- `processing_service/systemd/`: source-host service unit.
-- `tests/`: GPU intake, callback, execution, protocol, and build-isolation tests only.
-- `compose.yaml`: standalone WhisperX container composition.
+- `moshi_data_pipeline/`: source-host GPU intake and WhisperX implementation.
+- `systemd/`: hardened source-host service unit.
+- `tests/`: GPU intake, callback, execution, protocol, and runtime-layout tests.
+- `requirements.txt`, `pyproject.toml`, `uv.lock`: locked Python runtime inputs.
 
 ## Verification
 
 ```bash
 .venv/bin/python -m pytest -q
-.venv/bin/ruff check \
-  moshi_data_pipeline/callback_contract.py \
-  moshi_data_pipeline/gpu_callback.py \
-  moshi_data_pipeline/gpu_dispatch_protocol.py \
-  moshi_data_pipeline/gpu_dispatch_state.py \
-  moshi_data_pipeline/gpu_execution.py \
-  moshi_data_pipeline/gpu_intake.py \
-  moshi_data_pipeline/gpu_intake_main.py \
-  moshi_data_pipeline/gpu_job_protocol.py \
-  moshi_data_pipeline/gpu_self_check.py \
-  processing_service/moshi_data_pipeline \
-  tests
+.venv/bin/ruff check moshi_data_pipeline tests
+systemd-analyze verify systemd/moshi-gpu-intake.service
 ```
 
 The private `/internal/v2/*` routes require Bearer authentication. Only `GET /health/live` is unauthenticated, and port 8766 must never be exposed publicly.

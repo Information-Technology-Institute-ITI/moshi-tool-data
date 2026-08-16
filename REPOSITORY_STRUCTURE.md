@@ -6,18 +6,19 @@ This checkout contains only the g4dn WhisperX processing service. The m8i websit
 
 | Path | Purpose |
 | --- | --- |
-| `moshi_data_pipeline/` | Canonical GPU intake, dispatch, callback, and WhisperX execution source. |
-| `processing_service/` | Self-contained CUDA Docker build context for g4dn. |
+| `moshi_data_pipeline/` | GPU intake, dispatch, callback, and WhisperX execution source. |
 | `tests/` | GPU-only contract and execution tests. |
-| `compose.yaml` | Standalone GPU service composition using host networking. |
+| `systemd/` | Hardened source-host service unit. |
 | `.env.example` | Required intake, callback, build, and model environment variables. |
-| `pyproject.toml`, `uv.lock` | Source-host Python environment and frozen dependencies. |
+| `requirements.txt`, `pyproject.toml`, `uv.lock` | Source-host Python environment and frozen dependencies. |
 
 ## GPU Runtime
 
 The active entrypoint is `moshi_data_pipeline.gpu_intake_main`. Protocol 2.0 intake modules accept only transcription dispatches. Callback protocol 1.0 names such as `MOSHI_WORKER_TOKEN`, `worker_id`, and `/internal/v1/workers/heartbeat` are compatibility fields for communication with m8i; they do not represent another runtime.
 
-`processing_service/moshi_data_pipeline/` contains the deployed package copy. `tests/test_service_build_contexts.py` verifies the active GPU modules match the canonical source and that web/catalog modules are absent from the image context.
+There is one package tree and one deployment mode. `tests/test_runtime_layout.py`
+verifies that removed web, container, and pull-worker artifacts do not return and
+that the systemd unit uses the protected source-host paths.
 
 ## Persistent Data
 
@@ -29,4 +30,4 @@ The GPU cache contains model files, checksum-addressed inputs, disposable attemp
 - `test_gpu_execution.py`: execution, restart recovery, and durable callbacks.
 - `test_gpu_callback.py`: callback protocol transport.
 - `test_gpu_job_protocol.py`: transcription-only immutable job contexts.
-- `test_service_build_contexts.py`: image isolation, source synchronization, Compose, and systemd checks.
+- `test_runtime_layout.py`: standalone repository and systemd layout checks.
