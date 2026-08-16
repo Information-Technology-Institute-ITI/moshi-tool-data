@@ -30,6 +30,11 @@ Store secrets only in protected environment files or a managed secret service. N
 unit files, command lines, source control, test fixtures, or access logs. The intake supports
 `MOSHI_DISPATCH_TOKEN_NEXT` for overlap during rotation.
 
+Ports are runtime configuration, not fixed deployment constants. Use `MOSHI_WEB_PORT` for the
+m8i callback listener port and `MOSHI_GPU_INTAKE_PORT` for the g4dn private intake listener. Their
+initial values are 80 and 8766 respectively; security-group and host-firewall rules must be updated
+deliberately whenever either value changes.
+
 ## Phase 1: private intake and persistent state
 
 The first implementation phase is intentionally bounded. It provides:

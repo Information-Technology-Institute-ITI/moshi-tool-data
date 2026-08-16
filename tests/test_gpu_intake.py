@@ -5,12 +5,52 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from moshi_data_pipeline.gpu_intake import GpuIntakeSettings, create_gpu_intake_app
 
 TOKEN = "dispatch-token-for-tests"
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_settings_from_environment_honor_explicit_ports(
+    tmp_path, monkeypatch
+) -> None:
+    values = {
+        "MOSHI_DISPATCH_TOKEN": TOKEN,
+        "MOSHI_WORKER_TOKEN": "callback-token-for-tests",
+        "MOSHI_BUILD_ID": "build-a",
+        "MOSHI_WEB_INTERNAL_URL": "http://web.internal:80",
+        "MOSHI_WEB_PORT": "8080",
+        "MOSHI_GPU_INTAKE_PORT": "9000",
+        "MOSHI_WORKER_CACHE": str(tmp_path / "cache"),
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    settings = GpuIntakeSettings.from_environment()
+
+    assert settings.callback_origin == "http://web.internal:8080"
+    assert settings.port == 9000
+
+
+@pytest.mark.parametrize("name", ["MOSHI_WEB_PORT", "MOSHI_GPU_INTAKE_PORT"])
+@pytest.mark.parametrize("value", ["0", "65536", "not-a-port"])
+def test_settings_reject_invalid_ports(tmp_path, monkeypatch, name, value) -> None:
+    values = {
+        "MOSHI_DISPATCH_TOKEN": TOKEN,
+        "MOSHI_WORKER_TOKEN": "callback-token-for-tests",
+        "MOSHI_BUILD_ID": "build-a",
+        "MOSHI_WEB_INTERNAL_URL": "http://web.internal",
+        "MOSHI_WORKER_CACHE": str(tmp_path / "cache"),
+        name: value,
+    }
+    for key, setting in values.items():
+        monkeypatch.setenv(key, setting)
+
+    with pytest.raises(RuntimeError, match="port|integer|positive"):
+        GpuIntakeSettings.from_environment()
 
 
 def _settings(root: Path, *, build_id: str = "build-a") -> GpuIntakeSettings:

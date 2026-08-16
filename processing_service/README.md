@@ -52,7 +52,9 @@ Required variables:
 - `MOSHI_WORKER_CACHE=/home/ubuntu/moshi-worker-cache` for this source deployment.
 
 Optional variables include `MOSHI_DISPATCH_TOKEN_NEXT` for rotation,
-`MOSHI_GPU_INTAKE_PORT` (default 8766), `MOSHI_GPU_MAX_INPUT_BYTES` (default 20 GiB), and
+`MOSHI_WEB_PORT` overrides the callback port encoded in `MOSHI_WEB_INTERNAL_URL` (defaulting to
+that URL's explicit or scheme-default port). `MOSHI_GPU_INTAKE_PORT` controls the private intake
+listener (default 8766). `MOSHI_GPU_MAX_INPUT_BYTES` (default 20 GiB) and
 `MOSHI_GPU_MIN_FREE_BYTES` (default 10 GiB).
 
 Configure the functional check with `MOSHI_CONFIG` and `MOSHI_SELF_TEST_METADATA`. Both must be

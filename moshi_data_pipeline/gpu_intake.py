@@ -70,7 +70,20 @@ def _positive_float(name: str, default: float) -> float:
     return value
 
 
-def _callback_origin(value: str) -> str:
+def _optional_tcp_port(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if not 1 <= value <= 65535:
+        raise RuntimeError(f"{name} must be a valid TCP port")
+    return value
+
+
+def _callback_origin(value: str, port_override: int | None = None) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RuntimeError("MOSHI_WEB_INTERNAL_URL must be an HTTP(S) origin")
@@ -82,7 +95,8 @@ def _callback_origin(value: str) -> str:
         or parsed.fragment
     ):
         raise RuntimeError("MOSHI_WEB_INTERNAL_URL must be a plain origin")
-    port = f":{parsed.port}" if parsed.port else ""
+    selected_port = port_override if port_override is not None else parsed.port
+    port = f":{selected_port}" if selected_port else ""
     return f"{parsed.scheme}://{parsed.hostname}{port}"
 
 
@@ -132,7 +146,9 @@ class GpuIntakeSettings:
         return cls(
             cache_root=Path(os.environ.get("MOSHI_WORKER_CACHE", "/cache")),
             build_id=build_id,
-            callback_origin=_callback_origin(callback),
+            callback_origin=_callback_origin(
+                callback, _optional_tcp_port("MOSHI_WEB_PORT")
+            ),
             dispatch_token=token,
             dispatch_token_next=os.environ.get("MOSHI_DISPATCH_TOKEN_NEXT") or None,
             host=os.environ.get("MOSHI_GPU_INTAKE_HOST", "0.0.0.0"),
