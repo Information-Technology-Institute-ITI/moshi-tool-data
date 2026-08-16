@@ -1230,5 +1230,3 @@ def render_source_clips(
     )
     progress(1.0, "Clips are ready for listening review")
     return {"source_id": source_id, "clips": len(artifacts)}
-
-

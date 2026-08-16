@@ -4,12 +4,12 @@ import asyncio
 import hashlib
 from pathlib import Path
 
+from moshi_data_pipeline.gpu_callback import GpuCallbackTransportError, GpuServiceIdentity
 from moshi_data_pipeline.gpu_dispatch_protocol import DispatchCreate, DispatchStart
 from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
 from moshi_data_pipeline.gpu_execution import GpuJobRunner, GpuOutboxSender
-from moshi_data_pipeline.remote_worker import WorkerIdentity, WorkerTransportError
+from moshi_data_pipeline.gpu_job_protocol import ArtifactRef, JobContext
 from moshi_data_pipeline.studio.execution_runtime import ExecutionOutput, ProducedFile
-from moshi_data_pipeline.studio.protocol import ArtifactRef, JobContext
 
 
 class FakeCallbackApi:
@@ -28,7 +28,7 @@ class FakeCallbackApi:
     def create_artifact_upload(
         self,
         job_id,
-        worker_id,
+        gpu_service_id,
         lease_token,
         *,
         role,
@@ -41,13 +41,13 @@ class FakeCallbackApi:
         self.uploads[identifier] = bytearray()
         return {"id": identifier}
 
-    def artifact_upload_offset(self, upload_id, worker_id, lease_token):
+    def artifact_upload_offset(self, upload_id, gpu_service_id, lease_token):
         return len(self.uploads[upload_id])
 
     def append_artifact_upload(
         self,
         upload_id,
-        worker_id,
+        gpu_service_id,
         lease_token,
         *,
         body,
@@ -160,16 +160,14 @@ def _prepare_dispatch(tmp_path) -> tuple[GpuDispatchStore, bytes]:
             )
         ],
     )
-    store.start_dispatch(
-        "dispatch-1", DispatchStart(context=context), "lease-" + "x" * 40
-    )
+    store.start_dispatch("dispatch-1", DispatchStart(context=context), "lease-" + "x" * 40)
     return store, content
 
 
 def test_pushed_job_executes_then_persists_uploads_and_completion(tmp_path) -> None:
     store, _ = _prepare_dispatch(tmp_path)
     api = FakeCallbackApi()
-    identity = WorkerIdentity("gpu-1", "boot-1", "build-a")
+    identity = GpuServiceIdentity("gpu-1", "boot-1", "build-a")
     runner = GpuJobRunner(
         store,
         api,
@@ -207,12 +205,12 @@ def test_lease_401_blocks_execution_without_losing_dispatch(tmp_path) -> None:
 
     class UnauthorizedApi(FakeCallbackApi):
         def job_heartbeat(self, job_id, lease_token, payload):
-            raise WorkerTransportError("unauthorized", status_code=401)
+            raise GpuCallbackTransportError("unauthorized", status_code=401)
 
     runner = GpuJobRunner(
         store,
         UnauthorizedApi(),
-        WorkerIdentity("gpu-1", "boot-1", "build-a"),
+        GpuServiceIdentity("gpu-1", "boot-1", "build-a"),
         executor_factory=FakeExecutor,
     )
     assert runner.run_once() is True
@@ -237,7 +235,7 @@ def test_interrupted_running_dispatch_is_requeued_on_store_restart(tmp_path) -> 
 def test_execution_failure_is_delivered_through_durable_failure_callback(tmp_path) -> None:
     store, _ = _prepare_dispatch(tmp_path)
     api = FakeCallbackApi()
-    identity = WorkerIdentity("gpu-1", "boot-1", "build-a")
+    identity = GpuServiceIdentity("gpu-1", "boot-1", "build-a")
     runner = GpuJobRunner(
         store,
         api,
@@ -269,11 +267,11 @@ def test_ambiguous_completion_retry_reuses_persisted_upload(tmp_path) -> None:
 
         def complete(self, job_id, lease_token, payload):
             if self.fail_completion:
-                raise WorkerTransportError("response was lost")
+                raise GpuCallbackTransportError("response was lost")
             return super().complete(job_id, lease_token, payload)
 
     api = FlakyApi()
-    identity = WorkerIdentity("gpu-1", "boot-1", "build-a")
+    identity = GpuServiceIdentity("gpu-1", "boot-1", "build-a")
     runner = GpuJobRunner(
         store,
         api,
@@ -288,9 +286,7 @@ def test_ambiguous_completion_retry_reuses_persisted_upload(tmp_path) -> None:
     assert list(api.uploads) == ["upload-1"]
 
     with store.connect() as connection:
-        connection.execute(
-            "UPDATE dispatches SET next_callback_at=NULL WHERE id='dispatch-1'"
-        )
+        connection.execute("UPDATE dispatches SET next_callback_at=NULL WHERE id='dispatch-1'")
     api.fail_completion = False
     assert sender.run_once() is True
     assert store.get_dispatch("dispatch-1")["state"] == "acknowledged"

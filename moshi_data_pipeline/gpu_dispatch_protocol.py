@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from moshi_data_pipeline.studio.protocol import JobContext
+from moshi_data_pipeline.gpu_job_protocol import JobContext
 
 GPU_DISPATCH_PROTOCOL_VERSION = "2.0"
 

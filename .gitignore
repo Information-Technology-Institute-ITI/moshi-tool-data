@@ -3,7 +3,7 @@
 .runtime/
 .cache/huggingface/
 huggingface/
-moshi-worker-cache/
+moshi-gpu-cache/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -14,11 +14,5 @@ dist/
 .env
 raw/
 studio_workspace/
-web/node_modules/
-web/*.tsbuildinfo
-web/vite.config.js
-web/vite.config.d.ts
-web_service/.venv/
-web_service/frontend/node_modules/
 processing_service/.venv/
 local_data/

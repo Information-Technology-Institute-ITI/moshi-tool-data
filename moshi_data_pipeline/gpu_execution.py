@@ -12,15 +12,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
-from moshi_data_pipeline.remote_worker import (
-    HttpWorkerApi,
-    WorkerIdentity,
-    WorkerTransportError,
+from moshi_data_pipeline.callback_contract import CALLBACK_PROTOCOL_VERSION
+from moshi_data_pipeline.gpu_callback import (
+    GpuCallbackTransportError,
+    GpuServiceIdentity,
+    HttpGpuCallbackApi,
     sha256_file,
 )
+from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
+from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS, JobContext
 from moshi_data_pipeline.studio.execution_runtime import ContextJobExecutor, ExecutionOutput
-from moshi_data_pipeline.studio.protocol import JOB_KINDS, WORKER_PROTOCOL_VERSION, JobContext
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _failure_payload(exc: Exception, worker_id: str) -> dict[str, Any]:
+def _failure_payload(exc: Exception, gpu_service_id: str) -> dict[str, Any]:
     message = str(exc)[:4000] or type(exc).__name__
     lowered = message.casefold()
     if isinstance(exc, MemoryError) or "out of memory" in lowered:
@@ -58,7 +59,7 @@ def _failure_payload(exc: Exception, worker_id: str) -> dict[str, Any]:
     else:
         failure_class, retryable = "application", False
     return {
-        "worker_id": worker_id,
+        "worker_id": gpu_service_id,
         "failure_class": failure_class,
         "error": message,
         "retryable": retryable,
@@ -69,8 +70,8 @@ class GpuJobRunner:
     def __init__(
         self,
         store: GpuDispatchStore,
-        api: HttpWorkerApi,
-        identity: WorkerIdentity,
+        api: HttpGpuCallbackApi,
+        identity: GpuServiceIdentity,
         *,
         executor_factory: Any = ContextJobExecutor,
         heartbeat_seconds: float = 15,
@@ -96,7 +97,7 @@ class GpuJobRunner:
                 str(record["job_id"]),
                 str(record["lease_token"]),
                 {
-                    "worker_id": self.identity.worker_id,
+                    "worker_id": self.identity.service_id,
                     "progress": 0.0,
                     "message": "GPU accepted pushed attempt",
                 },
@@ -109,11 +110,9 @@ class GpuJobRunner:
                     http_status=409,
                 )
                 return False
-            self.store.record_callback_health(
-                success=True, http_status=200, error_class=None
-            )
+            self.store.record_callback_health(success=True, http_status=200, error_class=None)
             return True
-        except WorkerTransportError as exc:
+        except GpuCallbackTransportError as exc:
             dispatch_id = str(record["dispatch_id"])
             if exc.status_code == 401:
                 self.store.block_callback_auth(dispatch_id)
@@ -140,9 +139,7 @@ class GpuJobRunner:
                 )
             return False
 
-    def _verified_inputs(
-        self, record: dict[str, Any], context: JobContext
-    ) -> dict[str, Path]:
+    def _verified_inputs(self, record: dict[str, Any], context: JobContext) -> dict[str, Path]:
         registered = {str(item["artifact_id"]): item for item in record["inputs"]}
         inputs: dict[str, Path] = {}
         for artifact in context.inputs:
@@ -201,7 +198,7 @@ class GpuJobRunner:
         self.store.record_execution_success(
             dispatch_id,
             {
-                "worker_id": self.identity.worker_id,
+                "worker_id": self.identity.service_id,
                 "input_fingerprint": context.input_fingerprint,
                 "kind": context.kind,
                 "result": output.result,
@@ -222,14 +219,14 @@ class GpuJobRunner:
         if not isinstance(context_wrapper, dict) or "context" not in context_wrapper:
             self.store.record_execution_failure(
                 dispatch_id,
-                _failure_payload(ValueError("Missing execution context"), self.identity.worker_id),
+                _failure_payload(ValueError("Missing execution context"), self.identity.service_id),
             )
             return True
         try:
             context = JobContext.model_validate(context_wrapper["context"])
         except Exception as exc:  # noqa: BLE001 - stored as a bounded invalid-input failure.
             self.store.record_execution_failure(
-                dispatch_id, _failure_payload(exc, self.identity.worker_id)
+                dispatch_id, _failure_payload(exc, self.identity.service_id)
             )
             return True
         lease_token = str(record["lease_token"])
@@ -244,7 +241,7 @@ class GpuJobRunner:
                     response = self.api.job_heartbeat(
                         context.job_id,
                         lease_token,
-                        {"worker_id": self.identity.worker_id, **progress_state},
+                        {"worker_id": self.identity.service_id, **progress_state},
                     )
                     if response.get("cancel_requested"):
                         cancelled.append("Web service cancelled or superseded the attempt")
@@ -253,7 +250,7 @@ class GpuJobRunner:
                         self.store.record_callback_health(
                             success=True, http_status=200, error_class=None
                         )
-                except WorkerTransportError as exc:
+                except GpuCallbackTransportError as exc:
                     if exc.status_code == 401:
                         auth_failed.set()
                         heartbeat_stop.set()
@@ -296,7 +293,7 @@ class GpuJobRunner:
                 self.store.block_callback_auth(dispatch_id)
         except Exception as exc:  # noqa: BLE001 - converted to a bounded durable failure.
             self.store.record_execution_failure(
-                dispatch_id, _failure_payload(exc, self.identity.worker_id)
+                dispatch_id, _failure_payload(exc, self.identity.service_id)
             )
             if auth_failed.is_set():
                 self.store.block_callback_auth(dispatch_id)
@@ -313,8 +310,8 @@ class GpuOutboxSender:
     def __init__(
         self,
         store: GpuDispatchStore,
-        api: HttpWorkerApi,
-        identity: WorkerIdentity,
+        api: HttpGpuCallbackApi,
+        identity: GpuServiceIdentity,
     ) -> None:
         self.store = store
         self.api = api
@@ -340,7 +337,7 @@ class GpuOutboxSender:
             if not upload_id:
                 upload = self.api.create_artifact_upload(
                     str(record["job_id"]),
-                    self.identity.worker_id,
+                    self.identity.service_id,
                     str(record["lease_token"]),
                     role=str(output["role"]),
                     filename=str(output["filename"]),
@@ -354,20 +351,20 @@ class GpuOutboxSender:
                 )
             size = int(output["size_bytes"])
             offset = self.api.artifact_upload_offset(
-                str(upload_id), self.identity.worker_id, str(record["lease_token"])
+                str(upload_id), self.identity.service_id, str(record["lease_token"])
             )
             if offset < 0 or offset > size:
-                raise WorkerTransportError("Web upload offset is invalid")
+                raise GpuCallbackTransportError("Web upload offset is invalid")
             with path.open("rb") as stream:
                 stream.seek(offset)
                 while offset < size:
                     chunk = stream.read(min(self.api.upload_chunk_bytes, size - offset))
                     if not chunk:
-                        raise WorkerTransportError("Outbox artifact ended during upload")
+                        raise GpuCallbackTransportError("Outbox artifact ended during upload")
                     end = offset + len(chunk) - 1
                     self.api.append_artifact_upload(
                         str(upload_id),
-                        self.identity.worker_id,
+                        self.identity.service_id,
                         str(record["lease_token"]),
                         body=chunk,
                         start=offset,
@@ -375,9 +372,7 @@ class GpuOutboxSender:
                         total=size,
                     )
                     offset = end + 1
-            self.store.mark_output_uploaded(
-                str(record["dispatch_id"]), int(output["ordinal"])
-            )
+            self.store.mark_output_uploaded(str(record["dispatch_id"]), int(output["ordinal"]))
             produced.append(
                 {
                     "upload_id": str(upload_id),
@@ -405,16 +400,12 @@ class GpuOutboxSender:
             payload = dict(record["outbox_payload"] or {})
             if record["outbox_kind"] == "complete":
                 payload["artifacts"] = self._upload_outputs(record)
-                self.api.complete(
-                    str(record["job_id"]), str(record["lease_token"]), payload
-                )
+                self.api.complete(str(record["job_id"]), str(record["lease_token"]), payload)
             elif record["outbox_kind"] == "fail":
-                self.api.fail(
-                    str(record["job_id"]), str(record["lease_token"]), payload
-                )
+                self.api.fail(str(record["job_id"]), str(record["lease_token"]), payload)
             else:
                 raise ValueError("Unknown durable callback kind")
-        except WorkerTransportError as exc:
+        except GpuCallbackTransportError as exc:
             if exc.status_code == 401:
                 self.store.block_callback_auth(dispatch_id)
             elif exc.status_code == 409:
@@ -447,8 +438,8 @@ class GpuExecutionCoordinator:
     def __init__(
         self,
         store: GpuDispatchStore,
-        api: HttpWorkerApi,
-        identity: WorkerIdentity,
+        api: HttpGpuCallbackApi,
+        identity: GpuServiceIdentity,
         *,
         compute_lock: asyncio.Lock,
         heartbeat_seconds: float = 15,
@@ -473,18 +464,23 @@ class GpuExecutionCoordinator:
         state = self.store.status()
         current = state.get("current_dispatch")
         current_state = str(current["state"]) if current else None
-        worker_status = "busy" if current_state in {
-            "running",
-            "outbox_pending",
-            "callback_uploading",
-        } else "idle"
+        service_status = (
+            "busy"
+            if current_state
+            in {
+                "running",
+                "outbox_pending",
+                "callback_uploading",
+            }
+            else "idle"
+        )
         return {
-            "protocol_version": WORKER_PROTOCOL_VERSION,
-            "worker_id": self.identity.worker_id,
+            "protocol_version": CALLBACK_PROTOCOL_VERSION,
+            "worker_id": self.identity.service_id,
             "boot_id": self.identity.boot_id,
             "build_id": self.identity.build_id,
             "supported_kinds": list(JOB_KINDS),
-            "status": worker_status,
+            "status": service_status,
             "current_job_id": current["job_id"] if current else None,
             "details": {"dispatch_protocol_version": "2.0", "mode": "push"},
         }
@@ -510,24 +506,20 @@ class GpuExecutionCoordinator:
                     LOGGER.error("GPU outbox loop error: %s", type(exc).__name__)
             await asyncio.sleep(0 if processed else 0.75)
 
-    async def _worker_heartbeat_loop(self) -> None:
+    async def _service_heartbeat_loop(self) -> None:
         while not self.stop_event.is_set():
             if not self.store.callback_auth_blocked():
                 try:
-                    await asyncio.to_thread(
-                        self.api.worker_heartbeat, self._heartbeat_payload()
-                    )
+                    await asyncio.to_thread(self.api.service_heartbeat, self._heartbeat_payload())
                     self.store.record_callback_health(
                         success=True, http_status=200, error_class=None
                     )
-                except WorkerTransportError as exc:
+                except GpuCallbackTransportError as exc:
                     self.store.record_callback_health(
                         success=False,
                         http_status=exc.status_code,
                         error_class=(
-                            "authentication_failed"
-                            if exc.status_code == 401
-                            else "transport"
+                            "authentication_failed" if exc.status_code == 401 else "transport"
                         ),
                         next_retry_seconds=(
                             None if exc.status_code == 401 else round(self.heartbeat_seconds)
@@ -549,7 +541,7 @@ class GpuExecutionCoordinator:
         self._tasks = [
             asyncio.create_task(self._execution_loop()),
             asyncio.create_task(self._outbox_loop()),
-            asyncio.create_task(self._worker_heartbeat_loop()),
+            asyncio.create_task(self._service_heartbeat_loop()),
         ]
 
     async def stop(self) -> None:
@@ -562,9 +554,9 @@ class GpuExecutionCoordinator:
         self._tasks.clear()
 
 
-def default_worker_identity(build_id: str, boot_id: str) -> WorkerIdentity:
-    return WorkerIdentity(
-        worker_id=os.environ.get("MOSHI_WORKER_ID", socket.gethostname()),
-        boot_id=os.environ.get("MOSHI_WORKER_BOOT_ID", boot_id),
+def default_gpu_service_identity(build_id: str, boot_id: str) -> GpuServiceIdentity:
+    return GpuServiceIdentity(
+        service_id=os.environ.get("MOSHI_GPU_SERVICE_ID", socket.gethostname()),
+        boot_id=os.environ.get("MOSHI_GPU_SERVICE_BOOT_ID", boot_id),
         build_id=build_id,
     )

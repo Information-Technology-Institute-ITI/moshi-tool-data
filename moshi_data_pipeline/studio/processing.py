@@ -105,7 +105,9 @@ def _independent_channel_routing_ready(
     )
 
 
-def _speaker_for_interval(start: float, end: float, segments: list[SpeakerSegment]) -> str | None:
+def _speaker_for_interval(
+    start: float, end: float, segments: list[SpeakerSegment]
+) -> str | None:
     overlaps: dict[str, float] = {}
     for segment in segments:
         overlap = max(0.0, min(end, segment.end) - max(start, segment.start))
@@ -205,7 +207,9 @@ def _flag_overlapping_transcript(
         flags = set(utterance.quality_flags) - {"overlapping_speech"}
         if overlap_samples >= threshold:
             flags.add("overlapping_speech")
-        values.append(utterance.model_copy(update={"quality_flags": sorted(flags)}))
+        values.append(
+            utterance.model_copy(update={"quality_flags": sorted(flags)})
+        )
     return values
 
 
@@ -293,7 +297,10 @@ def rediarize_source(
     saved = catalog.save_annotation(source_id, annotation.version, updated)
     inspection = dict(source.get("inspection") or {})
     channel_report = dict(inspection.get("channel_routing") or {})
-    if channel_report.get("routing_candidate") and paths.canonical_channels(source_id).exists():
+    if (
+        channel_report.get("routing_candidate")
+        and paths.canonical_channels(source_id).exists()
+    ):
         try:
             channel_mapping, channel_mapping_report = infer_speaker_channel_mapping_file(
                 paths.canonical_channels(source_id),
@@ -345,7 +352,10 @@ def initialize_source(
     else:
         progress(0.18, "Reusing immutable canonical audio")
     preserved_channels = paths.canonical_channels(source_id)
-    if config.audio.preserve_source_channels and int(inspection.get("channels") or 0) > 1:
+    if (
+        config.audio.preserve_source_channels
+        and int(inspection.get("channels") or 0) > 1
+    ):
         if not preserved_channels.exists():
             progress(0.23, "Preserving source channels for channel-first routing")
             extract_preserved_channels_wav(original, preserved_channels, SAMPLE_RATE)
@@ -397,10 +407,12 @@ def initialize_source(
         mapped_exclusive, mapped_overlap, mapping = _map_diarization(exclusive, diarization)
         if inspection["channel_routing"].get("routing_candidate"):
             try:
-                channel_mapping, channel_mapping_report = infer_speaker_channel_mapping_file(
-                    preserved_channels,
-                    mapped_overlap,
-                    config.channel_routing,
+                channel_mapping, channel_mapping_report = (
+                    infer_speaker_channel_mapping_file(
+                        preserved_channels,
+                        mapped_overlap,
+                        config.channel_routing,
+                    )
                 )
                 inspection["channel_routing"].update(
                     {
@@ -482,7 +494,9 @@ def transcribe_source(
         canonical, raw, config.transcription, config.alignment
     )
     segments = _segments_from_annotation(annotation)
-    words, _ = assign_speakers_to_words(words, segments, config.diarization.min_assignment_overlap)
+    words, _ = assign_speakers_to_words(
+        words, segments, config.diarization.min_assignment_overlap
+    )
     updated = annotation.model_copy(
         update={
             "transcript": _flag_overlapping_transcript(
@@ -492,7 +506,9 @@ def transcribe_source(
             "aligned_words": [word.to_dict() for word in words],
         }
     )
-    updated = normalize_annotation_bounds(updated, int(source["duration_samples"] or 0))
+    updated = normalize_annotation_bounds(
+        updated, int(source["duration_samples"] or 0)
+    )
     saved = catalog.save_annotation(source_id, annotation.version, updated)
     atomic_write_json(paths.artifact(source_id, "aligned_transcript.json"), aligned)
     progress(1.0, "Transcript is ready for correction")
@@ -515,7 +531,11 @@ def _candidate_from_result(
         ).strip(),
         average_log_probability=_aggregate_average_log_probability(segments),
         quality_flags=sorted(
-            {str(flag) for segment in segments for flag in segment.get("quality_flags", [])}
+            {
+                str(flag)
+                for segment in segments
+                for flag in segment.get("quality_flags", [])
+            }
         ),
     )
 
@@ -563,7 +583,9 @@ def generate_review_candidates(
         }
     )
     output_root = (
-        paths.source_root(source_id) / "review_candidates" / f"annotation_v{annotation.version}"
+        paths.source_root(source_id)
+        / "review_candidates"
+        / f"annotation_v{annotation.version}"
     )
     output_root.mkdir(parents=True, exist_ok=True)
     candidates: dict[str, TranscriptCandidate] = {}
@@ -683,7 +705,13 @@ def realign_source(
             word.score is None or word.score < config.alignment.low_confidence_score
             for word in utterance_words
         )
-        status = "unaligned" if not has_word else "low_confidence" if low_confidence else "aligned"
+        status = (
+            "unaligned"
+            if not has_word
+            else "low_confidence"
+            if low_confidence
+            else "aligned"
+        )
         quality_flags = [
             value
             for value in utterance.quality_flags
@@ -790,7 +818,9 @@ def transcribe_overlap_stems(
 
 
 def _overlap_id(source_id: str, version: int, start: int, end: int) -> str:
-    digest = hashlib.sha256(f"{source_id}:{version}:{start}:{end}".encode()).hexdigest()[:16]
+    digest = hashlib.sha256(
+        f"{source_id}:{version}:{start}:{end}".encode()
+    ).hexdigest()[:16]
     return f"overlap_{digest}"
 
 
@@ -810,18 +840,24 @@ def recover_source_overlaps(
         annotation.channel_routing_mode == "independent_stereo"
         and not _independent_channel_routing_ready(paths, source_id, annotation)
     ):
-        raise ValueError("Independent stereo routing must have a verified A/B channel map")
+        raise ValueError(
+            "Independent stereo routing must have a verified A/B channel map"
+        )
     overlaps = derived_overlaps(annotation.activities)
     if not overlaps:
         catalog.replace_overlap_recoveries(source_id, annotation.version, [])
         progress(1.0, "No overlap regions need recovery")
         return {"source_id": source_id, "regions": 0, "recovered": 0}
     output_root = (
-        paths.source_root(source_id) / "recovery" / new_id(f"annotation_v{annotation.version}")
+        paths.source_root(source_id)
+        / "recovery"
+        / new_id(f"annotation_v{annotation.version}")
     )
     output_root.mkdir(parents=True, exist_ok=True)
     segments = _segments_from_annotation(annotation)
-    direct_channels = _independent_channel_routing_ready(paths, source_id, annotation)
+    direct_channels = _independent_channel_routing_ready(
+        paths, source_id, annotation
+    )
     separator = None
     if direct_channels:
         progress(0.05, "Using verified independent source channels")
@@ -877,9 +913,7 @@ def recover_source_overlaps(
             user_channel = annotation.speaker_channel_map[user_speaker]
             assistant_path = output_root / f"{region_id}_assistant.wav"
             user_path = output_root / f"{region_id}_user.wav"
-            write_pcm16(
-                assistant_path, routed[:, assistant_channel : assistant_channel + 1], routed_rate
-            )
+            write_pcm16(assistant_path, routed[:, assistant_channel : assistant_channel + 1], routed_rate)
             write_pcm16(user_path, routed[:, user_channel : user_channel + 1], routed_rate)
             base.update(
                 {
@@ -1043,9 +1077,13 @@ def render_source_clips(
         annotation.channel_routing_mode == "independent_stereo"
         and not _independent_channel_routing_ready(paths, source_id, annotation)
     ):
-        raise ValueError("Independent stereo routing must have a verified A/B channel map")
+        raise ValueError(
+            "Independent stereo routing must have a verified A/B channel map"
+        )
     output_root = (
-        paths.source_root(source_id) / "clips" / new_id(f"annotation_v{annotation.version}")
+        paths.source_root(source_id)
+        / "clips"
+        / new_id(f"annotation_v{annotation.version}")
     )
     output_root.mkdir(parents=True, exist_ok=True)
     segments = _segments_from_annotation(annotation)
@@ -1115,11 +1153,13 @@ def render_source_clips(
             right = min(clip.end_sample, exclusion.end_sample)
             if right > left:
                 rendered.stereo[left - clip.start_sample : right - clip.start_sample] = 0
-                rendered.assistant_mask[left - clip.start_sample : right - clip.start_sample] = (
-                    False
-                )
+                rendered.assistant_mask[
+                    left - clip.start_sample : right - clip.start_sample
+                ] = False
                 rendered.user_mask[left - clip.start_sample : right - clip.start_sample] = False
-                reconstruction_mask[left - clip.start_sample : right - clip.start_sample] = False
+                reconstruction_mask[
+                    left - clip.start_sample : right - clip.start_sample
+                ] = False
         reconstruction_error = mixture_reconstruction_error_db(
             mixture_reference,
             rendered.stereo,

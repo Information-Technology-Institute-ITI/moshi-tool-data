@@ -14,6 +14,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
+from moshi_data_pipeline.gpu_callback import HttpGpuCallbackApi
 from moshi_data_pipeline.gpu_dispatch_protocol import (
     GPU_DISPATCH_PROTOCOL_VERSION,
     DispatchCreate,
@@ -29,8 +30,9 @@ from moshi_data_pipeline.gpu_dispatch_state import (
 )
 from moshi_data_pipeline.gpu_execution import (
     GpuExecutionCoordinator,
-    default_worker_identity,
+    default_gpu_service_identity,
 )
+from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS
 from moshi_data_pipeline.gpu_self_check import (
     FunctionalCheckRunner,
     SelfCheckCoordinator,
@@ -38,7 +40,6 @@ from moshi_data_pipeline.gpu_self_check import (
     SelfCheckRateLimitError,
     SelfCheckRepository,
 )
-from moshi_data_pipeline.remote_worker import HttpWorkerApi
 
 
 def _positive_integer(name: str, default: int) -> int:
@@ -144,11 +145,9 @@ class GpuIntakeSettings:
         if not callback_token:
             raise RuntimeError("MOSHI_WORKER_TOKEN is required")
         return cls(
-            cache_root=Path(os.environ.get("MOSHI_WORKER_CACHE", "/cache")),
+            cache_root=Path(os.environ.get("MOSHI_GPU_CACHE", "/cache")),
             build_id=build_id,
-            callback_origin=_callback_origin(
-                callback, _optional_tcp_port("MOSHI_WEB_PORT")
-            ),
+            callback_origin=_callback_origin(callback, _optional_tcp_port("MOSHI_WEB_PORT")),
             dispatch_token=token,
             dispatch_token_next=os.environ.get("MOSHI_DISPATCH_TOKEN_NEXT") or None,
             host=os.environ.get("MOSHI_GPU_INTAKE_HOST", "0.0.0.0"),
@@ -165,16 +164,12 @@ class GpuIntakeSettings:
                 else None
             ),
             self_check_max_cer=_positive_float("MOSHI_SELF_TEST_MAX_CER", 0.20),
-            self_check_validity_hours=_positive_integer(
-                "MOSHI_SELF_TEST_VALIDITY_HOURS", 6
-            ),
+            self_check_validity_hours=_positive_integer("MOSHI_SELF_TEST_VALIDITY_HOURS", 6),
             self_check_manual_cooldown_seconds=_positive_integer(
                 "MOSHI_SELF_TEST_MANUAL_COOLDOWN_SECONDS", 600
             ),
             callback_token=callback_token,
-            callback_timeout_seconds=_positive_integer(
-                "MOSHI_CALLBACK_TIMEOUT_SECONDS", 15
-            ),
+            callback_timeout_seconds=_positive_integer("MOSHI_CALLBACK_TIMEOUT_SECONDS", 15),
             job_heartbeat_seconds=_positive_integer("MOSHI_JOB_HEARTBEAT_SECONDS", 15),
         )
 
@@ -189,9 +184,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
     host_boot_id = _host_boot_id()
     compute_lock = asyncio.Lock()
     if bool(settings.config_path) != bool(settings.self_check_metadata):
-        raise RuntimeError(
-            "MOSHI_CONFIG and MOSHI_SELF_TEST_METADATA must be configured together"
-        )
+        raise RuntimeError("MOSHI_CONFIG and MOSHI_SELF_TEST_METADATA must be configured together")
     self_check: SelfCheckCoordinator | None = None
     if settings.config_path and settings.self_check_metadata:
         runner = FunctionalCheckRunner(
@@ -212,7 +205,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         )
     execution: GpuExecutionCoordinator | None = None
     if settings.callback_token:
-        callback_api = HttpWorkerApi(
+        callback_api = HttpGpuCallbackApi(
             settings.callback_origin,
             settings.callback_token,
             timeout_seconds=settings.callback_timeout_seconds,
@@ -220,7 +213,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         execution = GpuExecutionCoordinator(
             store,
             callback_api,
-            default_worker_identity(settings.build_id, host_boot_id),
+            default_gpu_service_identity(settings.build_id, host_boot_id),
             compute_lock=compute_lock,
             heartbeat_seconds=settings.job_heartbeat_seconds,
         )
@@ -254,8 +247,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
                 and latest["requirement_key"] == requirement_key
                 and latest["status"] == "passed"
                 and latest["valid_until"]
-                and datetime.fromisoformat(str(latest["valid_until"]))
-                > datetime.now(UTC)
+                and datetime.fromisoformat(str(latest["valid_until"])) > datetime.now(UTC)
             )
             value["functional_check"] = {
                 "available": True,
@@ -336,9 +328,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         return JSONResponse(status_code=507, content={"detail": str(exc)})
 
     @app.exception_handler(SelfCheckRateLimitError)
-    async def self_check_rate_limit(
-        _: Request, exc: SelfCheckRateLimitError
-    ) -> JSONResponse:
+    async def self_check_rate_limit(_: Request, exc: SelfCheckRateLimitError) -> JSONResponse:
         return JSONResponse(
             status_code=429,
             content={"detail": str(exc)},
@@ -362,6 +352,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
             "protocol_version": GPU_DISPATCH_PROTOCOL_VERSION,
             "build_id": settings.build_id,
             "capabilities": {
+                "job_kinds": list(JOB_KINDS),
                 "input_receipt": True,
                 "execution": execution is not None,
                 "callback_outbox": execution is not None,
@@ -383,9 +374,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         return {"checks": self_check.history(limit)}
 
     @app.post("/internal/v2/self-checks", dependencies=[authorization])
-    async def trigger_self_check(
-        payload: SelfCheckRequest, response: Response
-    ) -> dict[str, Any]:
+    async def trigger_self_check(payload: SelfCheckRequest, response: Response) -> dict[str, Any]:
         if self_check is None:
             raise HTTPException(status_code=503, detail="Functional check is not configured")
         current = store.status().get("current_dispatch")
@@ -400,14 +389,12 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         if payload.protocol_version != GPU_DISPATCH_PROTOCOL_VERSION:
             raise HTTPException(status_code=409, detail="GPU dispatch protocol mismatch")
         if payload.required_build_id != settings.build_id:
-            raise HTTPException(status_code=409, detail="GPU worker build mismatch")
+            raise HTTPException(status_code=409, detail="GPU service build mismatch")
         value, created = store.create_dispatch(payload)
         response.status_code = 201 if created else 200
         return value
 
-    @app.get(
-        "/internal/v2/dispatches/{dispatch_id}", dependencies=[authorization]
-    )
+    @app.get("/internal/v2/dispatches/{dispatch_id}", dependencies=[authorization])
     async def get_dispatch(dispatch_id: str) -> dict[str, Any]:
         return store.get_dispatch(dispatch_id)
 
@@ -445,9 +432,7 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post(
-        "/internal/v2/dispatches/{dispatch_id}/start", dependencies=[authorization]
-    )
+    @app.post("/internal/v2/dispatches/{dispatch_id}/start", dependencies=[authorization])
     async def start_dispatch(
         dispatch_id: str,
         payload: DispatchStart,
@@ -466,17 +451,13 @@ def create_gpu_intake_app(settings: GpuIntakeSettings) -> FastAPI:
                 detail="A current functional check must pass before GPU execution",
             )
         try:
-            value, queued = store.start_dispatch(
-                dispatch_id, payload, x_lease_token or ""
-            )
+            value, queued = store.start_dispatch(dispatch_id, payload, x_lease_token or "")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         response.status_code = 202 if queued else 200
         return value
 
-    @app.post(
-        "/internal/v2/dispatches/{dispatch_id}/cancel", dependencies=[authorization]
-    )
+    @app.post("/internal/v2/dispatches/{dispatch_id}/cancel", dependencies=[authorization])
     async def cancel_dispatch(dispatch_id: str) -> dict[str, Any]:
         value, _ = store.cancel_dispatch(dispatch_id)
         return value

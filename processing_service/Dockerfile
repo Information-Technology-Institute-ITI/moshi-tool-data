@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    MOSHI_WORKER_CACHE=/cache \
+    MOSHI_GPU_CACHE=/cache \
     HF_HOME=/cache/huggingface
 
 RUN apt-get update \
@@ -16,12 +16,12 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --extra ml --extra separation --extra review --no-dev --no-install-project --python 3.11
+RUN uv sync --frozen --extra ml --extra separation --extra server --no-dev --no-install-project --python 3.11
 COPY moshi_data_pipeline/ ./moshi_data_pipeline/
 COPY config.example.yaml ./config.example.yaml
-RUN uv sync --frozen --extra ml --extra separation --extra review --no-dev --python 3.11
+RUN uv sync --frozen --extra ml --extra separation --extra server --no-dev --python 3.11
 
 ENV PATH="/app/.venv/bin:${PATH}"
 VOLUME ["/cache"]
 
-CMD ["python", "-m", "moshi_data_pipeline.remote_worker_main"]
+CMD ["python", "-m", "moshi_data_pipeline.gpu_intake_main"]

@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
-from moshi_data_pipeline.studio.protocol import StrictModel
+from moshi_data_pipeline.gpu_job_protocol import StrictModel
 
 
 class InitializeResult(StrictModel):
@@ -85,4 +85,3 @@ def validate_job_result(kind: str, value: dict[str, Any]) -> StrictModel:
     if result.kind != kind:
         raise ValueError("Result kind does not match the leased job")
     return result
-

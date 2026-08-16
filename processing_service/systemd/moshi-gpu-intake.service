@@ -3,7 +3,7 @@ Description=Moshi private GPU intake
 Wants=network-online.target
 After=network-online.target
 ConditionPathIsDirectory=/home/ubuntu/moshi-tool-data
-ConditionPathIsDirectory=/home/ubuntu/moshi-worker-cache
+ConditionPathIsDirectory=/home/ubuntu/moshi-gpu-cache
 
 [Service]
 Type=simple
@@ -14,7 +14,7 @@ Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/ubuntu/.config/moshi/gpu-intake.env
 EnvironmentFile=/home/ubuntu/.config/moshi/gpu-intake-token.env
 EnvironmentFile=/home/ubuntu/.config/moshi/huggingface.env
-ExecStart=/bin/bash -c 'set -a; . /home/ubuntu/.config/moshi/worker-token.env; set +a; exec /home/ubuntu/moshi-tool-data/.venv/bin/python -m moshi_data_pipeline.gpu_intake_main'
+ExecStart=/bin/bash -c 'set -a; . /home/ubuntu/.config/moshi/callback-token.env; set +a; exec /home/ubuntu/moshi-tool-data/.venv/bin/python -m moshi_data_pipeline.gpu_intake_main'
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=120s
@@ -23,7 +23,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/moshi-worker-cache
+ReadWritePaths=/home/ubuntu/moshi-gpu-cache
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

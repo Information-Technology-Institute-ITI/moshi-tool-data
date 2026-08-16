@@ -14,9 +14,7 @@ TOKEN = "dispatch-token-for-tests"
 AUTHORIZATION = {"Authorization": f"Bearer {TOKEN}"}
 
 
-def test_settings_from_environment_honor_explicit_ports(
-    tmp_path, monkeypatch
-) -> None:
+def test_settings_from_environment_honor_explicit_ports(tmp_path, monkeypatch) -> None:
     values = {
         "MOSHI_DISPATCH_TOKEN": TOKEN,
         "MOSHI_WORKER_TOKEN": "callback-token-for-tests",
@@ -24,7 +22,7 @@ def test_settings_from_environment_honor_explicit_ports(
         "MOSHI_WEB_INTERNAL_URL": "http://web.internal:80",
         "MOSHI_WEB_PORT": "8080",
         "MOSHI_GPU_INTAKE_PORT": "9000",
-        "MOSHI_WORKER_CACHE": str(tmp_path / "cache"),
+        "MOSHI_GPU_CACHE": str(tmp_path / "cache"),
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -43,7 +41,7 @@ def test_settings_reject_invalid_ports(tmp_path, monkeypatch, name, value) -> No
         "MOSHI_WORKER_TOKEN": "callback-token-for-tests",
         "MOSHI_BUILD_ID": "build-a",
         "MOSHI_WEB_INTERNAL_URL": "http://web.internal",
-        "MOSHI_WORKER_CACHE": str(tmp_path / "cache"),
+        "MOSHI_GPU_CACHE": str(tmp_path / "cache"),
         name: value,
     }
     for key, setting in values.items():
@@ -133,14 +131,14 @@ def test_private_routes_require_bearer_authentication(tmp_path) -> None:
         response = client.get("/internal/v2/status")
         assert response.status_code == 401
         assert response.headers["www-authenticate"] == "Bearer"
-        assert client.get(
-            "/internal/v2/status", headers={"Authorization": "Bearer wrong"}
-        ).status_code == 401
-        ready = client.get(
-            "/internal/v2/health/ready", headers=AUTHORIZATION
-        ).json()
+        assert (
+            client.get("/internal/v2/status", headers={"Authorization": "Bearer wrong"}).status_code
+            == 401
+        )
+        ready = client.get("/internal/v2/health/ready", headers=AUTHORIZATION).json()
         assert ready["status"] == "intake_ready"
         assert ready["capabilities"] == {
+            "job_kinds": ["transcribe"],
             "input_receipt": True,
             "execution": False,
             "callback_outbox": False,
@@ -166,11 +164,9 @@ def test_manifest_enforces_protocol_build_idempotency_and_single_capacity(
 
         wrong_build = _manifest(content)
         wrong_build["required_build_id"] = "other-build"
-        response = client.post(
-            "/internal/v2/dispatches", headers=AUTHORIZATION, json=wrong_build
-        )
+        response = client.post("/internal/v2/dispatches", headers=AUTHORIZATION, json=wrong_build)
         assert response.status_code == 409
-        assert response.json()["detail"] == "GPU worker build mismatch"
+        assert response.json()["detail"] == "GPU service build mismatch"
 
         original = _register(client, content)
         assert original["state"] == "receiving"
@@ -184,9 +180,7 @@ def test_manifest_enforces_protocol_build_idempotency_and_single_capacity(
 
         changed = _manifest(content)
         changed["input_fingerprint"] = "b" * 64
-        response = client.post(
-            "/internal/v2/dispatches", headers=AUTHORIZATION, json=changed
-        )
+        response = client.post("/internal/v2/dispatches", headers=AUTHORIZATION, json=changed)
         assert response.status_code == 409
 
         response = client.post(
@@ -226,9 +220,7 @@ def test_resumable_upload_survives_restart_and_accepts_identical_retry(tmp_path)
         )
         assert response.status_code == 200
         assert response.json()["state"] == "verified"
-        dispatch = client.get(
-            "/internal/v2/dispatches/dispatch-1", headers=AUTHORIZATION
-        ).json()
+        dispatch = client.get("/internal/v2/dispatches/dispatch-1", headers=AUTHORIZATION).json()
         assert dispatch["state"] == "verified"
 
     digest = hashlib.sha256(content).hexdigest()
@@ -274,9 +266,10 @@ def test_verified_dispatch_can_be_queued_without_exposing_lease_token(tmp_path) 
     app = create_gpu_intake_app(_settings(tmp_path / "cache"))
     with TestClient(app) as client:
         _register(client, content)
-        assert _upload(
-            client, content, f"bytes 0-{len(content) - 1}/{len(content)}"
-        ).status_code == 200
+        assert (
+            _upload(client, content, f"bytes 0-{len(content) - 1}/{len(content)}").status_code
+            == 200
+        )
         response = client.post(
             "/internal/v2/dispatches/dispatch-1/start",
             headers={**AUTHORIZATION, "X-Lease-Token": lease_token},
@@ -309,14 +302,10 @@ def test_cancel_is_idempotent_and_releases_capacity(tmp_path) -> None:
     app = create_gpu_intake_app(_settings(tmp_path / "cache"))
     with TestClient(app) as client:
         _register(client, content)
-        first = client.post(
-            "/internal/v2/dispatches/dispatch-1/cancel", headers=AUTHORIZATION
-        )
+        first = client.post("/internal/v2/dispatches/dispatch-1/cancel", headers=AUTHORIZATION)
         assert first.status_code == 200
         assert first.json()["state"] == "cancelled"
-        second = client.post(
-            "/internal/v2/dispatches/dispatch-1/cancel", headers=AUTHORIZATION
-        )
+        second = client.post("/internal/v2/dispatches/dispatch-1/cancel", headers=AUTHORIZATION)
         assert second.status_code == 200
         status_response = client.get("/internal/v2/status", headers=AUTHORIZATION).json()
         assert status_response["safe_to_stop"] is True
@@ -414,9 +403,9 @@ def test_functional_check_is_persisted_deduplicated_and_never_returns_text(
         identifier = response.json()["id"]
         latest = None
         for _ in range(100):
-            latest = client.get(
-                "/internal/v2/status", headers=AUTHORIZATION
-            ).json()["functional_check"]["latest"]
+            latest = client.get("/internal/v2/status", headers=AUTHORIZATION).json()[
+                "functional_check"
+            ]["latest"]
             if latest and latest["status"] == "passed":
                 break
             time.sleep(0.01)
@@ -446,13 +435,11 @@ def test_functional_check_is_persisted_deduplicated_and_never_returns_text(
         assert int(forced.headers["retry-after"]) > 0
 
     with TestClient(create_gpu_intake_app(settings)) as client:
-        ready = client.get(
-            "/internal/v2/health/ready", headers=AUTHORIZATION
-        ).json()
+        ready = client.get("/internal/v2/health/ready", headers=AUTHORIZATION).json()
         assert ready["capabilities"]["functional_check"] is True
         assert ready["functional_check"]["ready"] is True
         assert ready["functional_check"]["latest"]["id"] == identifier
-        history = client.get(
-            "/internal/v2/self-checks?limit=10", headers=AUTHORIZATION
-        ).json()["checks"]
+        history = client.get("/internal/v2/self-checks?limit=10", headers=AUTHORIZATION).json()[
+            "checks"
+        ]
         assert [item["id"] for item in history] == [identifier]

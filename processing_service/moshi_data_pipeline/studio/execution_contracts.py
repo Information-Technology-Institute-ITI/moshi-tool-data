@@ -10,7 +10,7 @@ class ProcessingPaths(Protocol):
     """Filesystem surface available to processing code.
 
     Implementations may point at the local Studio workspace or at an isolated
-    per-attempt directory materialized by the remote worker.
+    per-attempt directory materialized by the GPU processing service.
     """
 
     root: Path
@@ -36,7 +36,7 @@ class ProcessingPaths(Protocol):
 class ProcessingState(Protocol):
     """Typed state operations needed by processing algorithms.
 
-    The remote implementation is in-memory and cannot access the web catalog.
+    The GPU implementation is in-memory and cannot access the web catalog.
     """
 
     def get_project(self, project_id: str) -> dict[str, Any]: ...

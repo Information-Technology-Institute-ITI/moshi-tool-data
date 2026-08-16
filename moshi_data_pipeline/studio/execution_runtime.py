@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import Field
 
 from moshi_data_pipeline.config import PipelineConfig
+from moshi_data_pipeline.gpu_job_protocol import JobContext, StrictModel
 from moshi_data_pipeline.studio.domain import AnnotationDocument, ClipPlanDocument
 from moshi_data_pipeline.studio.exporter import build_project_export
 from moshi_data_pipeline.studio.job_contracts import (
@@ -31,7 +32,6 @@ from moshi_data_pipeline.studio.processing import (
     transcribe_overlap_stems,
     transcribe_source,
 )
-from moshi_data_pipeline.studio.protocol import JobContext, StrictModel
 
 Progress = Any
 
@@ -48,7 +48,7 @@ class ExecutionOutput(StrictModel):
 
 
 class AttemptPaths:
-    """Isolated filesystem implementation used for one remote attempt."""
+    """Isolated filesystem implementation used for one GPU processing attempt."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -129,9 +129,7 @@ class MemoryProcessingState:
                 value.get("annotation") or {"source_id": source_id}
             )
             if value.get("clip_plan"):
-                self.plans[source_id] = ClipPlanDocument.model_validate(
-                    value["clip_plan"]
-                )
+                self.plans[source_id] = ClipPlanDocument.model_validate(value["clip_plan"])
             self.decisions[source_id] = deepcopy(value.get("clip_decisions", {}))
             recoveries = deepcopy(value.get("overlap_recoveries", []))
             if snapshot.get("overlap_recovery") is not None:
@@ -149,9 +147,7 @@ class MemoryProcessingState:
 
     def list_sources(self, project_id: str) -> list[dict[str, Any]]:
         return [
-            deepcopy(value)
-            for value in self.sources.values()
-            if value["project_id"] == project_id
+            deepcopy(value) for value in self.sources.values() if value["project_id"] == project_id
         ]
 
     def latest_annotation(self, source_id: str) -> AnnotationDocument:
@@ -314,7 +310,9 @@ class ContextJobExecutor:
                             if record["region_id"] == region_id:
                                 record[field] = self.paths.relative(destination)
                 elif role == "clips.manifest":
-                    destination = self.paths.source_root(source_id) / "input_clips" / "manifest.json"
+                    destination = (
+                        self.paths.source_root(source_id) / "input_clips" / "manifest.json"
+                    )
                     self._copy(source_path, destination)
                     source["clip_artifacts_path"] = self.paths.relative(destination)
             self._materialize_clip_inputs(
@@ -372,22 +370,41 @@ class ContextJobExecutor:
                     ("source.channels", self.paths.canonical_channels(source_id)),
                     ("source.proxy", self.paths.video_proxy(source_id)),
                     ("source.peaks", self.paths.peaks(source_id)),
-                    ("analysis.raw_transcript", self.paths.artifact(source_id, "raw_transcript.json")),
-                    ("analysis.aligned_transcript", self.paths.artifact(source_id, "aligned_transcript.json")),
+                    (
+                        "analysis.raw_transcript",
+                        self.paths.artifact(source_id, "raw_transcript.json"),
+                    ),
+                    (
+                        "analysis.aligned_transcript",
+                        self.paths.artifact(source_id, "aligned_transcript.json"),
+                    ),
                     ("analysis.diarization", self.paths.artifact(source_id, "diarization.json")),
                 ]
             )
         elif kind == "transcribe":
             candidates.extend(
                 [
-                    ("analysis.raw_transcript", self.paths.artifact(source_id, "raw_transcript.json")),
-                    ("analysis.aligned_transcript", self.paths.artifact(source_id, "aligned_transcript.json")),
+                    (
+                        "analysis.raw_transcript",
+                        self.paths.artifact(source_id, "raw_transcript.json"),
+                    ),
+                    (
+                        "analysis.aligned_transcript",
+                        self.paths.artifact(source_id, "aligned_transcript.json"),
+                    ),
                 ]
             )
         elif kind == "rediarize":
-            candidates.append(("analysis.diarization", self.paths.artifact(source_id, "diarization.json")))
+            candidates.append(
+                ("analysis.diarization", self.paths.artifact(source_id, "diarization.json"))
+            )
         elif kind == "realign":
-            candidates.append(("analysis.aligned_transcript", self.paths.artifact(source_id, "aligned_transcript.json")))
+            candidates.append(
+                (
+                    "analysis.aligned_transcript",
+                    self.paths.artifact(source_id, "aligned_transcript.json"),
+                )
+            )
         return [value for role, path in candidates if (value := self._artifact(role, path))]
 
     def execute(
@@ -467,9 +484,7 @@ class ContextJobExecutor:
                 ):
                     if record.get(field):
                         path = self.paths.resolve_relative(str(record[field]))
-                        value = self._artifact(
-                            f"overlap.{record['region_id']}.{suffix}", path
-                        )
+                        value = self._artifact(f"overlap.{record['region_id']}.{suffix}", path)
                         if value:
                             artifacts.append(value)
                     record.pop(field, None)
