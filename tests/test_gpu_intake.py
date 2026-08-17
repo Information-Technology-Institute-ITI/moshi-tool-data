@@ -68,6 +68,9 @@ def _manifest(
     dispatch_id: str = "dispatch-1",
     job_id: str = "job-1",
     attempt: int = 1,
+    role: str = "source.canonical",
+    media_type: str = "audio/wav",
+    filename: str = "canonical.wav",
 ) -> dict:
     return {
         "dispatch_id": dispatch_id,
@@ -79,31 +82,55 @@ def _manifest(
         "inputs": [
             {
                 "artifact_id": "input-1",
-                "role": "source.canonical",
+                "role": role,
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "size_bytes": len(content),
-                "media_type": "audio/wav",
-                "filename": "canonical.wav",
+                "media_type": media_type,
+                "filename": filename,
             }
         ],
     }
 
 
-def _context(content: bytes) -> dict:
-    manifest = _manifest(content)
-    return {
+def _context(
+    content: bytes,
+    *,
+    kind: str = "transcribe",
+    mode: str = "manual",
+    role: str = "source.canonical",
+    media_type: str = "audio/wav",
+    filename: str = "canonical.wav",
+) -> dict:
+    manifest = _manifest(
+        content,
+        role=role,
+        media_type=media_type,
+        filename=filename,
+    )
+    context = {
         "context": {
             "job_id": manifest["job_id"],
-            "kind": "transcribe",
+            "kind": kind,
             "attempt": manifest["attempt"],
             "lease_expires_at": "2026-08-16T18:00:00+00:00",
             "input_fingerprint": manifest["input_fingerprint"],
-            "payload": {},
+            "payload": {"mode": mode} if kind == "initialize" else {},
             "preconditions": {},
             "config": {},
             "inputs": manifest["inputs"],
         }
     }
+    if kind == "initialize":
+        context["context"]["preconditions"] = {
+            "project": {"id": "project-1", "name": "Project", "language": "ar"},
+            "source": {"id": "source-1", "project_id": "project-1"},
+            "annotation": {"source_id": "source-1", "version": 0},
+        }
+        context["context"]["inputs"][0].update(
+            project_id="project-1",
+            source_id="source-1",
+        )
+    return context
 
 
 def _register(client: TestClient, content: bytes, **values) -> dict:
@@ -138,7 +165,7 @@ def test_private_routes_require_bearer_authentication(tmp_path) -> None:
         ready = client.get("/internal/v2/health/ready", headers=AUTHORIZATION).json()
         assert ready["status"] == "intake_ready"
         assert ready["capabilities"] == {
-            "job_kinds": ["transcribe"],
+            "job_kinds": ["initialize", "transcribe"],
             "input_receipt": True,
             "execution": False,
             "callback_outbox": False,
@@ -295,6 +322,97 @@ def test_verified_dispatch_can_be_queued_without_exposing_lease_token(tmp_path) 
         assert status_response.status_code == 200
         assert status_response.json()["safe_to_stop"] is False
         assert lease_token not in json.dumps(status_response.json())
+
+
+def test_initialize_original_can_be_received_and_queued(tmp_path) -> None:
+    content = b"immutable original media"
+    lease_token = "lease-" + "i" * 40
+    app = create_gpu_intake_app(_settings(tmp_path / "cache"))
+    with TestClient(app) as client:
+        _register(
+            client,
+            content,
+            role="source.original",
+            media_type="video/mp4",
+            filename="episode.mp4",
+        )
+        assert (
+            _upload(client, content, f"bytes 0-{len(content) - 1}/{len(content)}").status_code
+            == 200
+        )
+        response = client.post(
+            "/internal/v2/dispatches/dispatch-1/start",
+            headers={**AUTHORIZATION, "X-Lease-Token": lease_token},
+            json=_context(
+                content,
+                kind="initialize",
+                mode="assisted",
+                role="source.original",
+                media_type="video/mp4",
+                filename="episode.mp4",
+            ),
+        )
+        assert response.status_code == 202, response.text
+        assert response.json()["state"] == "queued"
+
+
+def test_initialize_input_role_is_immutable_between_receipt_and_start(tmp_path) -> None:
+    content = b"immutable original media"
+    app = create_gpu_intake_app(_settings(tmp_path / "cache"))
+    with TestClient(app) as client:
+        _register(client, content)
+        assert (
+            _upload(client, content, f"bytes 0-{len(content) - 1}/{len(content)}").status_code
+            == 200
+        )
+        response = client.post(
+            "/internal/v2/dispatches/dispatch-1/start",
+            headers={**AUTHORIZATION, "X-Lease-Token": "lease-" + "i" * 40},
+            json=_context(
+                content,
+                kind="initialize",
+                role="source.original",
+                media_type="audio/wav",
+                filename="canonical.wav",
+            ),
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Execution inputs do not match verified inputs"
+
+
+def test_queued_initialize_can_be_cancelled(tmp_path) -> None:
+    content = b"immutable original media"
+    app = create_gpu_intake_app(_settings(tmp_path / "cache"))
+    with TestClient(app) as client:
+        _register(
+            client,
+            content,
+            role="source.original",
+            media_type="video/mp4",
+            filename="episode.mp4",
+        )
+        _upload(client, content, f"bytes 0-{len(content) - 1}/{len(content)}")
+        queued = client.post(
+            "/internal/v2/dispatches/dispatch-1/start",
+            headers={**AUTHORIZATION, "X-Lease-Token": "lease-" + "i" * 40},
+            json=_context(
+                content,
+                kind="initialize",
+                role="source.original",
+                media_type="video/mp4",
+                filename="episode.mp4",
+            ),
+        )
+        assert queued.status_code == 202
+        cancelled = client.post(
+            "/internal/v2/dispatches/dispatch-1/cancel",
+            headers=AUTHORIZATION,
+        )
+        assert cancelled.status_code == 200
+        assert cancelled.json()["state"] == "cancelled"
+        assert client.get("/internal/v2/status", headers=AUTHORIZATION).json()[
+            "safe_to_stop"
+        ] is True
 
 
 def test_cancel_is_idempotent_and_releases_capacity(tmp_path) -> None:

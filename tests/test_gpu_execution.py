@@ -9,7 +9,11 @@ from moshi_data_pipeline.gpu_dispatch_protocol import DispatchCreate, DispatchSt
 from moshi_data_pipeline.gpu_dispatch_state import GpuDispatchStore
 from moshi_data_pipeline.gpu_execution import GpuJobRunner, GpuOutboxSender
 from moshi_data_pipeline.gpu_job_protocol import ArtifactRef, JobContext
-from moshi_data_pipeline.studio.execution_runtime import ExecutionOutput, ProducedFile
+from moshi_data_pipeline.studio.execution_runtime import (
+    ContextJobExecutor,
+    ExecutionOutput,
+    ProducedFile,
+)
 
 
 class FakeCallbackApi:
@@ -94,6 +98,60 @@ class FakeExecutor:
         )
 
 
+INITIALIZE_ARTIFACTS = (
+    ("source.canonical", "canonical.wav", b"canonical audio"),
+    ("source.peaks", "peaks.json", b'{"points":[]}'),
+    ("source.channels", "canonical_channels.wav", b"preserved channels"),
+    ("source.proxy", "proxy.mp4", b"video proxy"),
+    ("analysis.raw_transcript", "raw_transcript.json", b'{"segments":[]}'),
+    ("analysis.aligned_transcript", "aligned_transcript.json", b'{"segments":[]}'),
+    ("analysis.diarization", "diarization.json", b'{"segments":[]}'),
+)
+
+
+class FakeInitializeExecutor:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def execute(self, context, inputs, progress):
+        assert context.kind == "initialize"
+        assert context.payload == {"mode": "assisted"}
+        assert inputs["input-1"].read_bytes() == b"original media"
+        progress(0.5, "Fake initialization")
+        artifacts = []
+        for role, filename, content in INITIALIZE_ARTIFACTS:
+            path = self.root / filename
+            path.write_bytes(content)
+            artifacts.append(
+                ProducedFile(
+                    role=role,
+                    path=path,
+                    media_type=(
+                        "application/json"
+                        if filename.endswith(".json")
+                        else "video/mp4"
+                        if filename.endswith(".mp4")
+                        else "audio/wav"
+                    ),
+                )
+            )
+        return ExecutionOutput(
+            result={
+                "kind": "initialize",
+                "source_id": "source-1",
+                "annotation": {"source_id": "source-1", "version": 1},
+                "inspection": {"has_video": True, "channels": 2},
+                "duration_samples": 24_000,
+                "source_updates": {
+                    "status": "ready",
+                    "init_mode": "assisted",
+                    "duration_samples": 24_000,
+                },
+            },
+            artifacts=artifacts,
+        )
+
+
 class FailingExecutor:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -164,6 +222,71 @@ def _prepare_dispatch(tmp_path) -> tuple[GpuDispatchStore, bytes]:
     return store, content
 
 
+def _prepare_initialize_dispatch(tmp_path) -> tuple[GpuDispatchStore, bytes]:
+    content = b"original media"
+    digest = hashlib.sha256(content).hexdigest()
+    store = GpuDispatchStore(tmp_path / "cache", min_free_bytes=1)
+    payload = DispatchCreate(
+        dispatch_id="dispatch-1",
+        job_id="job-1",
+        attempt=1,
+        protocol_version="2.0",
+        required_build_id="build-a",
+        input_fingerprint="a" * 64,
+        inputs=[
+            {
+                "artifact_id": "input-1",
+                "role": "source.original",
+                "sha256": digest,
+                "size_bytes": len(content),
+                "media_type": "video/mp4",
+                "filename": "episode.mp4",
+            }
+        ],
+    )
+    store.create_dispatch(payload)
+
+    async def chunks():
+        yield content
+
+    asyncio.run(
+        store.append_input(
+            "dispatch-1",
+            "input-1",
+            f"bytes 0-{len(content) - 1}/{len(content)}",
+            chunks(),
+        )
+    )
+    context = JobContext(
+        job_id="job-1",
+        kind="initialize",
+        attempt=1,
+        lease_expires_at="2026-08-17T18:00:00+00:00",
+        input_fingerprint="a" * 64,
+        payload={"mode": "assisted"},
+        preconditions={
+            "project": {"id": "project-1", "name": "Project", "language": "ar"},
+            "source": {"id": "source-1", "project_id": "project-1"},
+            "annotation": {"source_id": "source-1", "version": 0},
+        },
+        config={},
+        inputs=[
+            ArtifactRef(
+                artifact_id="input-1",
+                role="source.original",
+                sha256=digest,
+                size_bytes=len(content),
+                media_type="video/mp4",
+                filename="episode.mp4",
+                project_id="project-1",
+                source_id="source-1",
+            )
+        ],
+    )
+    store.start_dispatch("dispatch-1", DispatchStart(context=context), "lease-" + "x" * 40)
+    return store, content
+
+
 def test_pushed_job_executes_then_persists_uploads_and_completion(tmp_path) -> None:
     store, _ = _prepare_dispatch(tmp_path)
     api = FakeCallbackApi()
@@ -200,6 +323,36 @@ def test_pushed_job_executes_then_persists_uploads_and_completion(tmp_path) -> N
     assert not (store.outbox_root / "dispatch-1").exists()
 
 
+def test_initialize_executes_with_typed_result_and_checksum_artifacts(tmp_path) -> None:
+    store, _ = _prepare_initialize_dispatch(tmp_path)
+    api = FakeCallbackApi()
+    identity = GpuServiceIdentity("gpu-1", "boot-1", "build-a")
+    runner = GpuJobRunner(
+        store,
+        api,
+        identity,
+        executor_factory=FakeInitializeExecutor,
+        heartbeat_seconds=3600,
+    )
+    assert runner.run_once() is True
+    assert store.get_dispatch("dispatch-1")["state"] == "outbox_pending"
+
+    sender = GpuOutboxSender(store, api, identity)
+    assert sender.run_once() is True
+    assert store.get_dispatch("dispatch-1")["state"] == "acknowledged"
+    completion = api.completed[0]
+    assert completion["kind"] == "initialize"
+    assert completion["result"]["kind"] == "initialize"
+    assert completion["result"]["duration_samples"] == 24_000
+    assert {item["role"] for item in completion["artifacts"]} == {
+        role for role, _, _ in INITIALIZE_ARTIFACTS
+    }
+    for artifact in completion["artifacts"]:
+        content = bytes(api.uploads[artifact["upload_id"]])
+        assert artifact["sha256"] == hashlib.sha256(content).hexdigest()
+        assert artifact["size_bytes"] == len(content)
+
+
 def test_lease_401_blocks_execution_without_losing_dispatch(tmp_path) -> None:
     store, _ = _prepare_dispatch(tmp_path)
 
@@ -220,8 +373,8 @@ def test_lease_401_blocks_execution_without_losing_dispatch(tmp_path) -> None:
     assert store.callback_auth_blocked() is True
 
 
-def test_interrupted_running_dispatch_is_requeued_on_store_restart(tmp_path) -> None:
-    store, _ = _prepare_dispatch(tmp_path)
+def test_interrupted_initialize_is_requeued_on_store_restart(tmp_path) -> None:
+    store, _ = _prepare_initialize_dispatch(tmp_path)
     claimed = store.claim_queued_dispatch()
     assert claimed is not None
     assert store.get_dispatch("dispatch-1")["state"] == "running"
@@ -230,6 +383,53 @@ def test_interrupted_running_dispatch_is_requeued_on_store_restart(tmp_path) -> 
     record = recovered.get_dispatch("dispatch-1")
     assert record["state"] == "queued"
     assert record["last_error"] == "GPU service restarted during execution"
+
+
+def test_interrupted_initialize_callback_resumes_without_reexecution(tmp_path) -> None:
+    store, _ = _prepare_initialize_dispatch(tmp_path)
+    api = FakeCallbackApi()
+    identity = GpuServiceIdentity("gpu-1", "boot-1", "build-a")
+    runner = GpuJobRunner(
+        store,
+        api,
+        identity,
+        executor_factory=FakeInitializeExecutor,
+        heartbeat_seconds=3600,
+    )
+    assert runner.run_once() is True
+    claimed = store.claim_pending_callback()
+    assert claimed is not None
+    assert store.get_dispatch("dispatch-1")["state"] == "callback_uploading"
+
+    recovered = GpuDispatchStore(store.cache_root, min_free_bytes=1)
+    assert recovered.get_dispatch("dispatch-1")["state"] == "outbox_pending"
+    assert GpuOutboxSender(recovered, api, identity).run_once() is True
+    assert recovered.get_dispatch("dispatch-1")["state"] == "acknowledged"
+    assert len(api.completed) == 1
+
+
+def test_initialize_preflight_cancellation_does_not_execute(tmp_path) -> None:
+    store, _ = _prepare_initialize_dispatch(tmp_path)
+
+    class CancelledApi(FakeCallbackApi):
+        def job_heartbeat(self, job_id, lease_token, payload):
+            self.heartbeats.append(payload)
+            return {"cancel_requested": True}
+
+    class UnexpectedExecutor:
+        def __init__(self, root: Path) -> None:
+            raise AssertionError("cancelled initialize must not start")
+
+    runner = GpuJobRunner(
+        store,
+        CancelledApi(),
+        GpuServiceIdentity("gpu-1", "boot-1", "build-a"),
+        executor_factory=UnexpectedExecutor,
+    )
+    assert runner.run_once() is True
+    record = store.get_dispatch("dispatch-1")
+    assert record["state"] == "orphaned"
+    assert record["last_error"] == "Web service cancelled or superseded the attempt"
 
 
 def test_execution_failure_is_delivered_through_durable_failure_callback(tmp_path) -> None:
@@ -257,8 +457,8 @@ def test_execution_failure_is_delivered_through_durable_failure_callback(tmp_pat
     ]
 
 
-def test_ambiguous_completion_retry_reuses_persisted_upload(tmp_path) -> None:
-    store, _ = _prepare_dispatch(tmp_path)
+def test_initialize_callback_retry_reuses_persisted_uploads(tmp_path) -> None:
+    store, _ = _prepare_initialize_dispatch(tmp_path)
 
     class FlakyApi(FakeCallbackApi):
         def __init__(self) -> None:
@@ -276,19 +476,94 @@ def test_ambiguous_completion_retry_reuses_persisted_upload(tmp_path) -> None:
         store,
         api,
         identity,
-        executor_factory=FakeExecutor,
+        executor_factory=FakeInitializeExecutor,
         heartbeat_seconds=3600,
     )
     assert runner.run_once() is True
     sender = GpuOutboxSender(store, api, identity)
     assert sender.run_once() is True
     assert store.get_dispatch("dispatch-1")["state"] == "outbox_pending"
-    assert list(api.uploads) == ["upload-1"]
+    persisted_uploads = list(api.uploads)
+    assert len(persisted_uploads) == len(INITIALIZE_ARTIFACTS)
 
     with store.connect() as connection:
         connection.execute("UPDATE dispatches SET next_callback_at=NULL WHERE id='dispatch-1'")
     api.fail_completion = False
     assert sender.run_once() is True
     assert store.get_dispatch("dispatch-1")["state"] == "acknowledged"
-    assert list(api.uploads) == ["upload-1"]
+    assert list(api.uploads) == persisted_uploads
     assert len(api.completed) == 1
+
+
+def test_context_executor_reuses_initialize_source_and_collects_artifacts(
+    tmp_path, monkeypatch
+) -> None:
+    original = tmp_path / "episode.mp4"
+    original.write_bytes(b"original media")
+    digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    context = JobContext(
+        job_id="job-1",
+        kind="initialize",
+        attempt=1,
+        lease_expires_at="2026-08-17T18:00:00+00:00",
+        input_fingerprint="a" * 64,
+        payload={"mode": "assisted"},
+        preconditions={
+            "project": {"id": "project-1", "name": "Project", "language": "ar"},
+            "source": {"id": "source-1", "project_id": "project-1"},
+            "annotation": {"source_id": "source-1", "version": 0},
+        },
+        config={},
+        inputs=[
+            ArtifactRef(
+                artifact_id="input-1",
+                role="source.original",
+                sha256=digest,
+                size_bytes=original.stat().st_size,
+                media_type="video/mp4",
+                filename=original.name,
+                project_id="project-1",
+                source_id="source-1",
+            )
+        ],
+    )
+    called = {}
+
+    def fake_initialize_source(state, paths, source_id, mode, config, progress):
+        called.update(source_id=source_id, mode=mode)
+        stored = paths.resolve_relative(state.get_source(source_id)["stored_path"])
+        assert stored.read_bytes() == original.read_bytes()
+        paths.canonical_audio(source_id).write_bytes(b"canonical")
+        paths.canonical_channels(source_id).write_bytes(b"channels")
+        paths.video_proxy(source_id).write_bytes(b"proxy")
+        paths.peaks(source_id).write_text('{"points":[]}', encoding="utf-8")
+        for name in ("raw_transcript.json", "aligned_transcript.json", "diarization.json"):
+            paths.artifact(source_id, name).write_text("{}", encoding="utf-8")
+        state.update_source(
+            source_id,
+            status="ready",
+            init_mode=mode,
+            duration_samples=24_000,
+            clips_stale=True,
+            inspection={"has_video": True, "channels": 2},
+        )
+        progress(1.0, "Initialized")
+        return {"source_id": source_id}
+
+    monkeypatch.setattr(
+        "moshi_data_pipeline.studio.execution_runtime.initialize_source",
+        fake_initialize_source,
+    )
+    output = ContextJobExecutor(tmp_path / "attempt").execute(
+        context,
+        {"input-1": original},
+        lambda value, message: None,
+    )
+
+    assert called == {"source_id": "source-1", "mode": "assisted"}
+    assert output.result["kind"] == "initialize"
+    assert output.result["source_id"] == "source-1"
+    assert output.result["duration_samples"] == 24_000
+    assert {artifact.role for artifact in output.artifacts} == {
+        role for role, _, _ in INITIALIZE_ARTIFACTS
+    }

@@ -14,7 +14,7 @@ This checkout contains only the g4dn WhisperX processing service. The m8i websit
 
 ## GPU Runtime
 
-The active entrypoint is `moshi_data_pipeline.gpu_intake_main`. Protocol 2.0 intake modules accept only transcription dispatches. Callback protocol 1.0 names such as `MOSHI_WORKER_TOKEN`, `worker_id`, and `/internal/v1/workers/heartbeat` are compatibility fields for communication with m8i; they do not represent another runtime.
+The active entrypoint is `moshi_data_pipeline.gpu_intake_main`. Protocol 2.0 intake modules accept typed `initialize` and `transcribe` dispatches. Callback protocol 1.0 names such as `MOSHI_WORKER_TOKEN`, `worker_id`, and `/internal/v1/workers/heartbeat` are compatibility fields for communication with m8i; they do not represent another runtime.
 
 There is one package tree and one deployment mode. `tests/test_runtime_layout.py`
 verifies that removed web, container, and pull-worker artifacts do not return and

@@ -695,13 +695,23 @@ class GpuDispatchStore:
                 raise DispatchConflictError("Execution context does not match the dispatch")
             registered = {
                 str(item["artifact_id"]): (
+                    str(item["role"]),
                     str(item["sha256"]),
                     int(item["size_bytes"]),
+                    str(item["media_type"]),
+                    str(item["filename"]),
                 )
                 for item in self._get_dispatch(connection, dispatch_id)["inputs"]
             }
             supplied = {
-                item.artifact_id: (item.sha256, item.size_bytes) for item in context.inputs
+                item.artifact_id: (
+                    item.role,
+                    item.sha256,
+                    item.size_bytes,
+                    item.media_type,
+                    item.filename,
+                )
+                for item in context.inputs
             }
             if registered != supplied:
                 raise DispatchConflictError("Execution inputs do not match verified inputs")

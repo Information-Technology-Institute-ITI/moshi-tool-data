@@ -7,13 +7,14 @@ This repository is the g4dn/WhisperX half of Moshi. The m8i server owns the webs
 The GPU service:
 
 - exposes a private authenticated intake on TCP 8766;
-- accepts immutable protocol 2.0 transcription dispatches from m8i;
+- accepts immutable protocol 2.0 initialize and transcription dispatches from m8i;
 - verifies input sizes and SHA-256 checksums;
 - runs one WhisperX transcription at a time;
 - retains progress and callback state across restarts;
 - uploads artifacts and sends completion or failure callbacks to m8i.
 
-Only the `transcribe` job kind is accepted.
+Only the `initialize` and `transcribe` job kinds are accepted. Initialize consumes
+one immutable `source.original` artifact and supports `manual` or `assisted` mode.
 
 ```text
 browser -> m8i website
