@@ -367,10 +367,3 @@ def test_malformed_success_responses_are_protocol_errors(response: object) -> No
 
     assert captured.value.retryable is False
     assert TOKEN not in str(captured.value)
-
-
-def test_canonical_and_web_build_context_copies_are_byte_identical() -> None:
-    for relative in ("gpu_dispatch_client.py", "gpu_dispatch_protocol.py"):
-        canonical = (ROOT / "moshi_data_pipeline" / relative).read_bytes()
-        web = (ROOT / "web_service" / "moshi_data_pipeline" / relative).read_bytes()
-        assert canonical == web, f"{relative} is out of sync"

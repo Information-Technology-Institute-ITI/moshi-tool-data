@@ -11,12 +11,8 @@ dist/
 .env
 raw/
 studio_workspace/
-web/node_modules/
-web/*.tsbuildinfo
-web/vite.config.js
-web/vite.config.d.ts
-web_service/.venv/
-web_service/frontend/node_modules/
-web_service/frontend/*.tsbuildinfo
-processing_service/.venv/
+frontend/node_modules/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 local_data/

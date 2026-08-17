@@ -1,16 +1,16 @@
-name: moshi-two-service
+name: moshi-web-service
 
 services:
   web:
     build:
-      context: ./web_service
+      context: .
     environment:
       MOSHI_WORKSPACE: /data/studio_workspace
       MOSHI_WEB_PORT: ${MOSHI_WEB_PORT:?set MOSHI_WEB_PORT}
       MOSHI_WEB_BIND_ADDRESS: 0.0.0.0
       MOSHI_WORKER_TOKEN: ${MOSHI_WORKER_TOKEN:?set MOSHI_WORKER_TOKEN}
       MOSHI_DISPATCH_TOKEN: ${MOSHI_DISPATCH_TOKEN:?set MOSHI_DISPATCH_TOKEN}
-      MOSHI_GPU_INTERNAL_URL: http://processing:${gpu_port:-8766}
+      MOSHI_GPU_INTERNAL_URL: ${MOSHI_GPU_INTERNAL_URL:?set MOSHI_GPU_INTERNAL_URL}
       MOSHI_GPU_REQUIRED_BUILD_ID: ${MOSHI_GPU_REQUIRED_BUILD_ID:?set MOSHI_GPU_REQUIRED_BUILD_ID}
       MOSHI_GPU_INSTANCE_ID: ${MOSHI_GPU_INSTANCE_ID:-}
       MOSHI_DEPLOYMENT_GENERATION: ${MOSHI_DEPLOYMENT_GENERATION:-local}
@@ -19,8 +19,6 @@ services:
       - ./local_data/studio_workspace:/data/studio_workspace
     ports:
       - "127.0.0.1:${MOSHI_WEB_PORT}:${MOSHI_WEB_PORT}"
-    networks:
-      - worker_private
     healthcheck:
       test:
         - CMD
@@ -30,39 +28,3 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
-
-  processing:
-    profiles: ["gpu"]
-    build:
-      context: ./processing_service
-    environment:
-      MOSHI_WEB_INTERNAL_URL: http://web:${MOSHI_WEB_PORT}
-      MOSHI_WORKER_TOKEN: ${MOSHI_WORKER_TOKEN:?set MOSHI_WORKER_TOKEN}
-      MOSHI_DISPATCH_TOKEN: ${MOSHI_DISPATCH_TOKEN:?set MOSHI_DISPATCH_TOKEN}
-      MOSHI_GPU_INTAKE_PORT: ${gpu_port:-8766}
-      MOSHI_BUILD_ID: ${MOSHI_GPU_REQUIRED_BUILD_ID:?set MOSHI_GPU_REQUIRED_BUILD_ID}
-      MOSHI_WORKER_ID: ${MOSHI_WORKER_ID:-moshi-gpu-push}
-      HF_TOKEN: ${HF_TOKEN:-}
-      MOSHI_WORKER_CACHE: /cache
-      HF_HOME: /cache/huggingface
-    command: ["python", "-m", "moshi_data_pipeline.gpu_intake_main"]
-    expose:
-      - "${gpu_port:-8766}"
-    volumes:
-      - ./local_data/worker_cache:/cache
-    networks:
-      - worker_private
-    depends_on:
-      web:
-        condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-networks:
-  worker_private:
-    driver: bridge

@@ -45,6 +45,12 @@ def build_app():
         deployment_generation=os.environ.get("MOSHI_DEPLOYMENT_GENERATION", "local"),
         gpu_dispatcher_settings=dispatcher_settings,
         lifecycle_idle_seconds=_positive_integer("MOSHI_GPU_IDLE_SECONDS", 15 * 60),
+        gpu_check_cooldown_seconds=_positive_integer(
+            "MOSHI_GPU_CHECK_COOLDOWN_SECONDS", 10 * 60
+        ),
+        gpu_cold_start_cooldown_seconds=_positive_integer(
+            "MOSHI_GPU_COLD_START_COOLDOWN_SECONDS", 30 * 60
+        ),
     )
 
 

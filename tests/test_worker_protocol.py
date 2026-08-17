@@ -17,10 +17,7 @@ from moshi_data_pipeline.studio.migrations import LATEST_SCHEMA_VERSION
 from moshi_data_pipeline.studio.protocol import JobContext
 
 ROOT = Path(__file__).parents[1]
-WEB_SCHEMA = ROOT / "web_service" / "protocol" / "worker_protocol.schema.json"
-PROCESSING_SCHEMA = (
-    ROOT / "processing_service" / "protocol" / "worker_protocol.schema.json"
-)
+WORKER_SCHEMA = ROOT / "protocol" / "worker_protocol.schema.json"
 EXPECTED_SCHEMA_SHA256 = "bd390dc8f225f286bbb1924efbea24234db5f5fc745f3f9c0ad010a70aeade18"
 
 
@@ -42,10 +39,9 @@ def _catalog(tmp_path: Path, clock: MutableClock) -> tuple[StudioCatalog, str]:
 
 
 def test_protocol_schema_copies_are_identical_and_validate_golden_context() -> None:
-    web_bytes = WEB_SCHEMA.read_bytes()
-    assert web_bytes == PROCESSING_SCHEMA.read_bytes()
-    assert hashlib.sha256(web_bytes).hexdigest() == EXPECTED_SCHEMA_SHA256
-    schema = json.loads(web_bytes)
+    schema_bytes = WORKER_SCHEMA.read_bytes()
+    assert hashlib.sha256(schema_bytes).hexdigest() == EXPECTED_SCHEMA_SHA256
+    schema = json.loads(schema_bytes)
     jsonschema.Draft202012Validator.check_schema(schema)
     message = {
         "message_type": "job_context",

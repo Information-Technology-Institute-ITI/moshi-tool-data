@@ -238,6 +238,310 @@ class StudioCatalog:
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
+    def get_user(self, user_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(user_id)
+        return dict(row)
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE email=? COLLATE NOCASE",
+                (email.strip(),),
+            ).fetchone()
+        return self._row(row)
+
+    def list_users(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 1_000:
+            raise ValueError("User list limit must be between 1 and 1000")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id,email,display_name,role,status,group_name,
+                    email_verified_at,last_login_at,created_at,updated_at
+                FROM users
+                ORDER BY created_at,id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_or_refresh_pending_user(
+        self,
+        *,
+        email: str,
+        display_name: str,
+        password_hash: str,
+        group_name: str | None = None,
+        role: str = "user",
+    ) -> tuple[dict[str, Any], bool]:
+        if role not in {"admin", "user"}:
+            raise ValueError("User role must be admin or user")
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM users WHERE email=? COLLATE NOCASE",
+                (email,),
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] == "pending":
+                    connection.execute(
+                        """
+                        UPDATE users
+                        SET display_name=?,password_hash=?,group_name=?,updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            display_name,
+                            password_hash,
+                            group_name,
+                            now,
+                            existing["id"],
+                        ),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM users WHERE id=?",
+                        (existing["id"],),
+                    ).fetchone()
+                connection.commit()
+                return dict(existing), False
+            user_id = new_id("user")
+            connection.execute(
+                """
+                INSERT INTO users(
+                    id,email,display_name,password_hash,role,status,group_name,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,'pending',?,?,?)
+                """,
+                (
+                    user_id,
+                    email,
+                    display_name,
+                    password_hash,
+                    role,
+                    group_name,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(row), True
+
+    def issue_email_verification(
+        self,
+        user_id: str,
+        token_hash: str,
+        *,
+        ttl_seconds: int,
+        resend_cooldown_seconds: int,
+    ) -> bool:
+        if ttl_seconds < 1 or resend_cooldown_seconds < 1:
+            raise ValueError("Verification timing values must be positive")
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            user = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                connection.rollback()
+                raise KeyError(user_id)
+            if user["status"] != "pending":
+                connection.commit()
+                return False
+            latest = connection.execute(
+                """
+                SELECT created_at FROM email_verification_tokens
+                WHERE user_id=? AND consumed_at IS NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if latest is not None:
+                available = datetime.fromisoformat(
+                    str(latest["created_at"])
+                ) + timedelta(seconds=resend_cooldown_seconds)
+                if available > now_dt:
+                    connection.commit()
+                    return False
+            connection.execute(
+                """
+                UPDATE email_verification_tokens
+                SET consumed_at=?
+                WHERE user_id=? AND consumed_at IS NULL
+                """,
+                (now, user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO email_verification_tokens(
+                    id,user_id,token_hash,expires_at,created_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    new_id("verify"),
+                    user_id,
+                    token_hash,
+                    (now_dt + timedelta(seconds=ttl_seconds)).isoformat(),
+                    now,
+                ),
+            )
+            connection.commit()
+        return True
+
+    def consume_email_verification(self, token_hash: str) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT token.id AS token_id,users.*
+                FROM email_verification_tokens AS token
+                JOIN users ON users.id=token.user_id
+                WHERE token.token_hash=? AND token.consumed_at IS NULL
+                    AND token.expires_at>?
+                """,
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            user_id = str(row["id"])
+            connection.execute(
+                "UPDATE email_verification_tokens SET consumed_at=? WHERE id=?",
+                (now, row["token_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE users
+                SET status='active',email_verified_at=COALESCE(email_verified_at,?),
+                    updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (now, now, user_id),
+            )
+            user = connection.execute(
+                "SELECT * FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(user)
+
+    def invalidate_email_verification(self, token_hash: str) -> bool:
+        now = self._now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_verification_tokens
+                SET consumed_at=?
+                WHERE token_hash=? AND consumed_at IS NULL
+                """,
+                (now, token_hash),
+            )
+        return cursor.rowcount == 1
+
+    def create_user_session(
+        self,
+        user_id: str,
+        token_hash: str,
+        *,
+        ttl_seconds: int,
+    ) -> dict[str, Any]:
+        if ttl_seconds < 1:
+            raise ValueError("Session TTL must be positive")
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        session_id = new_id("session")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            user = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                connection.rollback()
+                raise KeyError(user_id)
+            if user["status"] != "active":
+                connection.rollback()
+                raise ValueError("Only active users can create sessions")
+            connection.execute(
+                """
+                INSERT INTO user_sessions(
+                    id,user_id,token_hash,expires_at,created_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    session_id,
+                    user_id,
+                    token_hash,
+                    (now_dt + timedelta(seconds=ttl_seconds)).isoformat(),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
+                (now, now, user_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM user_sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def resolve_user_session(self, token_hash: str) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT users.*,sessions.id AS session_id
+                FROM user_sessions AS sessions
+                JOIN users ON users.id=sessions.user_id
+                WHERE sessions.token_hash=? AND sessions.revoked_at IS NULL
+                    AND sessions.expires_at>? AND users.status='active'
+                """,
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            connection.execute(
+                "UPDATE user_sessions SET last_seen_at=? WHERE id=?",
+                (now, row["session_id"]),
+            )
+            connection.commit()
+        value = dict(row)
+        value.pop("session_id", None)
+        return value
+
+    def revoke_user_session(self, token_hash: str) -> bool:
+        now = self._now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE user_sessions
+                SET revoked_at=?
+                WHERE token_hash=? AND revoked_at IS NULL
+                """,
+                (now, token_hash),
+            )
+        return cursor.rowcount == 1
+
     def create_project(self, name: str, language: str = "ar") -> dict[str, Any]:
         clean_name = name.strip()
         if not clean_name:
@@ -1928,9 +2232,15 @@ class StudioCatalog:
         expected_build_id: str | None = None,
         dispatch_protocol: str = GPU_DISPATCH_PROTOCOL_VERSION,
         worker_protocol: str = WORKER_PROTOCOL_VERSION,
+        manual_cooldown_seconds: int = 10 * 60,
+        manual_cold_start_cooldown_seconds: int = 30 * 60,
     ) -> tuple[dict[str, Any], bool]:
         if trigger not in {"manual", "job_preflight"}:
             raise ValueError("GPU check trigger must be manual or job_preflight")
+        if manual_cooldown_seconds < 1:
+            raise ValueError("Manual GPU check cooldown must be positive")
+        if manual_cold_start_cooldown_seconds < 1:
+            raise ValueError("Manual GPU cold-start cooldown must be positive")
         requester = requested_by.strip() if requested_by else None
         if trigger == "manual" and not requester:
             raise ValueError("Manual GPU checks require an authenticated requester")
@@ -1960,7 +2270,7 @@ class StudioCatalog:
                 ).fetchone()
                 if latest is not None:
                     available = datetime.fromisoformat(str(latest["requested_at"])) + timedelta(
-                        minutes=10
+                        seconds=manual_cooldown_seconds
                     )
                     if available > now_dt:
                         retry = int((available - now_dt).total_seconds()) + 1
@@ -1993,7 +2303,7 @@ class StudioCatalog:
                     if latest_cold is not None:
                         available = datetime.fromisoformat(
                             str(latest_cold["requested_at"])
-                        ) + timedelta(minutes=30)
+                        ) + timedelta(seconds=manual_cold_start_cooldown_seconds)
                         if available > now_dt:
                             retry = int((available - now_dt).total_seconds()) + 1
                             connection.rollback()

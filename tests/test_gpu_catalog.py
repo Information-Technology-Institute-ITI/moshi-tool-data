@@ -91,7 +91,7 @@ def test_v3_workspace_upgrades_to_gpu_schema(tmp_path) -> None:
         lifecycle_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(lifecycle_state)").fetchall()
         }
-    assert version == LATEST_SCHEMA_VERSION == 4
+    assert version == LATEST_SCHEMA_VERSION == 5
     assert {
         "gpu_runtime_state",
         "gpu_checks",
@@ -282,6 +282,43 @@ def test_gpu_check_deduplication_and_manual_limits(tmp_path) -> None:
     with pytest.raises(GpuCheckRateLimitError) as cold_limit:
         catalog.request_gpu_check("manual", requested_by="charlie", cold_start=True)
     assert "cold-start" in cold_limit.value.reason
+
+
+def test_gpu_check_cooldowns_are_configurable(tmp_path) -> None:
+    clock = Clock()
+    catalog = StudioCatalog(tmp_path / "catalog.sqlite3", clock=clock)
+    check, created = catalog.request_gpu_check(
+        "manual",
+        requested_by="alice",
+        cold_start=True,
+        manual_cooldown_seconds=7,
+        manual_cold_start_cooldown_seconds=19,
+    )
+    assert created is True
+    catalog.update_gpu_check(
+        check["id"],
+        status="passed",
+        finished_at=clock().isoformat(),
+    )
+
+    with pytest.raises(GpuCheckRateLimitError) as user_limit:
+        catalog.request_gpu_check(
+            "manual",
+            requested_by="alice",
+            manual_cooldown_seconds=7,
+            manual_cold_start_cooldown_seconds=19,
+        )
+    assert 6 <= user_limit.value.retry_after <= 8
+
+    with pytest.raises(GpuCheckRateLimitError) as cold_limit:
+        catalog.request_gpu_check(
+            "manual",
+            requested_by="bob",
+            cold_start=True,
+            manual_cooldown_seconds=7,
+            manual_cold_start_cooldown_seconds=19,
+        )
+    assert 18 <= cold_limit.value.retry_after <= 20
 
 
 def test_duplicate_active_job_creation_is_serialized(tmp_path) -> None:

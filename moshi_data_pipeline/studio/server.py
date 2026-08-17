@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+import smtplib
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,6 +13,15 @@ from typing import Any
 from moshi_data_pipeline.audio.ffmpeg import SUPPORTED_EXTENSIONS
 from moshi_data_pipeline.config import PipelineConfig, load_config
 from moshi_data_pipeline.studio.artifacts import UploadConflictError
+from moshi_data_pipeline.studio.auth import (
+    ActivationMailer,
+    ActivationRequest,
+    AuthenticationService,
+    AuthSettings,
+    ResendActivationRequest,
+    SigninRequest,
+    SignupRequest,
+)
 from moshi_data_pipeline.studio.catalog import (
     WORKER_PROTOCOL_VERSION,
     GpuCheckRateLimitError,
@@ -61,6 +71,10 @@ def create_studio_app(
     trusted_authenticated_user_header: str | None = None,
     loopback_authenticated_user: str | None = None,
     lifecycle_idle_seconds: int = 15 * 60,
+    gpu_check_cooldown_seconds: int = 10 * 60,
+    gpu_cold_start_cooldown_seconds: int = 30 * 60,
+    auth_settings: AuthSettings | None = None,
+    auth_mailer: ActivationMailer | None = None,
 ):
     try:
         from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -73,9 +87,7 @@ def create_studio_app(
         )
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
-        raise RuntimeError(
-            'The studio requires: pip install -e ".[review]"'
-        ) from exc
+        raise RuntimeError('The studio requires: pip install -e ".[review]"') from exc
 
     service = StudioService(
         workspace.resolve(),
@@ -87,6 +99,13 @@ def create_studio_app(
         gpu_dispatcher_settings=gpu_dispatcher_settings,
         gpu_dispatch_client=gpu_dispatch_client,
         lifecycle_idle_seconds=lifecycle_idle_seconds,
+        gpu_check_cooldown_seconds=gpu_check_cooldown_seconds,
+        gpu_cold_start_cooldown_seconds=gpu_cold_start_cooldown_seconds,
+    )
+    authentication = AuthenticationService(
+        service.catalog,
+        auth_settings or AuthSettings.from_environment(),
+        mailer=auth_mailer,
     )
     configured_worker_tokens = tuple(
         value
@@ -103,8 +122,7 @@ def create_studio_app(
         if value.strip()
     }
     identity_header = (
-        trusted_authenticated_user_header
-        or os.environ.get("MOSHI_AUTHENTICATED_USER_HEADER", "")
+        trusted_authenticated_user_header or os.environ.get("MOSHI_AUTHENTICATED_USER_HEADER", "")
     ).strip()
     if identity_header and not re.fullmatch(r"[A-Za-z0-9-]{1,80}", identity_header):
         raise RuntimeError("MOSHI_AUTHENTICATED_USER_HEADER is invalid")
@@ -113,13 +131,9 @@ def create_studio_app(
         or os.environ.get("MOSHI_TRUST_PROXY_AUTH", "").strip() == "1"
     )
     loopback_identity = (
-        loopback_authenticated_user
-        or os.environ.get("MOSHI_LOOPBACK_AUTHENTICATED_USER", "")
+        loopback_authenticated_user or os.environ.get("MOSHI_LOOPBACK_AUTHENTICATED_USER", "")
     ).strip()
-    if (
-        len(loopback_identity) > 200
-        or any(ord(character) < 32 for character in loopback_identity)
-    ):
+    if len(loopback_identity) > 200 or any(ord(character) < 32 for character in loopback_identity):
         raise RuntimeError("MOSHI_LOOPBACK_AUTHENTICATED_USER is invalid")
     trial_operator_ips: set[str] = set()
     for value in os.environ.get("MOSHI_TRIAL_OPERATOR_IPS", "").split(","):
@@ -129,20 +143,15 @@ def create_studio_app(
         try:
             trial_operator_ips.add(str(ipaddress.ip_address(candidate)))
         except ValueError as exc:
-            raise RuntimeError(
-                "MOSHI_TRIAL_OPERATOR_IPS must contain exact IP addresses"
-            ) from exc
-    trial_operator_identity = os.environ.get(
-        "MOSHI_TRIAL_AUTHENTICATED_USER", ""
-    ).strip()
+            raise RuntimeError("MOSHI_TRIAL_OPERATOR_IPS must contain exact IP addresses") from exc
+    trial_operator_identity = os.environ.get("MOSHI_TRIAL_AUTHENTICATED_USER", "").strip()
     if bool(trial_operator_ips) != bool(trial_operator_identity):
         raise RuntimeError(
             "MOSHI_TRIAL_OPERATOR_IPS and MOSHI_TRIAL_AUTHENTICATED_USER "
             "must be configured together"
         )
-    if (
-        len(trial_operator_identity) > 200
-        or any(ord(character) < 32 for character in trial_operator_identity)
+    if len(trial_operator_identity) > 200 or any(
+        ord(character) < 32 for character in trial_operator_identity
     ):
         raise RuntimeError("MOSHI_TRIAL_AUTHENTICATED_USER is invalid")
 
@@ -171,6 +180,16 @@ def create_studio_app(
         lifespan=lifespan,
     )
     app.state.studio = service
+    app.state.authentication = authentication
+    public_auth_paths = {
+        "/api/health",
+        "/api/auth/signup",
+        "/api/auth/activate",
+        "/api/auth/resend-activation",
+        "/api/auth/signin",
+        "/api/auth/signout",
+        "/api/auth/me",
+    }
 
     @app.middleware("http")
     async def enforce_trusted_origin(request: Request, call_next):
@@ -181,9 +200,8 @@ def create_studio_app(
                     status_code=403,
                     content={"detail": "Worker callback source is not allowed"},
                 )
-        if (
-            request.method not in {"GET", "HEAD", "OPTIONS"}
-            and not request.url.path.startswith("/internal/")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not request.url.path.startswith(
+            "/internal/"
         ):
             origin = request.headers.get("origin")
             if origin:
@@ -199,25 +217,40 @@ def create_studio_app(
                         status_code=403,
                         content={"detail": "Untrusted request origin"},
                     )
+        session_user = authentication.current_user(
+            request.cookies.get(authentication.settings.cookie_name)
+        )
+        if session_user is not None:
+            request.state.authenticated_user = session_user
+        protected_browser_path = (
+            request.url.path.startswith("/api/") and request.url.path not in public_auth_paths
+        ) or request.url.path.startswith("/media/")
+        if (
+            authentication.settings.require_sign_in
+            and protected_browser_path
+            and session_user is None
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Sign in is required"},
+            )
         return await call_next(request)
 
     @app.exception_handler(KeyError)
     async def missing_handler(_: Request, exc: KeyError):
-        return JSONResponse(
-            status_code=404, content={"detail": f"Not found: {exc.args[0]}"}
-        )
+        return JSONResponse(status_code=404, content={"detail": f"Not found: {exc.args[0]}"})
 
     @app.exception_handler(VersionConflictError)
     async def conflict_handler(_: Request, exc: VersionConflictError):
-        return JSONResponse(
-            status_code=409, content={"detail": str(exc)}
-        )
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(ValueError)
     async def value_handler(_: Request, exc: ValueError):
-        return JSONResponse(
-            status_code=400, content={"detail": str(exc)}
-        )
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(PermissionError)
+    async def permission_handler(_: Request, exc: PermissionError):
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
 
     @app.exception_handler(LeaseConflictError)
     async def lease_conflict_handler(_: Request, exc: LeaseConflictError):
@@ -232,9 +265,7 @@ def create_studio_app(
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(GpuCheckRateLimitError)
-    async def gpu_check_rate_limit_handler(
-        _: Request, exc: GpuCheckRateLimitError
-    ):
+    async def gpu_check_rate_limit_handler(_: Request, exc: GpuCheckRateLimitError):
         return JSONResponse(
             status_code=429,
             content={"detail": exc.reason},
@@ -256,6 +287,9 @@ def create_studio_app(
             raise HTTPException(status_code=403, detail="Untrusted request origin")
 
     def authenticated_user(request: Request) -> str:
+        session_user = getattr(request.state, "authenticated_user", None)
+        if session_user is not None:
+            return str(session_user["email"])
         source = request.client.host if request.client else ""
         try:
             is_loopback = ipaddress.ip_address(source).is_loopback
@@ -280,8 +314,7 @@ def create_studio_app(
             raise HTTPException(status_code=503, detail="Worker API is not configured")
         scheme, _, token = (authorization or "").partition(" ")
         valid = scheme.casefold() == "bearer" and any(
-            hmac.compare_digest(token, expected)
-            for expected in configured_worker_tokens
+            hmac.compare_digest(token, expected) for expected in configured_worker_tokens
         )
         if not valid:
             raise HTTPException(
@@ -297,6 +330,87 @@ def create_studio_app(
 
     def worker_auth(authorization: str | None) -> None:
         require_worker_token(authorization)
+
+    @app.get("/api/auth/me")
+    def auth_me(request: Request):
+        return {
+            "user": getattr(request.state, "authenticated_user", None),
+            "required": authentication.settings.require_sign_in,
+        }
+
+    @app.post("/api/auth/signup", status_code=202)
+    def auth_signup(payload: SignupRequest, request: Request):
+        require_same_origin(request)
+        if not authentication.settings.email_configured:
+            raise HTTPException(
+                status_code=503,
+                detail="Activation email delivery is not configured",
+            )
+        try:
+            authentication.signup(
+                email=payload.email,
+                password=payload.password,
+                display_name=payload.display_name,
+            )
+        except (OSError, RuntimeError, smtplib.SMTPException):
+            raise HTTPException(
+                status_code=503,
+                detail="Activation email could not be sent",
+            ) from None
+        return {"message": ("If the address can be registered, an activation email has been sent.")}
+
+    @app.post("/api/auth/resend-activation", status_code=202)
+    def auth_resend_activation(payload: ResendActivationRequest, request: Request):
+        require_same_origin(request)
+        if not authentication.settings.email_configured:
+            raise HTTPException(
+                status_code=503,
+                detail="Activation email delivery is not configured",
+            )
+        try:
+            authentication.resend_activation(payload.email)
+        except (OSError, RuntimeError, smtplib.SMTPException):
+            raise HTTPException(
+                status_code=503,
+                detail="Activation email could not be sent",
+            ) from None
+        return {"message": ("If the account is awaiting activation, a new email has been sent.")}
+
+    @app.post("/api/auth/activate")
+    def auth_activate(payload: ActivationRequest, request: Request):
+        require_same_origin(request)
+        return {"user": authentication.activate(payload.token)}
+
+    @app.post("/api/auth/signin")
+    def auth_signin(payload: SigninRequest, request: Request):
+        require_same_origin(request)
+        user, token = authentication.signin(payload.email, payload.password)
+        response = JSONResponse(content={"user": user})
+        response.set_cookie(
+            key=authentication.settings.cookie_name,
+            value=token,
+            max_age=authentication.settings.session_ttl_seconds,
+            httponly=True,
+            secure=authentication.settings.cookie_secure,
+            samesite="lax",
+            path="/",
+            domain=None,
+        )
+        return response
+
+    @app.post("/api/auth/signout")
+    def auth_signout(request: Request):
+        require_same_origin(request)
+        authentication.signout(request.cookies.get(authentication.settings.cookie_name))
+        response = JSONResponse(content={"signed_out": True})
+        response.delete_cookie(
+            key=authentication.settings.cookie_name,
+            path="/",
+            secure=authentication.settings.cookie_secure,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
 
     @app.post("/internal/v1/workers/heartbeat")
     def worker_heartbeat(
@@ -387,8 +501,7 @@ def create_studio_app(
         return {
             "job": job,
             "cancel_requested": (
-                service.contexts.current_fingerprint(job)
-                != job["input_fingerprint"]
+                service.contexts.current_fingerprint(job) != job["input_fingerprint"]
             ),
         }
 
@@ -605,8 +718,7 @@ def create_studio_app(
     def gpu_check_history(limit: int = 10):
         return {
             "checks": [
-                public_gpu_check(check)
-                for check in service.catalog.list_gpu_checks(limit=limit)
+                public_gpu_check(check) for check in service.catalog.list_gpu_checks(limit=limit)
             ]
         }
 
@@ -663,9 +775,7 @@ def create_studio_app(
                 status_code=415,
                 detail=f"Unsupported media extension: {Path(x_filename).suffix}",
             )
-        destination, digest, size = await store_upload(
-            service.paths, x_filename, request.stream()
-        )
+        destination, digest, size = await store_upload(service.paths, x_filename, request.stream())
         try:
             return service.catalog.create_source(
                 project_id,
@@ -771,9 +881,7 @@ def create_studio_app(
     @app.get("/api/sources/{source_id}/annotations")
     def get_annotation(source_id: str):
         return {
-            "annotation": service.catalog.latest_annotation(source_id).model_dump(
-                mode="json"
-            ),
+            "annotation": service.catalog.latest_annotation(source_id).model_dump(mode="json"),
             "revisions": service.catalog.annotation_revisions(source_id),
         }
 
@@ -951,11 +1059,7 @@ def create_studio_app(
     def clip_media(source_id: str, clip_id: str, kind: str):
         artifacts = clip_artifacts(service.catalog, service.paths, source_id)
         item = next(
-            (
-                value
-                for value in artifacts.get("artifacts", [])
-                if value["clip"]["id"] == clip_id
-            ),
+            (value for value in artifacts.get("artifacts", []) if value["clip"]["id"] == clip_id),
             None,
         )
         if item is None:
@@ -972,6 +1076,17 @@ def create_studio_app(
     assets = static_root / "assets"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="studio-assets")
+
+    @app.get("/studio-intro.png", include_in_schema=False)
+    def studio_intro_asset():
+        path = static_root / "studio-intro.png"
+        if not path.exists():
+            raise HTTPException(status_code=404)
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/")
     def index():
@@ -1011,9 +1126,7 @@ def serve_studio(
     try:
         import uvicorn
     except ImportError as exc:
-        raise RuntimeError(
-            'The studio requires: pip install -e ".[review]"'
-        ) from exc
+        raise RuntimeError('The studio requires: pip install -e ".[review]"') from exc
     uvicorn.run(
         create_studio_app(workspace, load_config(config_path)),
         host=host,

@@ -398,11 +398,67 @@ def _gpu_push_dispatch_v2(connection: sqlite3.Connection) -> None:
     )
 
 
+def _user_authentication_v1(connection: sqlite3.Connection) -> None:
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            display_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','active','disabled')),
+            group_name TEXT,
+            email_verified_at TEXT,
+            last_login_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS email_verification_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash) = 64),
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash) = 64),
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS users_status_idx
+            ON users(status, created_at);
+        CREATE INDEX IF NOT EXISTS users_group_idx
+            ON users(group_name, status);
+        CREATE INDEX IF NOT EXISTS email_verification_expiry_idx
+            ON email_verification_tokens(expires_at, consumed_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS email_verification_one_active_idx
+            ON email_verification_tokens(user_id)
+            WHERE consumed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS user_sessions_user_idx
+            ON user_sessions(user_id, revoked_at, expires_at);
+        CREATE INDEX IF NOT EXISTS user_sessions_expiry_idx
+            ON user_sessions(expires_at, revoked_at);
+        """,
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "legacy_compatibility", _legacy_compatibility),
     (2, "worker_protocol_v1", _worker_protocol_v1),
     (3, "artifact_commit_journal", _artifact_commit_journal),
     (4, "gpu_push_dispatch_v2", _gpu_push_dispatch_v2),
+    (5, "user_authentication_v1", _user_authentication_v1),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

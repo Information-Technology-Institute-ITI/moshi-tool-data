@@ -82,6 +82,8 @@ class StudioService:
         gpu_dispatcher_settings: GpuDispatcherSettings | None = None,
         gpu_dispatch_client: Any = None,
         lifecycle_idle_seconds: int = 15 * 60,
+        gpu_check_cooldown_seconds: int = 10 * 60,
+        gpu_cold_start_cooldown_seconds: int = 30 * 60,
     ):
         if enable_local_worker and gpu_dispatcher_settings is not None:
             raise ValueError("The local worker and GPU push dispatcher cannot run together")
@@ -119,6 +121,8 @@ class StudioService:
             metrics_publisher=metrics_publisher,
         )
         self.gpu_settings = gpu_dispatcher_settings
+        self.gpu_check_cooldown_seconds = gpu_check_cooldown_seconds
+        self.gpu_cold_start_cooldown_seconds = gpu_cold_start_cooldown_seconds
         self.dispatcher: Any = (
             GpuPushDispatcher(
                 self.catalog,
@@ -225,6 +229,8 @@ class StudioService:
             instance_id=self.gpu_settings.instance_id,
             cold_start=lifecycle.get("instance_state") != "running",
             expected_build_id=self.gpu_settings.required_build_id,
+            manual_cooldown_seconds=self.gpu_check_cooldown_seconds,
+            manual_cold_start_cooldown_seconds=self.gpu_cold_start_cooldown_seconds,
         )
         if created:
             self.catalog.update_lifecycle_state(

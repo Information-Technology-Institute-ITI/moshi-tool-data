@@ -3,48 +3,27 @@ requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "moshi-data-pipeline"
-version = "0.3.0"
-description = "Channel-first podcast-to-Kyutai-Moshi dataset preparation pipeline"
-readme = "README.md"
+name = "moshi-web-service"
+version = "0.4.0"
+description = "Always-on Moshi Dataset Studio web and worker-control service"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+  "boto3>=1.40,<2",
+  "fastapi==0.140.13",
   "jsonschema==4.26.0",
-  "numpy==2.2.6",
   "pydantic==2.13.4",
   "PyYAML==6.0.3",
   "rich==15.0.0",
-  "scipy==1.15.3",
-  "soundfile==0.14.0",
   "typer==0.27.0",
+  "uvicorn==0.51.0",
 ]
 
 [project.optional-dependencies]
-ml = [
-  "faster-whisper==1.2.1",
-  "pyannote.audio==4.0.7",
-  "torch==2.8.0",
-  "torchaudio==2.8.0",
-  "torchcodec==0.7.0",
-  "torchvision==0.23.0",
-  "whisperx==3.8.6",
-]
-separation = [
-  "speechbrain==1.1.0",
-]
-review = [
-  "boto3>=1.40,<2",
-  "fastapi==0.140.13",
-  "uvicorn==0.51.0",
-]
 dev = [
   "httpx2==2.9.1",
   "pytest==9.1.1",
   "ruff==0.16.0",
 ]
-
-[project.scripts]
-moshi-data-pipeline = "moshi_data_pipeline.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["moshi_data_pipeline*"]
@@ -67,17 +46,4 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
-ignore = [
-  "B008",  # Typer declares CLI options through evaluated default values.
-  "E501",
-]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
+ignore = ["B008", "E501"]

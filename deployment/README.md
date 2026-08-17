@@ -146,6 +146,8 @@ MOSHI_GPU_INSTANCE_ID=<exact g4dn instance ID>
 AWS_REGION=<actual region>
 MOSHI_DEPLOYMENT_GENERATION=<m8i deployment revision>
 MOSHI_GPU_IDLE_SECONDS=900
+MOSHI_GPU_CHECK_COOLDOWN_SECONDS=600
+MOSHI_GPU_COLD_START_COOLDOWN_SECONDS=1800
 MOSHI_WORKER_SOURCE_IPS=172.31.26.80
 MOSHI_TRUSTED_ORIGINS=http://<public-m8i-host>
 MOSHI_AUTHENTICATED_USER_HEADER=X-Moshi-Authenticated-User
@@ -157,8 +159,11 @@ Use the default AWS credential chain. Do not put AWS access keys in this file.
 
 The m8i lifecycle controller owns the idle timer and every EC2
 `DescribeInstances`/`StartInstances`/`StopInstances` call. `MOSHI_GPU_IDLE_SECONDS` defaults to 900
-seconds. The GPU reports whether callbacks, checks, dispatches, and its durable outbox are safe; it
-does not stop its own EC2 instance.
+seconds. `MOSHI_GPU_CHECK_COOLDOWN_SECONDS` controls the per-user manual-check delay, and
+`MOSHI_GPU_COLD_START_COOLDOWN_SECONDS` controls the global delay between manual checks that start
+a stopped GPU. These values are positive seconds and apply after restarting the web service. The
+GPU reports whether callbacks, checks, dispatches, and its durable outbox are safe; it does not
+stop its own EC2 instance.
 
 Run one Uvicorn worker with the local ML worker disabled and the durable dispatcher enabled. If the
 dispatcher remains owned by the web lifespan, do not scale Uvicorn to multiple processes against
