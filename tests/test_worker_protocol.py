@@ -34,7 +34,9 @@ class MutableClock:
 
 def _catalog(tmp_path: Path, clock: MutableClock) -> tuple[StudioCatalog, str]:
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3", clock=clock)
-    project = catalog.create_project("Remote worker")
+    project = catalog.create_project(
+        "Remote worker", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     return catalog, str(project["id"])
 
 

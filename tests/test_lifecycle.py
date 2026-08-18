@@ -20,7 +20,9 @@ class Clock:
 def _controller(tmp_path, *, provider_state: str = "stopped"):
     clock = Clock()
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3", clock=clock)
-    project = catalog.create_project("Lifecycle")
+    project = catalog.create_project(
+        "Lifecycle", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     provider = LocalLifecycleProvider(provider_state)
     controller = LifecycleController(
         catalog,

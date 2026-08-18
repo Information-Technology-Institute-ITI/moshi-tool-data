@@ -18,7 +18,9 @@ def _app_with_job(tmp_path, kind: str = "transcribe"):
         worker_token=TOKEN,
     )
     service = app.state.studio
-    project = service.catalog.create_project("Worker API")
+    project = service.catalog.create_project(
+        "Worker API", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     job = service.enqueue(project["id"], kind)
     return app, service, job
 
@@ -264,7 +266,9 @@ def test_stale_authoritative_context_supersedes_completion(tmp_path) -> None:
         tmp_path / "workspace", start_worker=False, worker_token=TOKEN
     )
     service = app.state.studio
-    project = service.catalog.create_project("Stale context")
+    project = service.catalog.create_project(
+        "Stale context", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     original = service.paths.originals / "episode.wav"
     original.write_bytes(b"placeholder")
     source = service.catalog.create_source(
@@ -309,7 +313,9 @@ def test_artifact_and_typed_annotation_commit_are_atomic(tmp_path) -> None:
         tmp_path / "workspace", start_worker=False, worker_token=TOKEN
     )
     service = app.state.studio
-    project = service.catalog.create_project("Atomic result")
+    project = service.catalog.create_project(
+        "Atomic result", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     original = service.paths.originals / "episode.wav"
     original.write_bytes(b"placeholder")
     source = service.catalog.create_source(

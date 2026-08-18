@@ -21,6 +21,13 @@ from moshi_data_pipeline.studio.auth import (
     ResendActivationRequest,
     SigninRequest,
     SignupRequest,
+    public_user,
+)
+from moshi_data_pipeline.studio.authorization import (
+    CatalogAuthorization,
+    RequestPrincipal,
+    require_admin,
+    require_principal,
 )
 from moshi_data_pipeline.studio.catalog import (
     WORKER_PROTOCOL_VERSION,
@@ -37,6 +44,7 @@ from moshi_data_pipeline.studio.domain import (
     ExportCreate,
     OverlapDecisionPayload,
     ProjectCreate,
+    ProjectOwnerUpdate,
     ProjectUpdate,
     SourceRights,
 )
@@ -107,6 +115,18 @@ def create_studio_app(
         auth_settings or AuthSettings.from_environment(),
         mailer=auth_mailer,
     )
+    authorization = CatalogAuthorization(service.catalog)
+    local_catalog_user = (
+        service.catalog.ensure_local_admin()
+        if not authentication.settings.require_sign_in
+        else None
+    )
+    local_principal = (
+        RequestPrincipal.from_catalog_user(local_catalog_user)
+        if local_catalog_user is not None
+        else None
+    )
+    local_user = public_user(local_catalog_user) if local_catalog_user is not None else None
     configured_worker_tokens = tuple(
         value
         for value in (
@@ -181,6 +201,7 @@ def create_studio_app(
     )
     app.state.studio = service
     app.state.authentication = authentication
+    app.state.authorization = authorization
     public_auth_paths = {
         "/api/health",
         "/api/auth/signup",
@@ -220,25 +241,58 @@ def create_studio_app(
         session_user = authentication.current_user(
             request.cookies.get(authentication.settings.cookie_name)
         )
-        if session_user is not None:
-            request.state.authenticated_user = session_user
+        principal = (
+            local_principal
+            if local_principal is not None
+            else (
+                RequestPrincipal.from_catalog_user(session_user)
+                if session_user is not None
+                else None
+            )
+        )
+        visible_user = local_user if local_user is not None else session_user
+        if visible_user is not None:
+            request.state.authenticated_user = visible_user
+        if principal is not None:
+            request.state.principal = principal
         protected_browser_path = (
             request.url.path.startswith("/api/") and request.url.path not in public_auth_paths
         ) or request.url.path.startswith("/media/")
-        if (
-            authentication.settings.require_sign_in
-            and protected_browser_path
-            and session_user is None
-        ):
+        if protected_browser_path and principal is None:
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Sign in is required"},
             )
+        if protected_browser_path:
+            path = request.url.path
+            try:
+                if match := re.match(r"^/api/admin/projects/([^/]+)", path):
+                    require_admin(principal)
+                    authorization.authorize_project(principal, match.group(1))
+                elif path.startswith(("/api/admin/", "/api/system/")):
+                    require_admin(principal)
+                elif match := re.match(r"^/api/projects/([^/]+)", path):
+                    authorization.authorize_project(principal, match.group(1))
+                elif match := re.match(r"^/api/sources/([^/]+)", path):
+                    authorization.authorize_source(principal, match.group(1))
+                elif match := re.match(r"^/api/jobs/([^/]+)", path):
+                    authorization.authorize_job(principal, match.group(1))
+                elif match := re.match(r"^/media/exports/([^/]+)", path):
+                    authorization.authorize_export(principal, match.group(1))
+                elif match := re.match(r"^/media/([^/]+)", path):
+                    authorization.authorize_source(principal, match.group(1))
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            except KeyError:
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": "Not found"},
+                )
         return await call_next(request)
 
     @app.exception_handler(KeyError)
-    async def missing_handler(_: Request, exc: KeyError):
-        return JSONResponse(status_code=404, content={"detail": f"Not found: {exc.args[0]}"})
+    async def missing_handler(_: Request, __: KeyError):
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
 
     @app.exception_handler(VersionConflictError)
     async def conflict_handler(_: Request, exc: VersionConflictError):
@@ -288,7 +342,7 @@ def create_studio_app(
 
     def authenticated_user(request: Request) -> str:
         session_user = getattr(request.state, "authenticated_user", None)
-        if session_user is not None:
+        if authentication.settings.require_sign_in and session_user is not None:
             return str(session_user["email"])
         source = request.client.host if request.client else ""
         try:
@@ -697,7 +751,8 @@ def create_studio_app(
         return {"status": "ok", "workspace": str(service.paths.root)}
 
     @app.get("/api/system/worker")
-    def worker_status():
+    def worker_status(request: Request):
+        require_admin(require_principal(request))
         return {
             "protocol_version": WORKER_PROTOCOL_VERSION,
             "worker": service.catalog.latest_worker_state(),
@@ -707,15 +762,18 @@ def create_studio_app(
         }
 
     @app.post("/api/system/worker/retry-startup", status_code=202)
-    def retry_worker_startup():
+    def retry_worker_startup(request: Request):
+        require_admin(require_principal(request))
         return service.lifecycle.retry_blocked()
 
     @app.get("/api/system/gpu")
-    def gpu_status():
+    def gpu_status(request: Request):
+        require_admin(require_principal(request))
         return service.gpu_status()
 
     @app.get("/api/system/gpu/checks")
-    def gpu_check_history(limit: int = 10):
+    def gpu_check_history(request: Request, limit: int = 10):
+        require_admin(require_principal(request))
         return {
             "checks": [
                 public_gpu_check(check) for check in service.catalog.list_gpu_checks(limit=limit)
@@ -724,6 +782,7 @@ def create_studio_app(
 
     @app.post("/api/system/gpu/checks")
     def trigger_gpu_check(request: Request):
+        require_admin(require_principal(request))
         require_same_origin(request)
         user = authenticated_user(request)
         if service.gpu_settings is None:
@@ -738,13 +797,43 @@ def create_studio_app(
             },
         )
 
+    @app.get("/api/admin/users")
+    def list_admin_users(request: Request):
+        require_admin(require_principal(request))
+        return {"users": service.catalog.list_active_users()}
+
+    @app.patch("/api/admin/projects/{project_id}/owner")
+    def transfer_project_owner(
+        project_id: str,
+        payload: ProjectOwnerUpdate,
+        request: Request,
+    ):
+        principal = require_admin(require_principal(request))
+        authorization.authorize_project(principal, project_id)
+        return service.catalog.transfer_project_owner(
+            project_id,
+            owner_user_id=payload.owner_user_id,
+            actor_user_id=principal.user_id,
+        )
+
     @app.get("/api/projects")
-    def list_projects():
-        return {"projects": service.catalog.list_projects()}
+    def list_projects(request: Request):
+        principal = require_principal(request)
+        return {
+            "projects": service.catalog.list_projects(
+                viewer_id=principal.user_id,
+                is_admin=principal.is_admin,
+            )
+        }
 
     @app.post("/api/projects", status_code=201)
-    def create_project(payload: ProjectCreate):
-        return service.catalog.create_project(payload.name, payload.language)
+    def create_project(payload: ProjectCreate, request: Request):
+        principal = require_principal(request)
+        return service.catalog.create_project(
+            payload.name,
+            payload.language,
+            owner_user_id=principal.user_id,
+        )
 
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: str):
@@ -762,6 +851,22 @@ def create_studio_app(
             name=payload.name,
             language=payload.language,
         )
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(
+        project_id: str,
+        request: Request,
+        x_confirm_delete: str = Header(...),
+    ):
+        principal = require_principal(request)
+        authorization.authorize_project(principal, project_id)
+        if x_confirm_delete != project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Confirm-Delete must exactly match the project id",
+            )
+        deleted = service.delete_project(project_id, actor_user_id=principal.user_id)
+        return {"deleted": deleted["id"], "recoverable": False}
 
     @app.post("/api/projects/{project_id}/sources", status_code=201)
     async def upload_source(
@@ -975,13 +1080,18 @@ def create_studio_app(
         return job
 
     @app.get("/api/jobs/{job_id}/events")
-    async def job_events(job_id: str):
-        service.catalog.get_job(job_id)
+    async def job_events(job_id: str, request: Request):
+        principal = require_principal(request)
+        authorization.authorize_job(principal, job_id)
 
         async def values():
             previous = None
             while True:
-                job = service.catalog.get_job(job_id)
+                try:
+                    job = authorization.authorize_job(principal, job_id)
+                except KeyError:
+                    yield 'event: access_revoked\ndata: {"detail":"Not found"}\n\n'
+                    break
                 serialized = json.dumps(job, ensure_ascii=False)
                 if serialized != previous:
                     yield f"data: {serialized}\n\n"
@@ -1070,6 +1180,20 @@ def create_studio_app(
         return FileResponse(
             service.paths.resolve_relative(item[field]),
             media_type="audio/wav" if kind == "audio" else "application/json",
+        )
+
+    @app.get("/media/exports/{export_id}/bundle")
+    def export_bundle_media(export_id: str):
+        export = service.catalog.get_export(export_id)
+        if not export.get("path"):
+            raise KeyError(export_id)
+        path = service.paths.resolve_relative(str(export["path"]))
+        if not path.is_file():
+            raise KeyError(export_id)
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            filename=path.name,
         )
 
     static_root = Path(__file__).with_name("static")

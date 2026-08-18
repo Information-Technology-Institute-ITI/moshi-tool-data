@@ -161,7 +161,7 @@ class StudioService:
 
     def _repair_annotation_bounds(self) -> None:
         """Create a corrected revision for legacy model timestamps past EOF."""
-        for project in self.catalog.list_projects():
+        for project in self.catalog.list_projects(viewer_id="system", is_admin=True):
             for source in self.catalog.list_sources(project["id"]):
                 duration = int(source["duration_samples"] or 0)
                 if duration <= 0:
@@ -627,3 +627,53 @@ class StudioService:
         if original.exists():
             original.unlink()
         return self.catalog.delete_source(source_id)
+
+    def delete_project(self, project_id: str, *, actor_user_id: str) -> dict[str, Any]:
+        project = self.catalog.get_project(project_id)
+        if any(
+            job["status"] in {"queued", "running"}
+            for job in self.catalog.list_jobs(project_id, limit=100_000)
+        ):
+            raise ValueError("Wait for active project jobs to finish before deletion")
+
+        targets: set[Path] = set()
+
+        def register_target(path: Path) -> None:
+            resolved = path.resolve()
+            if resolved == self.paths.root or self.paths.root not in resolved.parents:
+                raise ValueError("Refusing to remove a project target outside the workspace")
+            targets.add(resolved)
+
+        for source in self.catalog.list_sources(project_id):
+            register_target(self.paths.resolve_relative(str(source["stored_path"])))
+            register_target(self.paths.source_root(str(source["id"])))
+            for recovery in self.catalog.overlap_recoveries(str(source["id"])):
+                for field in ("assistant_path", "user_path", "original_path"):
+                    if recovery.get(field):
+                        register_target(
+                            self.paths.resolve_relative(str(recovery[field]))
+                        )
+        for artifact in self.catalog.list_project_artifacts(project_id):
+            register_target(self.paths.resolve_relative(str(artifact["relative_path"])))
+        for upload in self.catalog.list_project_artifact_uploads(project_id):
+            register_target(self.paths.resolve_relative(str(upload["staging_path"])))
+            if upload.get("final_relative_path"):
+                register_target(
+                    self.paths.resolve_relative(str(upload["final_relative_path"]))
+                )
+        for commit in self.catalog.list_project_artifact_commits(project_id):
+            for entry in commit["entries"]:
+                for field in ("staging_path", "final_path"):
+                    if entry.get(field):
+                        register_target(self.paths.resolve_relative(str(entry[field])))
+        for export in self.catalog.list_exports(project_id):
+            if export.get("path"):
+                register_target(self.paths.resolve_relative(str(export["path"])))
+
+        for target in sorted(targets, key=lambda value: len(value.parts), reverse=True):
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+        deleted = self.catalog.delete_project(project_id, actor_user_id=actor_user_id)
+        return {**project, **deleted}

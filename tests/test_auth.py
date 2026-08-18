@@ -234,5 +234,5 @@ def test_existing_v4_database_upgrades_with_auth_tables(tmp_path) -> None:
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert version == 5
+    assert version == 6
     assert {"users", "email_verification_tokens", "user_sessions"} <= tables

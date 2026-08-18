@@ -74,7 +74,9 @@ def test_studio_project_upload_rights_and_delete(tmp_path) -> None:
 def test_annotation_version_conflict_is_http_409(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     service = app.state.studio
-    project = service.catalog.create_project("Version test")
+    project = service.catalog.create_project(
+        "Version test", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     original = service.paths.originals / "version.wav"
     original.write_bytes(b"placeholder")
     source = service.catalog.create_source(
@@ -120,7 +122,9 @@ def test_annotation_version_conflict_is_http_409(tmp_path) -> None:
 def test_annotation_save_clamps_small_model_overrun(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     service = app.state.studio
-    project = service.catalog.create_project("Clamp test")
+    project = service.catalog.create_project(
+        "Clamp test", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     original = service.paths.originals / "clamp.wav"
     original.write_bytes(b"placeholder")
     source = service.catalog.create_source(
@@ -168,7 +172,9 @@ def test_startup_repairs_legacy_annotation_past_source_end(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     paths = StudioPaths(workspace)
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Legacy bounds")
+    project = catalog.create_project(
+        "Legacy bounds", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     original = paths.originals / "legacy.wav"
     original.write_bytes(b"placeholder")
     source = catalog.create_source(
@@ -206,7 +212,9 @@ def test_startup_repairs_legacy_annotation_past_source_end(tmp_path) -> None:
 def test_overlap_job_is_not_queued_until_regions_are_finalized(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     service = app.state.studio
-    project = service.catalog.create_project("Overlap gate")
+    project = service.catalog.create_project(
+        "Overlap gate", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
     original = service.paths.originals / "overlap.wav"
     original.write_bytes(b"placeholder")
     source = service.catalog.create_source(

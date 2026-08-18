@@ -106,7 +106,7 @@ def _registered_candidates(
     paths: StudioPaths,
 ) -> list[dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {}
-    for project in catalog.list_projects():
+    for project in catalog.list_projects(viewer_id="system", is_admin=True):
         project_id = str(project["id"])
         for source in catalog.list_sources(project_id):
             source_id = str(source["id"])

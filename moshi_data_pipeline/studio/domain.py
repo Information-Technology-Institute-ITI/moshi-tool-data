@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SAMPLE_RATE = 24_000
 Speaker = Literal["A", "B"]
@@ -16,13 +16,23 @@ def new_id(prefix: str) -> str:
 
 
 class ProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=120)
     language: str = Field(default="ar", min_length=2, max_length=16)
 
 
 class ProjectUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=120)
     language: str = Field(default="ar", min_length=2, max_length=16)
+
+
+class ProjectOwnerUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner_user_id: str = Field(min_length=1, max_length=200)
 
 
 class SourceRights(BaseModel):

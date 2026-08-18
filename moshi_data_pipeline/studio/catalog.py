@@ -30,6 +30,8 @@ GPU_DISPATCH_ACTIVE_STATES = (
     "cancel_requested",
     "blocked",
 )
+LOCAL_ADMIN_USER_ID = "user_local_admin"
+LOCAL_ADMIN_EMAIL = "local-admin@localhost.invalid"
 
 
 def utc_now() -> str:
@@ -271,6 +273,82 @@ class StudioCatalog:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_active_users(self, limit: int = 1_000) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 1_000:
+            raise ValueError("User list limit must be between 1 and 1000")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id,display_name,email
+                FROM users
+                WHERE status='active'
+                ORDER BY display_name COLLATE NOCASE,email COLLATE NOCASE,id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def ensure_local_admin(self) -> dict[str, Any]:
+        """Return the fixed catalog identity used only when sign-in is disabled."""
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO users(
+                    id,email,display_name,password_hash,role,status,group_name,
+                    email_verified_at,created_at,updated_at
+                ) VALUES(?,?,?,'!local-sign-in-disabled!','admin','active','local',?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    email=excluded.email,
+                    display_name=excluded.display_name,
+                    password_hash=excluded.password_hash,
+                    role='admin',
+                    status='active',
+                    group_name='local',
+                    email_verified_at=COALESCE(users.email_verified_at,excluded.email_verified_at),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    LOCAL_ADMIN_USER_ID,
+                    LOCAL_ADMIN_EMAIL,
+                    "Local administrator",
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM users WHERE id=?",
+                (LOCAL_ADMIN_USER_ID,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def delete_user(self, user_id: str) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            user = connection.execute(
+                "SELECT * FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                connection.rollback()
+                raise KeyError(user_id)
+            owned = connection.execute(
+                "SELECT 1 FROM projects WHERE owner_user_id=? LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if owned is not None:
+                connection.rollback()
+                raise ValueError(
+                    "Transfer or delete this user's datasets before deleting the user"
+                )
+            connection.execute("DELETE FROM users WHERE id=?", (user_id,))
+            connection.commit()
+        return dict(user)
 
     def create_or_refresh_pending_user(
         self,
@@ -542,42 +620,244 @@ class StudioCatalog:
             )
         return cursor.rowcount == 1
 
-    def create_project(self, name: str, language: str = "ar") -> dict[str, Any]:
+    def create_project(
+        self,
+        name: str,
+        language: str = "ar",
+        *,
+        owner_user_id: str,
+    ) -> dict[str, Any]:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("Project name cannot be blank")
         project_id = new_id("project")
-        now = utc_now()
-        with self.connect() as connection:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            owner = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (owner_user_id,),
+            ).fetchone()
+            if owner is None or owner["status"] != "active":
+                connection.rollback()
+                raise ValueError("Project owner must be an active user")
             connection.execute(
-                "INSERT INTO projects(id,name,language,created_at,updated_at) VALUES(?,?,?,?,?)",
-                (project_id, clean_name, language, now, now),
+                """
+                INSERT INTO projects(
+                    id,name,language,owner_user_id,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (project_id, clean_name, language, owner_user_id, now, now),
             )
+            connection.commit()
         return self.get_project(project_id)
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _decode_project(value: dict[str, Any]) -> dict[str, Any]:
+        owner_id = value.get("owner_user_id")
+        owner_email = value.pop("owner_email", None)
+        owner_display_name = value.pop("owner_display_name", None)
+        value["owner"] = (
+            {
+                "id": owner_id,
+                "display_name": owner_display_name,
+                "email": owner_email,
+            }
+            if owner_id is not None
+            else None
+        )
+        return value
+
+    def list_projects(self, viewer_id: str, is_admin: bool) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT p.*,
+                    owner.email AS owner_email,
+                    owner.display_name AS owner_display_name,
                     COUNT(s.id) AS source_count,
                     SUM(
                         CASE WHEN s.status IN ('ready','clips_ready') THEN 1 ELSE 0 END
                     ) AS ready_sources
                 FROM projects p
+                LEFT JOIN users owner ON owner.id=p.owner_user_id
                 LEFT JOIN sources s ON s.project_id=p.id
+                WHERE ?=1 OR p.owner_user_id=?
                 GROUP BY p.id
                 ORDER BY p.updated_at DESC
-                """
+                """,
+                (int(is_admin), viewer_id),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_project(dict(row)) for row in rows]
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            row = connection.execute(
+                """
+                SELECT p.*,owner.email AS owner_email,
+                    owner.display_name AS owner_display_name
+                FROM projects p
+                LEFT JOIN users owner ON owner.id=p.owner_user_id
+                WHERE p.id=?
+                """,
+                (project_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(project_id)
-        return dict(row)
+        return self._decode_project(dict(row))
+
+    def get_project_owner_id(self, project_id: str) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT owner_user_id FROM projects WHERE id=?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(project_id)
+        return str(row["owner_user_id"]) if row["owner_user_id"] is not None else None
+
+    def transfer_project_owner(
+        self,
+        project_id: str,
+        *,
+        owner_user_id: str,
+        actor_user_id: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            actor = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (actor_user_id,),
+            ).fetchone()
+            if actor is None or actor["status"] != "active":
+                connection.rollback()
+                raise ValueError("Ownership actor must be an active user")
+            project = connection.execute(
+                "SELECT owner_user_id FROM projects WHERE id=?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                connection.rollback()
+                raise KeyError(project_id)
+            destination = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (owner_user_id,),
+            ).fetchone()
+            if destination is None or destination["status"] != "active":
+                connection.rollback()
+                raise ValueError("Dataset owner must be an active user")
+            previous_owner = project["owner_user_id"]
+            if previous_owner == owner_user_id:
+                connection.commit()
+                return self.get_project(project_id)
+            connection.execute(
+                "UPDATE projects SET owner_user_id=?,updated_at=? WHERE id=?",
+                (owner_user_id, now, project_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_ownership_audit(
+                    id,actor_user_id,action,project_id,previous_owner_user_id,
+                    new_owner_user_id,created_at
+                ) VALUES(?,?,'transfer',?,?,?,?)
+                """,
+                (
+                    new_id("audit"),
+                    actor_user_id,
+                    project_id,
+                    previous_owner,
+                    owner_user_id,
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.get_project(project_id)
+
+    def delete_project(self, project_id: str, *, actor_user_id: str) -> dict[str, Any]:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            actor = connection.execute(
+                "SELECT status FROM users WHERE id=?",
+                (actor_user_id,),
+            ).fetchone()
+            if actor is None or actor["status"] != "active":
+                connection.rollback()
+                raise ValueError("Deletion actor must be an active user")
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id=?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(project_id)
+            project = dict(row)
+            connection.execute(
+                """
+                INSERT INTO project_ownership_audit(
+                    id,actor_user_id,action,project_id,previous_owner_user_id,
+                    new_owner_user_id,created_at
+                ) VALUES(?,?,'delete',?,?,NULL,?)
+                """,
+                (
+                    new_id("audit"),
+                    actor_user_id,
+                    project_id,
+                    project["owner_user_id"],
+                    now,
+                ),
+            )
+            connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            connection.commit()
+        return project
+
+    def list_project_ownership_audit(
+        self,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE project_id=?" if project_id is not None else ""
+        parameters: tuple[str, ...] = (project_id,) if project_id is not None else ()
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM project_ownership_audit
+                {where}
+                ORDER BY created_at,id
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_source_project_id(self, source_id: str) -> str:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM sources WHERE id=?",
+                (source_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(source_id)
+        return str(row["project_id"])
+
+    def get_job_project_id(self, job_id: str) -> str:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return str(row["project_id"])
+
+    def get_export_project_id(self, export_id: str) -> str:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM exports WHERE id=?",
+                (export_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(export_id)
+        return str(row["project_id"])
 
     def update_project(self, project_id: str, *, name: str, language: str) -> dict[str, Any]:
         clean_name = name.strip()
@@ -1986,6 +2266,52 @@ class StudioCatalog:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_project_artifacts(self, project_id: str) -> list[dict[str, Any]]:
+        """Return every registered project artifact, including inactive records."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE project_id=?
+                ORDER BY created_at,id
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_project_artifact_uploads(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT uploads.*
+                FROM artifact_uploads AS uploads
+                JOIN jobs ON jobs.id=uploads.job_id
+                WHERE jobs.project_id=?
+                ORDER BY uploads.created_at,uploads.id
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_project_artifact_commits(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT commits.*
+                FROM artifact_commits AS commits
+                JOIN jobs ON jobs.id=commits.job_id
+                WHERE jobs.project_id=?
+                ORDER BY commits.created_at,commits.id
+                """,
+                (project_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["entries"] = _loads(value.pop("entries_json"), [])
+            values.append(value)
+        return values
 
     def set_artifact_state(self, artifact_id: str, state: str) -> dict[str, Any]:
         if state not in {"active", "superseded", "missing"}:

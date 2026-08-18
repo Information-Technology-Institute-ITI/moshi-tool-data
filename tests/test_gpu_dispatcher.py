@@ -260,7 +260,9 @@ class FakeGpuClient:
 def _dispatcher_fixture(tmp_path, state: FakeGpuState, **settings_values):
     paths = StudioPaths(tmp_path / "workspace")
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("GPU dispatcher")
+    project = catalog.create_project(
+        "GPU dispatcher", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     content = b"immutable-audio-input"
     original = paths.originals / "fixture.wav"
     original.write_bytes(content)

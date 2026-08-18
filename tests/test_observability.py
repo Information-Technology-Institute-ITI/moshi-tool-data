@@ -16,7 +16,9 @@ def test_cloudwatch_metrics_cover_queue_cost_disk_backup_and_controller(tmp_path
     workspace = tmp_path / "studio_workspace"
     workspace.mkdir()
     catalog = StudioCatalog(workspace / "catalog.sqlite3")
-    project = catalog.create_project("Metrics")
+    project = catalog.create_project(
+        "Metrics", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     catalog.create_job(project["id"], "transcribe", None)
     client = MetricsClient()
     publisher = CloudWatchMetricsPublisher(

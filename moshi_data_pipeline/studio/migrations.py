@@ -453,12 +453,67 @@ def _user_authentication_v1(connection: sqlite3.Connection) -> None:
     )
 
 
+def _dataset_ownership_v1(connection: sqlite3.Connection) -> None:
+    # SQLite cannot add a non-null foreign-key column to a populated table without
+    # rebuilding it. Legacy rows intentionally remain ownerless until Plan 11.
+    _add_columns(
+        connection,
+        "projects",
+        {
+            "owner_user_id": "TEXT REFERENCES users(id) ON DELETE RESTRICT",
+        },
+    )
+    _execute_statements(
+        connection,
+        """
+        CREATE INDEX IF NOT EXISTS projects_owner_updated_idx
+            ON projects(owner_user_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS project_ownership_audit (
+            id TEXT PRIMARY KEY,
+            actor_user_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('transfer','delete')),
+            project_id TEXT NOT NULL,
+            previous_owner_user_id TEXT,
+            new_owner_user_id TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS project_ownership_audit_project_idx
+            ON project_ownership_audit(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS project_ownership_audit_actor_idx
+            ON project_ownership_audit(actor_user_id, created_at);
+        """,
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_owner_required_insert
+        BEFORE INSERT ON projects
+        WHEN NEW.owner_user_id IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'projects.owner_user_id is required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_owner_required_update
+        BEFORE UPDATE ON projects
+        WHEN NEW.owner_user_id IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'projects.owner_user_id is required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "legacy_compatibility", _legacy_compatibility),
     (2, "worker_protocol_v1", _worker_protocol_v1),
     (3, "artifact_commit_journal", _artifact_commit_journal),
     (4, "gpu_push_dispatch_v2", _gpu_push_dispatch_v2),
     (5, "user_authentication_v1", _user_authentication_v1),
+    (6, "dataset_ownership_v1", _dataset_ownership_v1),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

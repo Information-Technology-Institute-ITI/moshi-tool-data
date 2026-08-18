@@ -40,7 +40,9 @@ class Ec2LikeProvider(LocalLifecycleProvider):
 def _controller(tmp_path, *, state: str = "running", idle_seconds: int = 900):
     clock = Clock()
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3", clock=clock)
-    project = catalog.create_project("GPU lifecycle")
+    project = catalog.create_project(
+        "GPU lifecycle", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     provider = Ec2LikeProvider(state)
     controller = LifecycleController(
         catalog,

@@ -35,7 +35,9 @@ class Clock:
 
 def _catalog_with_job(tmp_path, *, clock=None):
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3", clock=clock)
-    project = catalog.create_project("GPU catalog")
+    project = catalog.create_project(
+        "GPU catalog", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     job = catalog.create_job(project["id"], "transcribe", None)
     return catalog, project, job
 
@@ -91,7 +93,7 @@ def test_v3_workspace_upgrades_to_gpu_schema(tmp_path) -> None:
         lifecycle_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(lifecycle_state)").fetchall()
         }
-    assert version == LATEST_SCHEMA_VERSION == 5
+    assert version == LATEST_SCHEMA_VERSION == 6
     assert {
         "gpu_runtime_state",
         "gpu_checks",
@@ -324,7 +326,9 @@ def test_gpu_check_cooldowns_are_configurable(tmp_path) -> None:
 def test_duplicate_active_job_creation_is_serialized(tmp_path) -> None:
     path = tmp_path / "catalog.sqlite3"
     first = StudioCatalog(path)
-    project = first.create_project("Duplicate jobs")
+    project = first.create_project(
+        "Duplicate jobs", owner_user_id=first.ensure_local_admin()["id"]
+    )
     second = StudioCatalog(path)
     fingerprint = "a" * 64
     barrier = threading.Barrier(2)
@@ -350,7 +354,9 @@ def test_duplicate_active_job_creation_is_serialized(tmp_path) -> None:
 def test_callback_upload_create_is_idempotent_and_cleans_unused_staging(tmp_path) -> None:
     paths = StudioPaths(tmp_path / "workspace")
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Idempotent upload")
+    project = catalog.create_project(
+        "Idempotent upload", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     job = catalog.create_job(project["id"], "transcribe", None)
     claimed = catalog.claim_leased_job(
         "worker",
@@ -428,7 +434,9 @@ def test_callback_upload_create_is_idempotent_and_cleans_unused_staging(tmp_path
 def test_job_context_freezes_and_revalidates_artifact_metadata(tmp_path) -> None:
     paths = StudioPaths(tmp_path / "workspace")
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Immutable input")
+    project = catalog.create_project(
+        "Immutable input", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     content = b"audio-fixture"
     original = paths.originals / "fixture.wav"
     original.write_bytes(content)

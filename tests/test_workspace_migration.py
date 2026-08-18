@@ -13,7 +13,9 @@ def _workspace(tmp_path: Path) -> tuple[Path, str]:
     root = tmp_path / "workspace"
     paths = StudioPaths(root)
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Migration fixture")
+    project = catalog.create_project(
+        "Migration fixture", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     content = b"original"
     original = paths.originals / "episode.wav"
     original.write_bytes(content)

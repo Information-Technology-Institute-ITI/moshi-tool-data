@@ -6,7 +6,8 @@ from moshi_data_pipeline.studio.domain import ActivityRegion, AnnotationDocument
 
 def test_catalog_versions_annotations_and_recovers_jobs(tmp_path) -> None:
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3")
-    project = catalog.create_project("Cairo conversations")
+    owner = catalog.ensure_local_admin()
+    project = catalog.create_project("Cairo conversations", owner_user_id=owner["id"])
     source = catalog.create_source(
         project["id"],
         "episode.wav",
@@ -49,12 +50,16 @@ def test_catalog_versions_annotations_and_recovers_jobs(tmp_path) -> None:
     restarted = StudioCatalog(tmp_path / "catalog.sqlite3")
     assert restarted.get_job(job["id"])["status"] == "queued"
     restarted.update_source(source["id"], status="clips_ready")
-    assert restarted.list_projects()[0]["ready_sources"] == 1
+    assert restarted.list_projects(viewer_id=owner["id"], is_admin=False)[0][
+        "ready_sources"
+    ] == 1
 
 
 def test_catalog_repairs_orphaned_processing_source(tmp_path) -> None:
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3")
-    project = catalog.create_project("Repair")
+    project = catalog.create_project(
+        "Repair", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     source = catalog.create_source(
         project["id"],
         "episode.wav",
@@ -82,7 +87,9 @@ def test_catalog_repairs_orphaned_processing_source(tmp_path) -> None:
 
 def test_catalog_fails_unsupported_queued_jobs(tmp_path) -> None:
     catalog = StudioCatalog(tmp_path / "catalog.sqlite3")
-    project = catalog.create_project("Unsupported")
+    project = catalog.create_project(
+        "Unsupported", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     supported = catalog.create_job(project["id"], "initialize", None)
     unsupported = catalog.create_job(project["id"], "realign", None, {"annotation_version": 2})
 

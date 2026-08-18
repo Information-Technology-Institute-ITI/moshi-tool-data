@@ -39,7 +39,9 @@ def test_source_level_split_is_deterministic_and_disjoint() -> None:
 def test_unapproved_overlap_is_muted_and_single_source_exports_train_only(tmp_path) -> None:
     paths = StudioPaths(tmp_path / "workspace")
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Stereo routing")
+    project = catalog.create_project(
+        "Stereo routing", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     original = paths.originals / "source.wav"
     original.write_bytes(b"immutable-placeholder")
     source = catalog.create_source(
@@ -157,7 +159,9 @@ def test_unapproved_overlap_is_muted_and_single_source_exports_train_only(tmp_pa
 def test_suspicious_assistant_transcript_requires_human_verification(tmp_path) -> None:
     paths = StudioPaths(tmp_path / "workspace")
     catalog = StudioCatalog(paths.database)
-    project = catalog.create_project("Verification")
+    project = catalog.create_project(
+        "Verification", owner_user_id=catalog.ensure_local_admin()["id"]
+    )
     original = paths.originals / "source.wav"
     original.write_bytes(b"placeholder")
     source = catalog.create_source(
