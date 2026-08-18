@@ -34,7 +34,7 @@ def _controller(tmp_path, *, provider_state: str = "stopped"):
     return clock, catalog, project, provider, controller
 
 
-def test_queued_work_starts_gpu_and_confirmed_idle_stops_it(tmp_path) -> None:
+def test_queued_work_starts_gpu_and_local_idle_deadline_stops_it(tmp_path) -> None:
     clock, catalog, project, provider, controller = _controller(tmp_path)
     job = catalog.create_job(project["id"], "transcribe", None)
     state = controller.tick()
@@ -63,7 +63,20 @@ def test_queued_work_starts_gpu_and_confirmed_idle_stops_it(tmp_path) -> None:
     catalog.complete_leased_job(
         job["id"], "worker-1", lease["lease_token"], {"ok": True}
     )
-    # Keep the heartbeat fresh while advancing the worker's preserved idle_since.
+    catalog.record_worker_state(
+        "worker-1",
+        boot_id="boot-1",
+        protocol_version="1.0",
+        build_id="build-a",
+        supported_kinds=["transcribe"],
+        status="idle",
+    )
+    idle = controller.tick()
+    assert idle["idle_stop_at"] == (clock.value + timedelta(seconds=900)).isoformat()
+    assert provider.actions == ["start"]
+
+    # A remote idle timestamp can predate this local boot. Only the durable
+    # m8i deadline is allowed to trigger an EC2 stop.
     clock.advance(seconds=901)
     catalog.record_worker_state(
         "worker-1",

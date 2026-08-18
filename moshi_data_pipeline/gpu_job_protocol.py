@@ -5,13 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from moshi_data_pipeline.callback_contract import CALLBACK_PROTOCOL_VERSION
 
-JobKind = Literal["transcribe"]
+JobKind = Literal["initialize", "transcribe"]
 
-JOB_KINDS: tuple[str, ...] = ("transcribe",)
+JOB_KINDS: tuple[str, ...] = ("initialize", "transcribe")
 
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -50,3 +50,24 @@ class JobContext(StrictModel):
     preconditions: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     inputs: list[ArtifactRef] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_initialize_contract(self) -> JobContext:
+        if self.kind != "initialize":
+            return self
+        if self.payload.get("mode") not in {"manual", "assisted"}:
+            raise ValueError("initialize payload mode must be manual or assisted")
+        project = self.preconditions.get("project")
+        source = self.preconditions.get("source")
+        if not isinstance(project, dict) or not str(project.get("id", "")):
+            raise ValueError("initialize requires a project precondition")
+        if not isinstance(source, dict) or not str(source.get("id", "")):
+            raise ValueError("initialize requires a source precondition")
+        if len(self.inputs) != 1 or self.inputs[0].role != "source.original":
+            raise ValueError("initialize requires exactly one source.original input")
+        original = self.inputs[0]
+        if original.source_id != str(source["id"]):
+            raise ValueError("initialize source.original must match the source precondition")
+        if original.project_id is not None and original.project_id != str(project["id"]):
+            raise ValueError("initialize source.original must match the project precondition")
+        return self

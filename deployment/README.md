@@ -35,7 +35,7 @@ The inspected host is Windows Server 2025. At the 2026-08-16 inspection:
 - a legacy Windows Firewall rule allowed g4dn `172.31.26.80` to reach port 8765.
 
 The GPU intake itself is reachable from m8i on 8766 and reports protocol 2.0 and standalone build
-`b86e2016dbc31058408dc7b3b3ac241397b8a828`.
+`ddbcb9bb5ebc2171e98f880a6f2ffe5ecc3f9a02`.
 
 Production cutover must stop until the actual supervised port-80 server and authentication boundary
 are selected, installed by the operator, and validated. Do not bind Uvicorn directly to port 80,
@@ -122,7 +122,7 @@ The web generation and GPU build are different deployables. The build script req
 identifiers so an operator cannot accidentally treat them as the same value:
 
 ```powershell
-./deployment/build-push.ps1 -WebGeneration <m8i-revision> -GpuBuildId b86e2016dbc31058408dc7b3b3ac241397b8a828 -Region <actual-region> -WebRepository <account>.dkr.ecr.<region>.amazonaws.com/moshi-web -ProcessingRepository <account>.dkr.ecr.<region>.amazonaws.com/moshi-processing
+./deployment/build-push.ps1 -WebGeneration <m8i-revision> -GpuBuildId ddbcb9bb5ebc2171e98f880a6f2ffe5ecc3f9a02 -Region <actual-region> -WebRepository <account>.dkr.ecr.<region>.amazonaws.com/moshi-web -ProcessingRepository <account>.dkr.ecr.<region>.amazonaws.com/moshi-processing
 ```
 
 Configure `MOSHI_DEPLOYMENT_GENERATION` with the web revision. Configure
@@ -141,7 +141,7 @@ outside the repository:
 ```dotenv
 MOSHI_WORKSPACE=<actual persistent workspace>
 MOSHI_GPU_INTERNAL_URL=http://172.31.26.80:8766
-MOSHI_GPU_REQUIRED_BUILD_ID=b86e2016dbc31058408dc7b3b3ac241397b8a828
+MOSHI_GPU_REQUIRED_BUILD_ID=ddbcb9bb5ebc2171e98f880a6f2ffe5ecc3f9a02
 MOSHI_GPU_INSTANCE_ID=<exact g4dn instance ID>
 AWS_REGION=<actual region>
 MOSHI_DEPLOYMENT_GENERATION=<m8i deployment revision>
@@ -222,7 +222,7 @@ nonsecret values include:
 
 ```dotenv
 MOSHI_WEB_INTERNAL_URL=http://172.31.52.46
-MOSHI_BUILD_ID=b86e2016dbc31058408dc7b3b3ac241397b8a828
+MOSHI_BUILD_ID=ddbcb9bb5ebc2171e98f880a6f2ffe5ecc3f9a02
 MOSHI_WORKER_CACHE=/home/ubuntu/moshi-worker-cache
 MOSHI_GPU_INTAKE_PORT=8766
 MOSHI_CONFIG=<absolute processing config path>

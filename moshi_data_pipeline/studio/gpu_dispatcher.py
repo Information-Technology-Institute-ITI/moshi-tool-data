@@ -57,6 +57,11 @@ REMOTE_ACCEPTED_STATES = {
 }
 REMOTE_TERMINAL_STATES = {"acknowledged", "orphaned", "rejected", "failed", "cancelled"}
 LOCAL_TERMINAL_JOB_STATES = {"complete", "failed", "superseded"}
+DEPLOYMENT_COMPATIBILITY_BLOCKS = {
+    "GPU dispatch protocol is incompatible",
+    "GPU worker build is incompatible",
+    "GPU service job capabilities are incompatible",
+}
 
 
 class GpuReadinessGateError(RuntimeError):
@@ -327,6 +332,19 @@ class GpuPushDispatcher:
             name="moshi-gpu-push-dispatcher",
             daemon=True,
         )
+        lifecycle = self.catalog.get_lifecycle_state()
+        if lifecycle.get("blocked_reason") in DEPLOYMENT_COMPATIBILITY_BLOCKS:
+            self.catalog.update_lifecycle_state(
+                blocked_reason=None,
+                last_error=None,
+                recovery_count=0,
+                startup_deadline=None,
+                idle_stop_at=None,
+                draining=False,
+            )
+        self.catalog.update_gpu_runtime_state(
+            expected_build_id=self.settings.required_build_id
+        )
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -403,8 +421,10 @@ class GpuPushDispatcher:
         lifecycle = self.catalog.get_lifecycle_state()
         if lifecycle.get("instance_state") != "running":
             return True
+        blocked_reason = lifecycle.get("blocked_reason")
         if (
-            lifecycle.get("blocked_reason")
+            blocked_reason
+            and blocked_reason not in DEPLOYMENT_COMPATIBILITY_BLOCKS
             and self.catalog.active_gpu_dispatch() is None
             and self.catalog.active_gpu_check() is None
         ):
@@ -426,6 +446,15 @@ class GpuPushDispatcher:
         except GpuReadinessGateError as exc:
             self._block_system(str(exc), "incompatible")
             return True
+        if blocked_reason in DEPLOYMENT_COMPATIBILITY_BLOCKS:
+            self.catalog.update_lifecycle_state(
+                blocked_reason=None,
+                last_error=None,
+                recovery_count=0,
+                startup_deadline=None,
+                idle_stop_at=None,
+                draining=False,
+            )
         if leader.lost:
             return True
 

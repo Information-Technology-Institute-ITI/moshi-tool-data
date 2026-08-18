@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from moshi_data_pipeline.config import PipelineConfig
+from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS as GPU_JOB_KINDS
 from moshi_data_pipeline.studio.artifacts import ArtifactStore
 from moshi_data_pipeline.studio.catalog import StudioCatalog
 from moshi_data_pipeline.studio.clip_registry import clip_artifacts
@@ -94,6 +95,7 @@ class StudioService:
         self.artifacts.reconcile_commits()
         self.contexts = JobContextBuilder(self.catalog, self.paths, config)
         self._repair_annotation_bounds()
+        self.catalog.repair_orphaned_processing_sources()
         if enable_local_worker:
             from moshi_data_pipeline.studio.worker import StudioWorker
 
@@ -121,6 +123,12 @@ class StudioService:
             metrics_publisher=metrics_publisher,
         )
         self.gpu_settings = gpu_dispatcher_settings
+        self.remote_job_kinds = set(GPU_JOB_KINDS) if gpu_dispatcher_settings is not None else set()
+        if gpu_dispatcher_settings is not None and not enable_local_worker:
+            self.catalog.fail_unsupported_queued_jobs(
+                GPU_JOB_KINDS,
+                reason="Job kind is not supported by the configured GPU service",
+            )
         self.gpu_check_cooldown_seconds = gpu_check_cooldown_seconds
         self.gpu_cold_start_cooldown_seconds = gpu_cold_start_cooldown_seconds
         self.dispatcher: Any = (
@@ -182,6 +190,8 @@ class StudioService:
                 active = self.catalog.active_job(source_id, kind)
                 if active is not None:
                     return active
+        if self.remote_job_kinds and kind not in self.remote_job_kinds:
+            raise ValueError("Job kind is not supported by the configured GPU service")
         job_payload = payload or {}
         preconditions, _, fingerprint = self.contexts.snapshot(
             project_id=project_id,

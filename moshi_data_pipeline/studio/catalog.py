@@ -682,6 +682,63 @@ class StudioCatalog:
                 raise KeyError(source_id)
         return self.get_source(source_id)
 
+    def repair_orphaned_processing_sources(self) -> int:
+        """Return stranded initialize sources to an upload state.
+
+        A queued initialize job can be fenced if the source changes before the
+        GPU accepts it. In that case no worker owns the source anymore, so the
+        UI should show it as retryable rather than permanently processing.
+        """
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sources
+                SET status='uploaded',updated_at=?
+                WHERE status='processing'
+                    AND duration_samples IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM jobs
+                        WHERE jobs.source_id=sources.id
+                            AND jobs.status IN ('queued','running')
+                    )
+                """,
+                (now,),
+            )
+        return int(cursor.rowcount)
+
+    def fail_unsupported_queued_jobs(
+        self,
+        supported_kinds: Sequence[str],
+        *,
+        reason: str,
+    ) -> int:
+        supported = tuple(dict.fromkeys(str(kind) for kind in supported_kinds))
+        if not supported:
+            return 0
+        now = utc_now()
+        placeholders = ",".join("?" for _ in supported)
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status='failed',
+                    progress=0,
+                    message=?,
+                    error=?,
+                    retryable=0,
+                    failure_class='unsupported_job_kind',
+                    finished_at=?,
+                    updated_at=?,
+                    lease_owner=NULL,
+                    lease_token_hash=NULL,
+                    lease_expires_at=NULL
+                WHERE status='queued' AND kind NOT IN ({placeholders})
+                """,
+                (reason, reason, now, now, *supported),
+            )
+        return int(cursor.rowcount)
+
     def delete_source(self, source_id: str) -> dict[str, Any]:
         source = self.get_source(source_id)
         with self.connect() as connection:

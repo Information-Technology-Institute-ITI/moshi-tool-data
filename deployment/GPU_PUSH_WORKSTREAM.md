@@ -62,7 +62,7 @@ than a new attempt.
 Execution begins only after:
 
 - dispatch protocol is exactly 2.0;
-- GPU build is exactly `b86e2016dbc31058408dc7b3b3ac241397b8a828`;
+- GPU build is exactly `ddbcb9bb5ebc2171e98f880a6f2ffe5ecc3f9a02`;
 - callback readiness is recent;
 - the current boot/build/model/fixture functional check is valid;
 - the m8i lease remains current.

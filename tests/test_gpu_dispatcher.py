@@ -360,6 +360,22 @@ def test_conflicting_remote_manifest_blocks_instead_of_creating_new_attempt(tmp_
         dispatcher.stop()
 
 
+def test_dispatcher_recovers_stale_compatibility_block_and_dispatches(tmp_path) -> None:
+    state = FakeGpuState()
+    catalog, job, dispatcher, _ = _dispatcher_fixture(tmp_path, state)
+    catalog.update_lifecycle_state(
+        blocked_reason="GPU worker build is incompatible",
+    )
+    try:
+        assert dispatcher.run_once() is True
+        assert catalog.get_lifecycle_state()["blocked_reason"] is None
+        assert catalog.get_job(job["id"])["status"] == "running"
+        assert catalog.active_gpu_dispatch() is not None
+        assert state.create_calls == 1
+    finally:
+        dispatcher.stop()
+
+
 def test_dispatcher_rejects_gpu_without_transcribe_capability(tmp_path) -> None:
     state = FakeGpuState(job_kinds=["initialize"])
     catalog, job, dispatcher, _ = _dispatcher_fixture(tmp_path, state)

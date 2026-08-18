@@ -464,21 +464,6 @@ class LifecycleController:
                 allow_runnable_jobs=False,
             )
 
-        idle_since = self._parse(worker["idle_since"]) if worker else None
-        confirmed_idle = bool(
-            worker_fresh
-            and worker_compatible
-            and worker["status"] == "idle"
-            and idle_since
-            and now - idle_since >= timedelta(seconds=self.idle_seconds)
-        )
-        if confirmed_idle:
-            return self._stop_after_recheck(
-                now,
-                updates,
-                allow_runnable_jobs=False,
-            )
-
         idle_stop = self._parse(stored.get("idle_stop_at"))
         if idle_stop is None:
             idle_stop = now + timedelta(seconds=self.idle_seconds)
