@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from moshi_data_pipeline.studio.domain import AnnotationDocument, ClipPlanDocument, new_id
 from moshi_data_pipeline.studio.migrations import apply_migrations
@@ -69,6 +69,14 @@ class GpuCheckRateLimitError(RuntimeError):
         super().__init__(reason)
 
 
+class ProjectDeletionConflictError(RuntimeError):
+    pass
+
+
+class PrincipalLike(Protocol):
+    user_id: str
+
+
 class StudioCatalog:
     def __init__(
         self,
@@ -88,6 +96,85 @@ class StudioCatalog:
 
     def _now(self) -> str:
         return self._now_datetime().astimezone(UTC).isoformat()
+
+    def _project_mutation_row(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+        require_admin: bool = False,
+        allow_deleting: bool = False,
+    ) -> sqlite3.Row:
+        project = connection.execute(
+            "SELECT * FROM projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
+        if project is None:
+            raise KeyError(project_id)
+        if principal is not None:
+            actor = connection.execute(
+                "SELECT role,status FROM users WHERE id=?",
+                (principal.user_id,),
+            ).fetchone()
+            authorized = bool(
+                actor is not None
+                and actor["status"] == "active"
+                and (
+                    actor["role"] == "admin"
+                    if require_admin
+                    else actor["role"] == "admin"
+                    or project["owner_user_id"] == principal.user_id
+                )
+            )
+            if not authorized:
+                raise KeyError(project_id)
+        if not allow_deleting and project["deletion_state"] != "active":
+            raise ProjectDeletionConflictError("Dataset deletion is already in progress")
+        return project
+
+    def _source_mutation_row(
+        self,
+        connection: sqlite3.Connection,
+        source_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> sqlite3.Row:
+        source = connection.execute(
+            "SELECT * FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if source is None:
+            raise KeyError(source_id)
+        try:
+            self._project_mutation_row(
+                connection,
+                str(source["project_id"]),
+                principal=principal,
+            )
+        except KeyError:
+            raise KeyError(source_id) from None
+        return source
+
+    def _job_mutation_row(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> sqlite3.Row:
+        job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job is None:
+            raise KeyError(job_id)
+        try:
+            self._project_mutation_row(
+                connection,
+                str(job["project_id"]),
+                principal=principal,
+            )
+        except KeyError:
+            raise KeyError(job_id) from None
+        return job
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -721,25 +808,17 @@ class StudioCatalog:
         project_id: str,
         *,
         owner_user_id: str,
-        actor_user_id: str,
+        principal: PrincipalLike,
     ) -> dict[str, Any]:
         now = self._now()
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            actor = connection.execute(
-                "SELECT status FROM users WHERE id=?",
-                (actor_user_id,),
-            ).fetchone()
-            if actor is None or actor["status"] != "active":
-                connection.rollback()
-                raise ValueError("Ownership actor must be an active user")
-            project = connection.execute(
-                "SELECT owner_user_id FROM projects WHERE id=?",
-                (project_id,),
-            ).fetchone()
-            if project is None:
-                connection.rollback()
-                raise KeyError(project_id)
+            project = self._project_mutation_row(
+                connection,
+                project_id,
+                principal=principal,
+                require_admin=True,
+            )
             destination = connection.execute(
                 "SELECT status FROM users WHERE id=?",
                 (owner_user_id,),
@@ -764,7 +843,7 @@ class StudioCatalog:
                 """,
                 (
                     new_id("audit"),
-                    actor_user_id,
+                    principal.user_id,
                     project_id,
                     previous_owner,
                     owner_user_id,
@@ -774,25 +853,188 @@ class StudioCatalog:
             connection.commit()
         return self.get_project(project_id)
 
-    def delete_project(self, project_id: str, *, actor_user_id: str) -> dict[str, Any]:
+    def reserve_project_deletion(
+        self,
+        project_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        now = self._now()
+        reservation_id = new_id("deletion")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            project = dict(
+                self._project_mutation_row(
+                    connection,
+                    project_id,
+                    principal=principal,
+                )
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET deletion_state='deleting',deletion_reservation_id=?,
+                    deletion_reserved_at=?,deletion_reserved_by=?,updated_at=?
+                WHERE id=? AND deletion_state='active'
+                """,
+                (
+                    reservation_id,
+                    now,
+                    principal.user_id,
+                    now,
+                    project_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_deletion_cleanup(
+                    id,project_id,actor_user_id,state,created_at,updated_at
+                ) VALUES(?,?,?,'reserved',?,?)
+                """,
+                (reservation_id, project_id, principal.user_id, now, now),
+            )
+            connection.execute(
+                """
+                UPDATE job_attempts
+                SET status='superseded',finished_at=?,failure_class='project_deletion',
+                    summary='Project deletion reserved'
+                WHERE status='running' AND job_id IN (
+                    SELECT id FROM jobs WHERE project_id=?
+                )
+                """,
+                (now, project_id),
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status='superseded',message='Project deletion reserved',
+                    error='Project deletion reserved',retryable=0,
+                    failure_class='project_deletion',finished_at=?,updated_at=?,
+                    lease_owner=NULL,lease_token_hash=NULL,lease_expires_at=NULL
+                WHERE project_id=? AND status IN ('queued','running')
+                """,
+                (now, now, project_id),
+            )
+            active_placeholders = ",".join("?" for _ in GPU_DISPATCH_ACTIVE_STATES)
+            connection.execute(
+                f"""
+                UPDATE gpu_dispatches
+                SET state='cancel_requested',last_error_class='project_deletion',
+                    last_error_summary='Project deletion reserved',updated_at=?
+                WHERE job_id IN (SELECT id FROM jobs WHERE project_id=?)
+                    AND state IN ({active_placeholders})
+                """,
+                (now, project_id, *GPU_DISPATCH_ACTIVE_STATES),
+            )
+            connection.execute(
+                """
+                UPDATE worker_state
+                SET status='idle',current_job_id=NULL,idle_since=COALESCE(idle_since,?),
+                    last_heartbeat=?
+                WHERE current_job_id IN (SELECT id FROM jobs WHERE project_id=?)
+                """,
+                (now, now, project_id),
+            )
+            connection.commit()
+        return {
+            **project,
+            "deletion_state": "deleting",
+            "deletion_reservation_id": reservation_id,
+            "deletion_reserved_at": now,
+            "deletion_reserved_by": principal.user_id,
+        }
+
+    def record_project_quarantine(
+        self,
+        reservation_id: str,
+        *,
+        quarantine_path: str,
+        manifest: list[dict[str, str]],
+    ) -> dict[str, Any]:
         now = self._now()
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            actor = connection.execute(
-                "SELECT status FROM users WHERE id=?",
-                (actor_user_id,),
-            ).fetchone()
-            if actor is None or actor["status"] != "active":
+            cursor = connection.execute(
+                """
+                UPDATE project_deletion_cleanup
+                SET state='quarantined',quarantine_path=?,manifest_json=?,updated_at=?
+                WHERE id=? AND state='reserved'
+                """,
+                (quarantine_path, _json(manifest), now, reservation_id),
+            )
+            if cursor.rowcount != 1:
                 connection.rollback()
-                raise ValueError("Deletion actor must be an active user")
-            row = connection.execute(
-                "SELECT * FROM projects WHERE id=?",
-                (project_id,),
+                raise ProjectDeletionConflictError("Project deletion reservation changed")
+            connection.commit()
+        return self.get_project_deletion_cleanup(reservation_id)
+
+    def abort_project_deletion(
+        self,
+        reservation_id: str,
+        *,
+        state: str = "aborted",
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if state not in {"aborted", "restore_failed"}:
+            raise ValueError("Invalid deletion abort state")
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cleanup = connection.execute(
+                "SELECT project_id FROM project_deletion_cleanup WHERE id=?",
+                (reservation_id,),
             ).fetchone()
-            if row is None:
+            if cleanup is None:
                 connection.rollback()
-                raise KeyError(project_id)
-            project = dict(row)
+                raise KeyError(reservation_id)
+            connection.execute(
+                """
+                UPDATE projects
+                SET deletion_state='active',deletion_reservation_id=NULL,
+                    deletion_reserved_at=NULL,deletion_reserved_by=NULL,updated_at=?
+                WHERE id=? AND deletion_reservation_id=?
+                """,
+                (now, cleanup["project_id"], reservation_id),
+            )
+            connection.execute(
+                """
+                UPDATE project_deletion_cleanup
+                SET state=?,error=?,updated_at=?,completed_at=? WHERE id=?
+                """,
+                (state, error, now, now, reservation_id),
+            )
+            connection.commit()
+        return self.get_project_deletion_cleanup(reservation_id)
+
+    def finalize_project_deletion(
+        self,
+        project_id: str,
+        *,
+        reservation_id: str,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        now = self._now()
+        audit_id = new_id("audit")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            project = dict(
+                self._project_mutation_row(
+                    connection,
+                    project_id,
+                    principal=principal,
+                    allow_deleting=True,
+                )
+            )
+            if project["deletion_reservation_id"] != reservation_id:
+                connection.rollback()
+                raise ProjectDeletionConflictError("Project deletion reservation changed")
+            cleanup = connection.execute(
+                "SELECT state FROM project_deletion_cleanup WHERE id=? AND project_id=?",
+                (reservation_id, project_id),
+            ).fetchone()
+            if cleanup is None or cleanup["state"] != "quarantined":
+                connection.rollback()
+                raise ProjectDeletionConflictError("Project quarantine is not ready")
             connection.execute(
                 """
                 INSERT INTO project_ownership_audit(
@@ -801,16 +1043,77 @@ class StudioCatalog:
                 ) VALUES(?,?,'delete',?,?,NULL,?)
                 """,
                 (
-                    new_id("audit"),
-                    actor_user_id,
+                    audit_id,
+                    principal.user_id,
                     project_id,
                     project["owner_user_id"],
                     now,
                 ),
             )
+            connection.execute(
+                """
+                UPDATE project_deletion_cleanup
+                SET audit_id=?,state='pending_purge',updated_at=? WHERE id=?
+                """,
+                (audit_id, now, reservation_id),
+            )
             connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
             connection.commit()
         return project
+
+    def finish_project_deletion_cleanup(
+        self,
+        reservation_id: str,
+        *,
+        state: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if state not in {"complete", "purge_failed"}:
+            raise ValueError("Invalid deletion cleanup state")
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE project_deletion_cleanup
+                SET state=?,error=?,updated_at=?,completed_at=?
+                WHERE id=? AND state='pending_purge'
+                """,
+                (state, error, now, now, reservation_id),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise KeyError(reservation_id)
+            connection.commit()
+        return self.get_project_deletion_cleanup(reservation_id)
+
+    def get_project_deletion_cleanup(self, reservation_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_deletion_cleanup WHERE id=?",
+                (reservation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(reservation_id)
+        value = dict(row)
+        value["manifest"] = _loads(value.pop("manifest_json"), [])
+        return value
+
+    def list_project_deletion_cleanup(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM project_deletion_cleanup
+                WHERE project_id=? ORDER BY created_at,id
+                """,
+                (project_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["manifest"] = _loads(value.pop("manifest_json"), [])
+            values.append(value)
+        return values
 
     def list_project_ownership_audit(
         self,
@@ -859,17 +1162,28 @@ class StudioCatalog:
             raise KeyError(export_id)
         return str(row["project_id"])
 
-    def update_project(self, project_id: str, *, name: str, language: str) -> dict[str, Any]:
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str,
+        language: str,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("Project name cannot be blank")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._project_mutation_row(connection, project_id, principal=principal)
             cursor = connection.execute(
                 "UPDATE projects SET name=?,language=?,updated_at=? WHERE id=?",
                 (clean_name, language, utc_now(), project_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(project_id)
+            connection.commit()
         return self.get_project(project_id)
 
     def create_source(
@@ -880,10 +1194,14 @@ class StudioCatalog:
         content_type: str,
         sha256: str,
         size_bytes: int,
+        *,
+        principal: PrincipalLike | None = None,
     ) -> dict[str, Any]:
         source_id = new_id("source")
         now = utc_now()
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._project_mutation_row(connection, project_id, principal=principal)
             connection.execute(
                 """
                 INSERT INTO sources(
@@ -904,6 +1222,7 @@ class StudioCatalog:
                 ),
             )
             connection.execute("UPDATE projects SET updated_at=? WHERE id=?", (now, project_id))
+            connection.commit()
         return self.get_source(source_id)
 
     def list_sources(self, project_id: str) -> list[dict[str, Any]]:
@@ -921,6 +1240,20 @@ class StudioCatalog:
             raise KeyError(source_id)
         return self._decode_source(dict(row))
 
+    def get_source_for_mutation(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = dict(
+                self._source_mutation_row(connection, source_id, principal=principal)
+            )
+            connection.commit()
+        return self._decode_source(source)
+
     @staticmethod
     def _decode_source(value: dict[str, Any]) -> dict[str, Any]:
         value["rights_confirmed"] = bool(value["rights_confirmed"])
@@ -928,7 +1261,13 @@ class StudioCatalog:
         value["inspection"] = _loads(value.pop("inspection_json"), {})
         return value
 
-    def update_source(self, source_id: str, **values: Any) -> dict[str, Any]:
+    def update_source(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+        **values: Any,
+    ) -> dict[str, Any]:
         allowed = {
             "status",
             "init_mode",
@@ -953,13 +1292,17 @@ class StudioCatalog:
                 updates[key] = value
         updates["updated_at"] = utc_now()
         assignments = ",".join(f"{key}=?" for key in updates)
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id, principal=principal)
             cursor = connection.execute(
                 f"UPDATE sources SET {assignments} WHERE id=?",
                 (*updates.values(), source_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(source_id)
+            connection.commit()
         return self.get_source(source_id)
 
     def repair_orphaned_processing_sources(self) -> int:
@@ -1019,11 +1362,41 @@ class StudioCatalog:
             )
         return int(cursor.rowcount)
 
-    def delete_source(self, source_id: str) -> dict[str, Any]:
-        source = self.get_source(source_id)
-        with self.connect() as connection:
+    def delete_source(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = dict(
+                self._source_mutation_row(connection, source_id, principal=principal)
+            )
+            active_source_job = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE source_id=? AND status IN ('queued','running') LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+            if active_source_job is not None:
+                connection.rollback()
+                raise ValueError("Wait for active source jobs to finish before deletion")
+            active_export = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE project_id=? AND kind='export'
+                    AND status IN ('queued','running') LIMIT 1
+                """,
+                (source["project_id"],),
+            ).fetchone()
+            if active_export is not None:
+                connection.rollback()
+                raise ValueError("Wait for the active project export before deletion")
             connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
-        return source
+            connection.commit()
+        return self._decode_source(source)
 
     def latest_annotation(self, source_id: str) -> AnnotationDocument:
         with self.connect() as connection:
@@ -1063,10 +1436,16 @@ class StudioCatalog:
         return [dict(row) for row in rows]
 
     def save_annotation(
-        self, source_id: str, expected_version: int, annotation: AnnotationDocument
+        self,
+        source_id: str,
+        expected_version: int,
+        annotation: AnnotationDocument,
+        *,
+        principal: PrincipalLike | None = None,
     ) -> AnnotationDocument:
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id, principal=principal)
             row = connection.execute(
                 "SELECT active_annotation_version FROM sources WHERE id=?", (source_id,)
             ).fetchone()
@@ -1109,9 +1488,16 @@ class StudioCatalog:
         current = self.latest_annotation(source_id)
         return self.save_annotation(source_id, current.version, annotation)
 
-    def save_clip_plan(self, plan: ClipPlanDocument) -> ClipPlanDocument:
+    def save_clip_plan(
+        self,
+        plan: ClipPlanDocument,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> ClipPlanDocument:
         now = utc_now()
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, plan.source_id, principal=principal)
             connection.execute(
                 """
                 INSERT INTO clip_plans(source_id,annotation_version,plan_json,updated_at)
@@ -1136,6 +1522,7 @@ class StudioCatalog:
                 (now, plan.source_id),
             )
             connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (plan.source_id,))
+            connection.commit()
         return plan
 
     def get_clip_plan(self, source_id: str) -> ClipPlanDocument | None:
@@ -1146,12 +1533,21 @@ class StudioCatalog:
         return ClipPlanDocument.model_validate_json(row["plan_json"]) if row is not None else None
 
     def save_clip_decision(
-        self, source_id: str, clip_id: str, decision: str, auditioned: bool
+        self,
+        source_id: str,
+        clip_id: str,
+        decision: str,
+        auditioned: bool,
+        *,
+        principal: PrincipalLike | None = None,
     ) -> dict[str, Any]:
-        if decision == "approve" and not auditioned:
-            raise ValueError("Clip approval requires audition")
         now = utc_now()
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id, principal=principal)
+            if decision == "approve" and not auditioned:
+                connection.rollback()
+                raise ValueError("Clip approval requires audition")
             connection.execute(
                 """
                 INSERT INTO clip_decisions(source_id,clip_id,decision,auditioned,updated_at)
@@ -1163,6 +1559,7 @@ class StudioCatalog:
                 """,
                 (source_id, clip_id, decision, int(auditioned), now),
             )
+            connection.commit()
         return {
             "source_id": source_id,
             "clip_id": clip_id,
@@ -1186,7 +1583,9 @@ class StudioCatalog:
     def replace_overlap_recoveries(
         self, source_id: str, annotation_version: int, records: list[dict[str, Any]]
     ) -> None:
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id)
             connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
             for record in records:
                 connection.execute(
@@ -1218,6 +1617,7 @@ class StudioCatalog:
                 (utc_now(), source_id),
             )
             connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
+            connection.commit()
 
     def overlap_recoveries(self, source_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1237,11 +1637,20 @@ class StudioCatalog:
         return values
 
     def decide_overlap(
-        self, source_id: str, region_id: str, decision: str, auditioned: bool
+        self,
+        source_id: str,
+        region_id: str,
+        decision: str,
+        auditioned: bool,
+        *,
+        principal: PrincipalLike | None = None,
     ) -> dict[str, Any]:
-        if not auditioned:
-            raise ValueError("A recovered-overlap decision requires audition")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id, principal=principal)
+            if not auditioned:
+                connection.rollback()
+                raise ValueError("A recovered-overlap decision requires audition")
             cursor = connection.execute(
                 """
                 UPDATE overlap_recoveries SET decision=?,auditioned=?,updated_at=?
@@ -1259,6 +1668,7 @@ class StudioCatalog:
                 (utc_now(), source_id),
             )
             connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
+            connection.commit()
         return next(
             value for value in self.overlap_recoveries(source_id) if value["region_id"] == region_id
         )
@@ -1269,7 +1679,9 @@ class StudioCatalog:
         region_id: str,
         details: dict[str, Any],
     ) -> dict[str, Any]:
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id)
             cursor = connection.execute(
                 """
                 UPDATE overlap_recoveries SET details_json=?,updated_at=?
@@ -1278,7 +1690,9 @@ class StudioCatalog:
                 (_json(details), utc_now(), source_id, region_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(region_id)
+            connection.commit()
         return next(
             value for value in self.overlap_recoveries(source_id) if value["region_id"] == region_id
         )
@@ -1294,6 +1708,8 @@ class StudioCatalog:
         preconditions: dict[str, Any] | None = None,
         input_fingerprint: str | None = None,
         max_attempts: int = 3,
+        principal: PrincipalLike | None = None,
+        source_updates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
@@ -1319,6 +1735,16 @@ class StudioCatalog:
             raise ValueError("input_fingerprint must be a SHA-256 hex digest")
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._project_mutation_row(connection, project_id, principal=principal)
+            if source_id is not None:
+                source = self._source_mutation_row(
+                    connection,
+                    source_id,
+                    principal=principal,
+                )
+                if source["project_id"] != project_id:
+                    connection.rollback()
+                    raise ValueError("Job source does not belong to the project")
             existing = connection.execute(
                 """
                 SELECT * FROM jobs
@@ -1331,6 +1757,17 @@ class StudioCatalog:
             if existing is not None:
                 connection.commit()
                 return self._decode_job(dict(existing))
+            if source_updates:
+                allowed_source_updates = {"status", "init_mode"}
+                unknown = set(source_updates) - allowed_source_updates
+                if unknown:
+                    connection.rollback()
+                    raise ValueError(f"Unknown source fields: {sorted(unknown)}")
+                assignments = ",".join(f"{key}=?" for key in source_updates)
+                connection.execute(
+                    f"UPDATE sources SET {assignments},updated_at=? WHERE id=?",
+                    (*source_updates.values(), now, source_id),
+                )
             connection.execute(
                 """
                 INSERT INTO jobs(
@@ -1428,7 +1865,12 @@ class StudioCatalog:
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
+                """
+                SELECT jobs.id FROM jobs
+                JOIN projects ON projects.id=jobs.project_id
+                WHERE jobs.status='queued' AND projects.deletion_state='active'
+                ORDER BY jobs.created_at LIMIT 1
+                """
             ).fetchone()
             if row is None:
                 connection.rollback()
@@ -1544,10 +1986,12 @@ class StudioCatalog:
                 parameters.extend(kinds)
             row = connection.execute(
                 f"""
-                SELECT id,attempt FROM jobs
-                WHERE status='queued' AND protocol_version=?
-                    AND attempt < max_attempts {kind_filter}
-                ORDER BY created_at,id LIMIT 1
+                SELECT jobs.id,jobs.attempt FROM jobs
+                JOIN projects ON projects.id=jobs.project_id
+                WHERE jobs.status='queued' AND jobs.protocol_version=?
+                    AND jobs.attempt < jobs.max_attempts
+                    AND projects.deletion_state='active' {kind_filter}
+                ORDER BY jobs.created_at,jobs.id LIMIT 1
                 """,
                 parameters,
             ).fetchone()
@@ -1610,6 +2054,10 @@ class StudioCatalog:
         row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
+        try:
+            self._project_mutation_row(connection, str(row["project_id"]))
+        except ProjectDeletionConflictError as exc:
+            raise LeaseConflictError("The job project is being deleted") from exc
         stored_hash = str(row["lease_token_hash"] or "")
         if (
             row["status"] != "running"
@@ -2176,6 +2624,7 @@ class StudioCatalog:
         source_id: str | None = None,
         producing_job_id: str | None = None,
         state: str = "active",
+        principal: PrincipalLike | None = None,
     ) -> dict[str, Any]:
         if len(sha256) != 64 or any(value not in "0123456789abcdef" for value in sha256):
             raise ValueError("Artifact SHA-256 must be lowercase hexadecimal")
@@ -2192,7 +2641,33 @@ class StudioCatalog:
             raise ValueError("Artifact path must be a safe workspace-relative path")
         identity = hashlib.sha256(f"{role}\0{normalized}".encode()).hexdigest()[:32]
         artifact_id = f"artifact_{identity}"
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            effective_project_id = project_id
+            if effective_project_id is None and source_id is not None:
+                source = connection.execute(
+                    "SELECT project_id FROM sources WHERE id=?",
+                    (source_id,),
+                ).fetchone()
+                if source is None:
+                    connection.rollback()
+                    raise KeyError(source_id)
+                effective_project_id = str(source["project_id"])
+            if effective_project_id is None and producing_job_id is not None:
+                job = connection.execute(
+                    "SELECT project_id FROM jobs WHERE id=?",
+                    (producing_job_id,),
+                ).fetchone()
+                if job is None:
+                    connection.rollback()
+                    raise KeyError(producing_job_id)
+                effective_project_id = str(job["project_id"])
+            if effective_project_id is not None:
+                self._project_mutation_row(
+                    connection,
+                    effective_project_id,
+                    principal=principal,
+                )
             connection.execute(
                 """
                 INSERT INTO artifacts(
@@ -2218,13 +2693,14 @@ class StudioCatalog:
                     sha256,
                     size_bytes,
                     media_type,
-                    project_id,
+                    effective_project_id,
                     source_id,
                     producing_job_id,
                     state,
                     self._now(),
                 ),
             )
+            connection.commit()
         return self.get_artifact_by_path(normalized)
 
     def get_artifact(self, artifact_id: str) -> dict[str, Any]:
@@ -2316,12 +2792,24 @@ class StudioCatalog:
     def set_artifact_state(self, artifact_id: str, state: str) -> dict[str, Any]:
         if state not in {"active", "superseded", "missing"}:
             raise ValueError(f"Invalid artifact state: {state}")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            artifact = connection.execute(
+                "SELECT project_id FROM artifacts WHERE id=?",
+                (artifact_id,),
+            ).fetchone()
+            if artifact is None:
+                connection.rollback()
+                raise KeyError(artifact_id)
+            if artifact["project_id"] is not None:
+                self._project_mutation_row(connection, str(artifact["project_id"]))
             cursor = connection.execute(
                 "UPDATE artifacts SET state=? WHERE id=?", (state, artifact_id)
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(artifact_id)
+            connection.commit()
         return self.get_artifact(artifact_id)
 
     def queue_summary(self) -> dict[str, int]:
@@ -2902,11 +3390,13 @@ class StudioCatalog:
                 parameters.extend(kinds)
             row = connection.execute(
                 f"""
-                SELECT id,attempt,input_fingerprint FROM jobs
-                WHERE status='queued' AND protocol_version=?
-                    AND input_fingerprint IS NOT NULL
-                    AND attempt < max_attempts {kind_filter}
-                ORDER BY created_at,id LIMIT 1
+                SELECT jobs.id,jobs.attempt,jobs.input_fingerprint FROM jobs
+                JOIN projects ON projects.id=jobs.project_id
+                WHERE jobs.status='queued' AND jobs.protocol_version=?
+                    AND jobs.input_fingerprint IS NOT NULL
+                    AND jobs.attempt < jobs.max_attempts
+                    AND projects.deletion_state='active' {kind_filter}
+                ORDER BY jobs.created_at,jobs.id LIMIT 1
                 """,
                 parameters,
             ).fetchone()
@@ -3560,13 +4050,24 @@ class StudioCatalog:
         if final_relative_path is not None:
             values["final_relative_path"] = final_relative_path
         assignments = ",".join(f"{key}=?" for key in values)
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            upload = connection.execute(
+                "SELECT job_id FROM artifact_uploads WHERE id=?",
+                (upload_id,),
+            ).fetchone()
+            if upload is None:
+                connection.rollback()
+                raise KeyError(upload_id)
+            self._job_mutation_row(connection, str(upload["job_id"]))
             cursor = connection.execute(
                 f"UPDATE artifact_uploads SET {assignments} WHERE id=?",
                 (*values.values(), upload_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(upload_id)
+            connection.commit()
         return self.get_artifact_upload(upload_id)
 
     def list_artifact_uploads(
@@ -3593,7 +4094,12 @@ class StudioCatalog:
     ) -> dict[str, Any]:
         commit_id = new_id("commit")
         now = self._now()
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._job_mutation_row(connection, job_id)
+            if int(job["attempt"]) != attempt:
+                connection.rollback()
+                raise LeaseConflictError("Artifact commit belongs to an obsolete attempt")
             connection.execute(
                 """
                 INSERT INTO artifact_commits(
@@ -3602,6 +4108,7 @@ class StudioCatalog:
                 """,
                 (commit_id, job_id, attempt, _json(entries), now, now),
             )
+            connection.commit()
         return self.get_artifact_commit(commit_id)
 
     def get_artifact_commit(self, commit_id: str) -> dict[str, Any]:
@@ -3618,13 +4125,24 @@ class StudioCatalog:
     def update_artifact_commit(self, commit_id: str, state: str) -> dict[str, Any]:
         if state not in {"prepared", "moved", "committed", "rolled_back"}:
             raise ValueError(f"Invalid artifact commit state: {state}")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            commit = connection.execute(
+                "SELECT job_id FROM artifact_commits WHERE id=?",
+                (commit_id,),
+            ).fetchone()
+            if commit is None:
+                connection.rollback()
+                raise KeyError(commit_id)
+            self._job_mutation_row(connection, str(commit["job_id"]))
             cursor = connection.execute(
                 "UPDATE artifact_commits SET state=?,updated_at=? WHERE id=?",
                 (state, self._now(), commit_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(commit_id)
+            connection.commit()
         return self.get_artifact_commit(commit_id)
 
     def update_job(
@@ -3649,17 +4167,28 @@ class StudioCatalog:
         if error is not None:
             values["error"] = error
         assignments = ",".join(f"{key}=?" for key in values)
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._job_mutation_row(connection, job_id)
             cursor = connection.execute(
                 f"UPDATE jobs SET {assignments} WHERE id=?",
                 (*values.values(), job_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise KeyError(job_id)
+            connection.commit()
         return self.get_job(job_id)
 
-    def retry_job(self, job_id: str) -> dict[str, Any]:
-        with self.connect() as connection:
+    def retry_job(
+        self,
+        job_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = self._job_mutation_row(connection, job_id, principal=principal)
             cursor = connection.execute(
                 """
                 UPDATE jobs SET status='queued',progress=0,message='Queued for retry',
@@ -3675,7 +4204,15 @@ class StudioCatalog:
                 (self._now(), job_id),
             )
             if cursor.rowcount != 1:
+                connection.rollback()
                 raise ValueError("Only failed jobs can be retried")
+            payload = _loads(job["payload_json"], {})
+            if job["kind"] == "export" and payload.get("export_id"):
+                connection.execute(
+                    "UPDATE exports SET status='queued' WHERE id=?",
+                    (str(payload["export_id"]),),
+                )
+            connection.commit()
         return self.get_job(job_id)
 
     def next_export_version(self, project_id: str) -> int:
@@ -3686,9 +4223,18 @@ class StudioCatalog:
             ).fetchone()
         return int(row["value"])
 
-    def create_export(self, project_id: str, name: str, version: int) -> dict[str, Any]:
+    def create_export(
+        self,
+        project_id: str,
+        name: str,
+        version: int,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
         export_id = new_id("export")
-        with self.connect() as connection:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._project_mutation_row(connection, project_id, principal=principal)
             connection.execute(
                 """
                 INSERT INTO exports(id,project_id,version,name,status,created_at)
@@ -3696,6 +4242,7 @@ class StudioCatalog:
                 """,
                 (export_id, project_id, version, name, utc_now()),
             )
+            connection.commit()
         return self.get_export(export_id)
 
     def get_export(self, export_id: str) -> dict[str, Any]:
@@ -3706,6 +4253,17 @@ class StudioCatalog:
         value = dict(row)
         value["report"] = _loads(value.pop("report_json"), None)
         return value
+
+    def discard_unstarted_export(self, export_id: str) -> bool:
+        """Compensate an export row when its job could not be enqueued."""
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM exports WHERE id=? AND status='queued'",
+                (export_id,),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
 
     def list_exports(self, project_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -3727,13 +4285,31 @@ class StudioCatalog:
         status: str,
         path: str | None = None,
         report: Any = None,
+        principal: PrincipalLike | None = None,
     ) -> dict[str, Any]:
-        with self.connect() as connection:
-            connection.execute(
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            export = connection.execute(
+                "SELECT project_id FROM exports WHERE id=?",
+                (export_id,),
+            ).fetchone()
+            if export is None:
+                connection.rollback()
+                raise KeyError(export_id)
+            self._project_mutation_row(
+                connection,
+                str(export["project_id"]),
+                principal=principal,
+            )
+            cursor = connection.execute(
                 """
                 UPDATE exports SET status=?,path=COALESCE(?,path),
                     report_json=COALESCE(?,report_json) WHERE id=?
                 """,
                 (status, path, _json(report) if report is not None else None, export_id),
             )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise KeyError(export_id)
+            connection.commit()
         return self.get_export(export_id)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from moshi_data_pipeline.config import PipelineConfig
-from moshi_data_pipeline.studio.catalog import StudioCatalog
+from moshi_data_pipeline.studio.catalog import PrincipalLike, StudioCatalog
 from moshi_data_pipeline.studio.media import StudioPaths, load_json_file, safe_filename
 from moshi_data_pipeline.studio.protocol import ArtifactRef, JobContext
 
@@ -50,6 +50,7 @@ class JobContextBuilder:
         *,
         project_id: str,
         source_id: str | None,
+        principal: PrincipalLike | None = None,
         known_sha256: str | None = None,
         known_size: int | None = None,
     ) -> dict[str, Any] | None:
@@ -65,12 +66,14 @@ class JobContextBuilder:
             media_type=media_type,
             project_id=project_id,
             source_id=source_id,
+            principal=principal,
         )
 
     def _source_inputs(
         self,
         kind: str,
         source: dict[str, Any],
+        principal: PrincipalLike | None = None,
     ) -> list[dict[str, Any]]:
         source_id = str(source["id"])
         project_id = str(source["project_id"])
@@ -147,6 +150,7 @@ class JobContextBuilder:
                     role,
                     project_id=project_id,
                     source_id=source_id,
+                    principal=principal,
                     known_sha256=known_hash,
                     known_size=known_size,
                 )
@@ -183,6 +187,7 @@ class JobContextBuilder:
         kind: str,
         source_id: str | None,
         payload: dict[str, Any],
+        principal: PrincipalLike | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
         project = self.catalog.get_project(project_id)
         preconditions: dict[str, Any] = {
@@ -215,7 +220,7 @@ class JobContextBuilder:
                     ),
                     None,
                 )
-            artifacts.extend(self._source_inputs(kind, source))
+            artifacts.extend(self._source_inputs(kind, source, principal))
         elif kind == "export":
             export_id = str(payload["export_id"])
             export = self.catalog.get_export(export_id)
@@ -234,7 +239,7 @@ class JobContextBuilder:
                         "overlap_recoveries": self.catalog.overlap_recoveries(source_id_value),
                     }
                 )
-                artifacts.extend(self._source_inputs(kind, source))
+                artifacts.extend(self._source_inputs(kind, source, principal))
             preconditions["sources"] = sources
         artifact_snapshot = sorted(
             (

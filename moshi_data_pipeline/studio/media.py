@@ -21,7 +21,7 @@ def safe_filename(value: str) -> str:
 
 
 class StudioPaths:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, create: bool = True):
         self.root = root.resolve()
         self.database = self.root / "catalog.sqlite3"
         self.originals = self.root / "originals"
@@ -30,16 +30,18 @@ class StudioPaths:
         self.incoming = self.root / ".incoming"
         self.worker_staging = self.incoming / "worker"
         self.worker_artifacts = self.root / "worker_artifacts"
-        for directory in (
-            self.root,
-            self.originals,
-            self.sources,
-            self.exports,
-            self.incoming,
-            self.worker_staging,
-            self.worker_artifacts,
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
+        self.deletion_quarantine = self.root / ".deletion_quarantine"
+        if create:
+            for directory in (
+                self.root,
+                self.originals,
+                self.sources,
+                self.exports,
+                self.incoming,
+                self.worker_staging,
+                self.worker_artifacts,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
 
     def resolve_relative(self, value: str) -> Path:
         path = (self.root / value).resolve()

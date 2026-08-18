@@ -33,6 +33,7 @@ from moshi_data_pipeline.studio.catalog import (
     WORKER_PROTOCOL_VERSION,
     GpuCheckRateLimitError,
     LeaseConflictError,
+    ProjectDeletionConflictError,
     ProtocolMismatchError,
     VersionConflictError,
 )
@@ -288,7 +289,10 @@ def create_studio_app(
                     status_code=404,
                     content={"detail": "Not found"},
                 )
-        return await call_next(request)
+        response = await call_next(request)
+        if protected_browser_path and request.url.path.startswith("/media/"):
+            response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.exception_handler(KeyError)
     async def missing_handler(_: Request, __: KeyError):
@@ -296,6 +300,10 @@ def create_studio_app(
 
     @app.exception_handler(VersionConflictError)
     async def conflict_handler(_: Request, exc: VersionConflictError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(ProjectDeletionConflictError)
+    async def deletion_conflict_handler(_: Request, exc: ProjectDeletionConflictError):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(ValueError)
@@ -813,7 +821,7 @@ def create_studio_app(
         return service.catalog.transfer_project_owner(
             project_id,
             owner_user_id=payload.owner_user_id,
-            actor_user_id=principal.user_id,
+            principal=principal,
         )
 
     @app.get("/api/projects")
@@ -845,11 +853,12 @@ def create_studio_app(
         }
 
     @app.put("/api/projects/{project_id}")
-    def update_project(project_id: str, payload: ProjectUpdate):
+    def update_project(project_id: str, payload: ProjectUpdate, request: Request):
         return service.catalog.update_project(
             project_id,
             name=payload.name,
             language=payload.language,
+            principal=require_principal(request),
         )
 
     @app.delete("/api/projects/{project_id}")
@@ -865,8 +874,13 @@ def create_studio_app(
                 status_code=400,
                 detail="X-Confirm-Delete must exactly match the project id",
             )
-        deleted = service.delete_project(project_id, actor_user_id=principal.user_id)
-        return {"deleted": deleted["id"], "recoverable": False}
+        deleted = service.delete_project(project_id, principal=principal)
+        cleanup = deleted["cleanup"]
+        return {
+            "deleted": deleted["id"],
+            "recoverable": False,
+            "cleanup_state": cleanup["state"],
+        }
 
     @app.post("/api/projects/{project_id}/sources", status_code=201)
     async def upload_source(
@@ -874,7 +888,7 @@ def create_studio_app(
         request: Request,
         x_filename: str = Header(...),
     ):
-        service.catalog.get_project(project_id)
+        principal = require_principal(request)
         if Path(x_filename).suffix.casefold() not in SUPPORTED_EXTENSIONS:
             raise HTTPException(
                 status_code=415,
@@ -889,6 +903,7 @@ def create_studio_app(
                 request.headers.get("content-type", "application/octet-stream"),
                 digest,
                 size,
+                principal=principal,
             )
         except Exception:
             if destination.exists():
@@ -902,6 +917,7 @@ def create_studio_app(
     @app.delete("/api/sources/{source_id}")
     def delete_source(
         source_id: str,
+        request: Request,
         x_confirm_delete: str = Header(...),
     ):
         if x_confirm_delete != source_id:
@@ -909,58 +925,73 @@ def create_studio_app(
                 status_code=400,
                 detail="X-Confirm-Delete must exactly match the source id",
             )
-        deleted = service.delete_source(source_id)
+        deleted = service.delete_source(
+            source_id,
+            principal=require_principal(request),
+        )
         return {"deleted": deleted["id"], "recoverable": False}
 
     @app.put("/api/sources/{source_id}/rights")
-    def save_rights(source_id: str, payload: SourceRights):
-        return service.save_rights(source_id, payload)
+    def save_rights(source_id: str, payload: SourceRights, request: Request):
+        return service.save_rights(
+            source_id,
+            payload,
+            principal=require_principal(request),
+        )
 
     @app.post("/api/sources/{source_id}/initialize", status_code=202)
     def initialize_source_job(
         source_id: str,
+        request: Request,
         payload: dict[str, Any] = Body(...),
     ):
         source = service.catalog.get_source(source_id)
         mode = str(payload.get("mode", "manual"))
         if mode not in {"manual", "assisted"}:
             raise ValueError("Initialization mode must be manual or assisted")
-        service.catalog.update_source(source_id, status="processing", init_mode=mode)
         return service.enqueue(
             source["project_id"],
             "initialize",
             source_id,
             {"mode": mode},
+            principal=require_principal(request),
+            source_updates={"status": "processing", "init_mode": mode},
         )
 
-    def enqueue_source(source_id: str, kind: str):
+    def enqueue_source(source_id: str, kind: str, request: Request):
         source = service.catalog.get_source(source_id)
-        return service.enqueue(source["project_id"], kind, source_id)
+        return service.enqueue(
+            source["project_id"],
+            kind,
+            source_id,
+            principal=require_principal(request),
+        )
 
     @app.post("/api/sources/{source_id}/transcribe", status_code=202)
-    def transcribe_source_job(source_id: str):
-        return enqueue_source(source_id, "transcribe")
+    def transcribe_source_job(source_id: str, request: Request):
+        return enqueue_source(source_id, "transcribe", request)
 
     @app.post("/api/sources/{source_id}/review-transcript", status_code=202)
-    def review_transcript_job(source_id: str):
-        return enqueue_source(source_id, "review_transcript")
+    def review_transcript_job(source_id: str, request: Request):
+        return enqueue_source(source_id, "review_transcript", request)
 
     @app.post("/api/sources/{source_id}/rediarize", status_code=202)
-    def rediarize_source_job(source_id: str):
-        return enqueue_source(source_id, "rediarize")
+    def rediarize_source_job(source_id: str, request: Request):
+        return enqueue_source(source_id, "rediarize", request)
 
     @app.post("/api/sources/{source_id}/realign", status_code=202)
-    def realign_source_job(source_id: str):
+    def realign_source_job(source_id: str, request: Request):
         source = service.catalog.get_source(source_id)
         return service.enqueue(
             source["project_id"],
             "realign",
             source_id,
             {"annotation_version": source["active_annotation_version"]},
+            principal=require_principal(request),
         )
 
     @app.post("/api/sources/{source_id}/recover-overlap", status_code=202)
-    def overlap_source_job(source_id: str):
+    def overlap_source_job(source_id: str, request: Request):
         annotation = service.catalog.latest_annotation(source_id)
         if annotation.assistant_speaker is None:
             raise ValueError("Choose the Moshi speaker before recovering overlap")
@@ -968,19 +999,20 @@ def create_studio_app(
             raise ValueError(
                 "Finalize and save the human speaker regions before recovering overlap"
             )
-        return enqueue_source(source_id, "recover_overlap")
+        return enqueue_source(source_id, "recover_overlap", request)
 
     @app.post(
         "/api/sources/{source_id}/overlaps/{region_id}/transcribe",
         status_code=202,
     )
-    def transcribe_overlap_job(source_id: str, region_id: str):
+    def transcribe_overlap_job(source_id: str, region_id: str, request: Request):
         source = service.catalog.get_source(source_id)
         return service.enqueue(
             source["project_id"],
             "transcribe_overlap",
             source_id,
             {"region_id": region_id},
+            principal=require_principal(request),
         )
 
     @app.get("/api/sources/{source_id}/annotations")
@@ -995,11 +1027,12 @@ def create_studio_app(
         return service.catalog.annotation_at(source_id, version).model_dump(mode="json")
 
     @app.put("/api/sources/{source_id}/annotations")
-    def save_annotation(source_id: str, payload: AnnotationSave):
+    def save_annotation(source_id: str, payload: AnnotationSave, request: Request):
         return service.save_annotation(
             source_id,
             payload.expected_version,
             payload.annotation,
+            principal=require_principal(request),
         ).model_dump(mode="json")
 
     @app.get("/api/sources/{source_id}/overlaps")
@@ -1011,17 +1044,23 @@ def create_studio_app(
         source_id: str,
         region_id: str,
         payload: OverlapDecisionPayload,
+        request: Request,
     ):
         return service.catalog.decide_overlap(
             source_id,
             region_id,
             payload.decision,
             payload.auditioned,
+            principal=require_principal(request),
         )
 
     @app.post("/api/sources/{source_id}/clip-plan")
-    def create_clip_plan(source_id: str, payload: ClipPlanRequest):
-        return service.plan_clips(source_id, payload)
+    def create_clip_plan(source_id: str, payload: ClipPlanRequest, request: Request):
+        return service.plan_clips(
+            source_id,
+            payload,
+            principal=require_principal(request),
+        )
 
     @app.get("/api/sources/{source_id}/clip-plan")
     def get_clip_plan(source_id: str):
@@ -1029,8 +1068,8 @@ def create_studio_app(
         return {"plan": plan.model_dump(mode="json") if plan else None}
 
     @app.post("/api/sources/{source_id}/generate", status_code=202)
-    def generate_source_job(source_id: str):
-        return enqueue_source(source_id, "generate")
+    def generate_source_job(source_id: str, request: Request):
+        return enqueue_source(source_id, "generate", request)
 
     @app.get("/api/sources/{source_id}/clips")
     def get_clips(source_id: str):
@@ -1041,18 +1080,23 @@ def create_studio_app(
         source_id: str,
         clip_id: str,
         payload: DecisionPayload,
+        request: Request,
     ):
         return service.decide_clip(
             source_id,
             clip_id,
             payload.decision,
             payload.auditioned,
+            principal=require_principal(request),
         )
 
     @app.post("/api/projects/{project_id}/exports", status_code=202)
-    def create_export(project_id: str, payload: ExportCreate):
-        service.catalog.get_project(project_id)
-        return service.create_export(project_id, payload.name)
+    def create_export(project_id: str, payload: ExportCreate, request: Request):
+        return service.create_export(
+            project_id,
+            payload.name,
+            principal=require_principal(request),
+        )
 
     @app.get("/api/projects/{project_id}/validate")
     def validate_project(project_id: str):
@@ -1067,13 +1111,11 @@ def create_studio_app(
         return service.catalog.get_job(job_id)
 
     @app.post("/api/jobs/{job_id}/retry", status_code=202)
-    def retry_job(job_id: str):
-        job = service.catalog.retry_job(job_id)
-        if job["kind"] == "export" and job["payload"].get("export_id"):
-            service.catalog.update_export(
-                str(job["payload"]["export_id"]),
-                status="queued",
-            )
+    def retry_job(job_id: str, request: Request):
+        job = service.catalog.retry_job(
+            job_id,
+            principal=require_principal(request),
+        )
         service.worker.wake()
         service.lifecycle.wake()
         service.dispatcher.wake()
@@ -1083,12 +1125,28 @@ def create_studio_app(
     async def job_events(job_id: str, request: Request):
         principal = require_principal(request)
         authorization.authorize_job(principal, job_id)
+        session_token = request.cookies.get(authentication.settings.cookie_name)
+
+        def current_stream_principal() -> RequestPrincipal | None:
+            if local_principal is not None:
+                try:
+                    user = service.catalog.get_user(local_principal.user_id)
+                except KeyError:
+                    return None
+                if user["status"] != "active":
+                    return None
+                return RequestPrincipal.from_catalog_user(user)
+            user = authentication.current_user(session_token)
+            return RequestPrincipal.from_catalog_user(user) if user is not None else None
 
         async def values():
             previous = None
             while True:
                 try:
-                    job = authorization.authorize_job(principal, job_id)
+                    current_principal = current_stream_principal()
+                    if current_principal is None:
+                        raise KeyError(job_id)
+                    job = authorization.authorize_job(current_principal, job_id)
                 except KeyError:
                     yield 'event: access_revoked\ndata: {"detail":"Not found"}\n\n'
                     break
@@ -1100,7 +1158,11 @@ def create_studio_app(
                     break
                 await asyncio.sleep(0.5)
 
-        return StreamingResponse(values(), media_type="text/event-stream")
+        return StreamingResponse(
+            values(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     def source_file(source_id: str, kind: str) -> Path:
         source = service.catalog.get_source(source_id)

@@ -5,6 +5,7 @@ import os
 import re
 import threading
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,11 @@ class ArtifactStore:
         self.paths = paths
         self._lock = threading.RLock()
 
+    @contextmanager
+    def mutation_guard(self):
+        with self._lock:
+            yield
+
     def _staging_file(self, identifier: str) -> Path:
         path = (self.paths.worker_staging / f"{identifier}.part").resolve()
         if self.paths.worker_staging.resolve() not in path.parents:
@@ -38,6 +44,22 @@ class ArtifactStore:
         return path
 
     def create_upload(
+        self,
+        job_id: str,
+        lease_token: str,
+        payload: UploadCreate,
+        *,
+        ttl_hours: int = 24,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._create_upload(
+                job_id,
+                lease_token,
+                payload,
+                ttl_hours=ttl_hours,
+            )
+
+    def _create_upload(
         self,
         job_id: str,
         lease_token: str,
@@ -213,6 +235,14 @@ class ArtifactStore:
         return digest.hexdigest()
 
     def commit_uploads(
+        self,
+        job: dict[str, Any],
+        produced: list[ProducedArtifact],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        with self._lock:
+            return self._commit_uploads(job, produced)
+
+    def _commit_uploads(
         self,
         job: dict[str, Any],
         produced: list[ProducedArtifact],

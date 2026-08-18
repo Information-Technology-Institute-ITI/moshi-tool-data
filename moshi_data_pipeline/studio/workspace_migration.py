@@ -21,6 +21,8 @@ CATALOG_TABLES = (
     "clip_decisions",
     "overlap_recoveries",
     "exports",
+    "project_ownership_audit",
+    "project_deletion_cleanup",
 )
 
 
@@ -32,25 +34,53 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _readonly_connection(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def _existing_tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+
+
+def _schema_version(connection: sqlite3.Connection) -> int:
+    if "schema_migrations" not in _existing_tables(connection):
+        return 0
+    return int(
+        connection.execute(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+        ).fetchone()[0]
+    )
+
+
+def _database_counts_connection(connection: sqlite3.Connection) -> dict[str, int]:
+    existing = _existing_tables(connection)
+    return {
+        table: (
+            int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if table in existing
+            else 0
+        )
+        for table in CATALOG_TABLES
+    }
+
+
 def _database_counts(path: Path) -> dict[str, int]:
     if not path.is_file():
         return dict.fromkeys(CATALOG_TABLES, 0)
-    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    connection = _readonly_connection(path)
     try:
-        existing = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        return {
-            table: (
-                int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                if table in existing
-                else 0
-            )
-            for table in CATALOG_TABLES
-        }
+        return _database_counts_connection(connection)
     finally:
         connection.close()
 
@@ -208,10 +238,23 @@ def register_workspace_artifacts(
     return {"registered": registered, "bytes": bytes_hashed}
 
 
-def verify_workspace(catalog: StudioCatalog, paths: StudioPaths) -> dict[str, Any]:
+def _verify_workspace_connection(
+    connection: sqlite3.Connection,
+    paths: StudioPaths,
+) -> dict[str, Any]:
     missing: list[str] = []
     mismatched: list[str] = []
-    artifacts = catalog.list_artifacts()
+    existing = _existing_tables(connection)
+    artifacts = (
+        [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM artifacts WHERE state='active' ORDER BY created_at,id"
+            ).fetchall()
+        ]
+        if "artifacts" in existing
+        else []
+    )
     for artifact in artifacts:
         try:
             path = paths.resolve_relative(str(artifact["relative_path"]))
@@ -231,8 +274,13 @@ def verify_workspace(catalog: StudioCatalog, paths: StudioPaths) -> dict[str, An
         "artifact_count": len(artifacts),
         "missing": missing,
         "mismatched": mismatched,
-        "schema_counts": _database_counts(paths.database),
+        "schema_counts": _database_counts_connection(connection),
     }
+
+
+def verify_workspace(catalog: StudioCatalog, paths: StudioPaths) -> dict[str, Any]:
+    with catalog.connect() as connection:
+        return _verify_workspace_connection(connection, paths)
 
 
 def migrate_workspace(
@@ -248,6 +296,33 @@ def migrate_workspace(
     if not before["database_exists"]:
         raise FileNotFoundError(before["database"])
     root = workspace.resolve()
+    if verify_only:
+        paths = StudioPaths(root, create=False)
+        connection = _readonly_connection(paths.database)
+        try:
+            schema_version = _schema_version(connection)
+            verification = _verify_workspace_connection(connection, paths)
+        finally:
+            connection.close()
+        schema_current = schema_version == LATEST_SCHEMA_VERSION
+        verification["schema_current"] = schema_current
+        verification["valid"] = bool(verification["valid"] and schema_current)
+        if not schema_current:
+            verification["schema_error"] = (
+                f"Schema version {schema_version} is outdated; "
+                f"expected {LATEST_SCHEMA_VERSION}"
+            )
+        return {
+            "mode": "verify",
+            "before": before,
+            "after": inspect_workspace(root),
+            "backup": None,
+            "registration": {"registered": 0, "bytes": 0},
+            "schema_version": schema_version,
+            "expected_schema_version": LATEST_SCHEMA_VERSION,
+            "verification": verification,
+            "changes_applied": False,
+        }
     backup_path: Path | None = None
     if apply:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -271,7 +346,7 @@ def migrate_workspace(
             ).fetchone()[0]
         )
     return {
-        "mode": "apply" if apply else "verify",
+        "mode": "apply",
         "before": before,
         "after": inspect_workspace(root),
         "backup": str(backup_path) if backup_path else None,

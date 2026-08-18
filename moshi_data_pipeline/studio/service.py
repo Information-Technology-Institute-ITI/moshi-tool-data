@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 from moshi_data_pipeline.config import PipelineConfig
 from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS as GPU_JOB_KINDS
 from moshi_data_pipeline.studio.artifacts import ArtifactStore
-from moshi_data_pipeline.studio.catalog import StudioCatalog
+from moshi_data_pipeline.studio.catalog import PrincipalLike, StudioCatalog
 from moshi_data_pipeline.studio.clip_registry import clip_artifacts
 from moshi_data_pipeline.studio.domain import (
     AnnotationDocument,
@@ -179,8 +180,11 @@ class StudioService:
         kind: str,
         source_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        *,
+        principal: PrincipalLike | None = None,
+        source_updates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if source_id is not None:
+        if source_id is not None and principal is None:
             if kind == "realign" and payload and "annotation_version" in payload:
                 requested_version = int(payload["annotation_version"])
                 for active in self.catalog.active_jobs(source_id, kind):
@@ -198,6 +202,7 @@ class StudioService:
             kind=kind,
             source_id=source_id,
             payload=job_payload,
+            principal=principal,
         )
         job = self.catalog.create_job(
             project_id,
@@ -206,6 +211,8 @@ class StudioService:
             job_payload,
             preconditions=preconditions,
             input_fingerprint=fingerprint,
+            principal=principal,
+            source_updates=source_updates,
         )
         self.worker.wake()
         self.lifecycle.wake()
@@ -477,28 +484,36 @@ class StudioService:
         if self.contexts.current_fingerprint(job) != input_fingerprint:
             return self.catalog.supersede_job(job_id, "Authoritative inputs changed")
         result = validate_job_result(kind, result_value)
-        registered, commit_id = self.artifacts.commit_uploads(job, produced_artifacts)
-        try:
-            mutation = self._prepare_remote_mutation(job, result, registered)
-            return self.catalog.commit_leased_job_result(
-                job_id,
-                worker_id,
-                lease_token,
-                result={
-                    **result.model_dump(mode="json"),
-                    "artifacts": [item["id"] for item in registered],
-                },
-                mutation=mutation,
-                artifact_commit_id=commit_id,
-            )
-        except Exception:
-            if commit_id is not None:
-                self.artifacts.rollback_commit(commit_id)
-            raise
+        with self.artifacts.mutation_guard():
+            registered, commit_id = self.artifacts.commit_uploads(job, produced_artifacts)
+            try:
+                mutation = self._prepare_remote_mutation(job, result, registered)
+                return self.catalog.commit_leased_job_result(
+                    job_id,
+                    worker_id,
+                    lease_token,
+                    result={
+                        **result.model_dump(mode="json"),
+                        "artifacts": [item["id"] for item in registered],
+                    },
+                    mutation=mutation,
+                    artifact_commit_id=commit_id,
+                )
+            except Exception:
+                if commit_id is not None:
+                    self.artifacts.rollback_commit(commit_id)
+                raise
 
-    def save_rights(self, source_id: str, rights: SourceRights) -> dict[str, Any]:
+    def save_rights(
+        self,
+        source_id: str,
+        rights: SourceRights,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
         return self.catalog.update_source(
             source_id,
+            principal=principal,
             origin=rights.origin,
             rights_basis=rights.rights_basis,
             rights_notes=rights.rights_notes,
@@ -510,6 +525,8 @@ class StudioService:
         source_id: str,
         expected_version: int,
         annotation: AnnotationDocument,
+        *,
+        principal: PrincipalLike,
     ) -> AnnotationDocument:
         source = self.catalog.get_source(source_id)
         if annotation.source_id != source_id:
@@ -551,11 +568,18 @@ class StudioService:
         if errors:
             raise ValueError("; ".join(errors))
         return self.catalog.save_annotation(
-            source_id, expected_version, normalized
+            source_id,
+            expected_version,
+            normalized,
+            principal=principal,
         )
 
     def plan_clips(
-        self, source_id: str, request: ClipPlanRequest
+        self,
+        source_id: str,
+        request: ClipPlanRequest,
+        *,
+        principal: PrincipalLike,
     ) -> dict[str, Any]:
         source = self.catalog.get_source(source_id)
         annotation = self.catalog.latest_annotation(source_id)
@@ -569,7 +593,10 @@ class StudioService:
             int(source["duration_samples"]),
             request,
         )
-        return self.catalog.save_clip_plan(plan).model_dump(mode="json")
+        return self.catalog.save_clip_plan(
+            plan,
+            principal=principal,
+        ).model_dump(mode="json")
 
     def decide_clip(
         self,
@@ -577,6 +604,8 @@ class StudioService:
         clip_id: str,
         decision: str,
         auditioned: bool,
+        *,
+        principal: PrincipalLike,
     ) -> dict[str, Any]:
         artifacts = clip_artifacts(self.catalog, self.paths, source_id)
         item = next(
@@ -592,88 +621,256 @@ class StudioService:
         if decision == "approve" and item["qc"]["status"] == "REJECT":
             raise ValueError("A rejected-QC clip cannot be approved")
         return self.catalog.save_clip_decision(
-            source_id, clip_id, decision, auditioned
+            source_id,
+            clip_id,
+            decision,
+            auditioned,
+            principal=principal,
         )
 
-    def create_export(self, project_id: str, name: str) -> dict[str, Any]:
+    def create_export(
+        self,
+        project_id: str,
+        name: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
         version = self.catalog.next_export_version(project_id)
-        export = self.catalog.create_export(project_id, name, version)
-        job = self.enqueue(
+        export = self.catalog.create_export(
             project_id,
-            "export",
-            payload={"export_id": export["id"]},
+            name,
+            version,
+            principal=principal,
         )
+        try:
+            job = self.enqueue(
+                project_id,
+                "export",
+                payload={"export_id": export["id"]},
+                principal=principal,
+            )
+        except Exception:
+            self.catalog.discard_unstarted_export(str(export["id"]))
+            raise
         return {"export": export, "job": job}
 
     def validate_project(self, project_id: str) -> dict[str, Any]:
         self.catalog.get_project(project_id)
         return validate_project_export(self.catalog, self.paths, project_id)
 
-    def delete_source(self, source_id: str) -> dict[str, Any]:
-        source = self.catalog.get_source(source_id)
-        if self.catalog.active_source_jobs(source_id):
-            raise ValueError("Wait for active source jobs to finish before deletion")
-        if any(
-            job["kind"] == "export" and job["status"] in {"queued", "running"}
-            for job in self.catalog.list_jobs(source["project_id"])
-        ):
-            raise ValueError("Wait for the active project export before deletion")
+    def delete_source(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        source = self.catalog.get_source_for_mutation(source_id, principal=principal)
         original = self.paths.resolve_relative(source["stored_path"])
         source_root = self.paths.source_root(source_id).resolve()
         if self.paths.root not in source_root.parents:
             raise ValueError("Refusing to remove a source outside the workspace")
+        deleted = self.catalog.delete_source(source_id, principal=principal)
         if source_root.exists():
             shutil.rmtree(source_root)
         if original.exists():
             original.unlink()
-        return self.catalog.delete_source(source_id)
+        return deleted
 
-    def delete_project(self, project_id: str, *, actor_user_id: str) -> dict[str, Any]:
-        project = self.catalog.get_project(project_id)
-        if any(
-            job["status"] in {"queued", "running"}
-            for job in self.catalog.list_jobs(project_id, limit=100_000)
+    def _registered_workspace_path(self, value: str) -> Path:
+        relative = Path(value)
+        if (
+            relative.is_absolute()
+            or value.strip() in {"", ".", ".."}
+            or ".." in relative.parts
         ):
-            raise ValueError("Wait for active project jobs to finish before deletion")
+            raise ValueError("Refusing to remove an unsafe project target")
+        return self.paths.root.joinpath(*relative.parts)
 
+    def _validate_deletion_target(
+        self,
+        path: Path,
+        *,
+        allow_quarantine: bool = False,
+    ) -> Path:
+        root = self.paths.root.resolve()
+        target = Path(os.path.abspath(path))
+        try:
+            relative = target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                "Refusing to remove a project target outside the workspace"
+            ) from exc
+        if relative == Path("."):
+            raise ValueError("Refusing to remove a protected workspace path")
+        in_quarantine = (
+            target == self.paths.deletion_quarantine
+            or self.paths.deletion_quarantine in target.parents
+        )
+        if in_quarantine and not allow_quarantine:
+            raise ValueError("Refusing to remove the deletion quarantine")
+
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        def validate_existing(candidate: Path) -> os.stat_result | None:
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(info.st_mode) or bool(
+                getattr(info, "st_file_attributes", 0) & reparse_flag
+            ):
+                raise ValueError("Refusing to remove a symlink or reparse point")
+            resolved = candidate.resolve(strict=True)
+            if resolved != root and root not in resolved.parents:
+                raise ValueError(
+                    "Refusing to remove a project target outside the workspace"
+                )
+            return info
+
+        cursor = root
+        for part in relative.parts:
+            cursor /= part
+            if validate_existing(cursor) is None:
+                break
+
+        stack = [target]
+        while stack:
+            candidate = stack.pop()
+            info = validate_existing(candidate)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                continue
+            with os.scandir(candidate) as entries:
+                stack.extend(Path(entry.path) for entry in entries)
+        return target
+
+    def _project_deletion_targets(self, project_id: str) -> list[Path]:
         targets: set[Path] = set()
 
-        def register_target(path: Path) -> None:
-            resolved = path.resolve()
-            if resolved == self.paths.root or self.paths.root not in resolved.parents:
-                raise ValueError("Refusing to remove a project target outside the workspace")
-            targets.add(resolved)
+        def register_relative(value: str) -> None:
+            targets.add(self._registered_workspace_path(value))
 
         for source in self.catalog.list_sources(project_id):
-            register_target(self.paths.resolve_relative(str(source["stored_path"])))
-            register_target(self.paths.source_root(str(source["id"])))
+            register_relative(str(source["stored_path"]))
+            targets.add(self.paths.source_root(str(source["id"])))
             for recovery in self.catalog.overlap_recoveries(str(source["id"])):
                 for field in ("assistant_path", "user_path", "original_path"):
                     if recovery.get(field):
-                        register_target(
-                            self.paths.resolve_relative(str(recovery[field]))
-                        )
+                        register_relative(str(recovery[field]))
         for artifact in self.catalog.list_project_artifacts(project_id):
-            register_target(self.paths.resolve_relative(str(artifact["relative_path"])))
+            register_relative(str(artifact["relative_path"]))
         for upload in self.catalog.list_project_artifact_uploads(project_id):
-            register_target(self.paths.resolve_relative(str(upload["staging_path"])))
+            register_relative(str(upload["staging_path"]))
             if upload.get("final_relative_path"):
-                register_target(
-                    self.paths.resolve_relative(str(upload["final_relative_path"]))
-                )
+                register_relative(str(upload["final_relative_path"]))
         for commit in self.catalog.list_project_artifact_commits(project_id):
             for entry in commit["entries"]:
                 for field in ("staging_path", "final_path"):
                     if entry.get(field):
-                        register_target(self.paths.resolve_relative(str(entry[field])))
+                        register_relative(str(entry[field]))
         for export in self.catalog.list_exports(project_id):
             if export.get("path"):
-                register_target(self.paths.resolve_relative(str(export["path"])))
+                register_relative(str(export["path"]))
 
-        for target in sorted(targets, key=lambda value: len(value.parts), reverse=True):
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-            elif target.is_dir():
-                shutil.rmtree(target)
-        deleted = self.catalog.delete_project(project_id, actor_user_id=actor_user_id)
-        return {**project, **deleted}
+        validated = [self._validate_deletion_target(target) for target in targets]
+        collapsed: list[Path] = []
+        for target in sorted(validated, key=lambda value: (len(value.parts), str(value))):
+            if any(target == parent or parent in target.parents for parent in collapsed):
+                continue
+            collapsed.append(target)
+        return collapsed
+
+    def _restore_project_quarantine(
+        self,
+        moved: list[tuple[Path, Path]],
+    ) -> None:
+        for original, quarantined in reversed(moved):
+            self._validate_deletion_target(quarantined, allow_quarantine=True)
+            self._validate_deletion_target(original)
+            if not quarantined.exists():
+                continue
+            original.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(quarantined, original)
+
+    def _purge_project_quarantine(self, quarantine: Path) -> None:
+        self._validate_deletion_target(quarantine, allow_quarantine=True)
+        if quarantine.exists():
+            shutil.rmtree(quarantine)
+
+    def delete_project(
+        self,
+        project_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        with self.artifacts.mutation_guard():
+            project = self.catalog.reserve_project_deletion(
+                project_id,
+                principal=principal,
+            )
+            reservation_id = str(project["deletion_reservation_id"])
+            quarantine = self.paths.deletion_quarantine / reservation_id
+            moved: list[tuple[Path, Path]] = []
+            try:
+                targets = self._project_deletion_targets(project_id)
+                quarantine.mkdir(parents=True, exist_ok=False)
+                payload_root = quarantine / "payload"
+                for target in targets:
+                    target = self._validate_deletion_target(target)
+                    if not target.exists():
+                        continue
+                    relative = target.relative_to(self.paths.root)
+                    destination = payload_root / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    self._validate_deletion_target(target)
+                    os.replace(target, destination)
+                    moved.append((target, destination))
+                manifest = [
+                    {
+                        "target": original.relative_to(self.paths.root).as_posix(),
+                        "quarantine": quarantined.relative_to(self.paths.root).as_posix(),
+                    }
+                    for original, quarantined in moved
+                ]
+                self.catalog.record_project_quarantine(
+                    reservation_id,
+                    quarantine_path=quarantine.relative_to(self.paths.root).as_posix(),
+                    manifest=manifest,
+                )
+                deleted = self.catalog.finalize_project_deletion(
+                    project_id,
+                    reservation_id=reservation_id,
+                    principal=principal,
+                )
+            except Exception as exc:
+                restore_error: Exception | None = None
+                try:
+                    self._restore_project_quarantine(moved)
+                    if quarantine.exists():
+                        shutil.rmtree(quarantine)
+                except Exception as restore_exc:  # pragma: no cover - catastrophic I/O failure
+                    restore_error = restore_exc
+                self.catalog.abort_project_deletion(
+                    reservation_id,
+                    state="restore_failed" if restore_error else "aborted",
+                    error=str(restore_error or exc),
+                )
+                if restore_error is not None:
+                    raise RuntimeError(
+                        "Project deletion failed and quarantined files could not be restored"
+                    ) from restore_error
+                raise
+
+            try:
+                self._purge_project_quarantine(quarantine)
+            except Exception as exc:
+                cleanup = self.catalog.finish_project_deletion_cleanup(
+                    reservation_id,
+                    state="purge_failed",
+                    error=str(exc),
+                )
+            else:
+                cleanup = self.catalog.finish_project_deletion_cleanup(
+                    reservation_id,
+                    state="complete",
+                )
+            return {**project, **deleted, "cleanup": cleanup}

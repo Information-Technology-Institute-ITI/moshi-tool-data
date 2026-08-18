@@ -93,7 +93,7 @@ def test_v3_workspace_upgrades_to_gpu_schema(tmp_path) -> None:
         lifecycle_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(lifecycle_state)").fetchall()
         }
-    assert version == LATEST_SCHEMA_VERSION == 6
+    assert version == LATEST_SCHEMA_VERSION == 7
     assert {
         "gpu_runtime_state",
         "gpu_checks",

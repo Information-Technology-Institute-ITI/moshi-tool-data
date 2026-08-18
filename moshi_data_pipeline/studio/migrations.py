@@ -507,6 +507,95 @@ def _dataset_ownership_v1(connection: sqlite3.Connection) -> None:
     )
 
 
+def _recoverable_project_deletion(connection: sqlite3.Connection) -> None:
+    _add_columns(
+        connection,
+        "projects",
+        {
+            "deletion_state": (
+                "TEXT NOT NULL DEFAULT 'active' "
+                "CHECK(deletion_state IN ('active','deleting'))"
+            ),
+            "deletion_reservation_id": "TEXT",
+            "deletion_reserved_at": "TEXT",
+            "deletion_reserved_by": "TEXT",
+        },
+    )
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS project_deletion_cleanup (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            actor_user_id TEXT NOT NULL,
+            audit_id TEXT,
+            state TEXT NOT NULL CHECK(state IN (
+                'reserved','quarantined','pending_purge','complete',
+                'aborted','restore_failed','purge_failed'
+            )),
+            quarantine_path TEXT,
+            manifest_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS project_deletion_cleanup_project_idx
+            ON project_deletion_cleanup(project_id, created_at);
+        CREATE INDEX IF NOT EXISTS project_deletion_cleanup_state_idx
+            ON project_deletion_cleanup(state, updated_at);
+        """,
+    )
+    # Legacy ownerless projects remain immutable except for the deletion reservation
+    # fields needed for an administrator to remove them safely.
+    connection.execute("DROP TRIGGER IF EXISTS projects_owner_required_update")
+    connection.execute(
+        """
+        CREATE TRIGGER projects_owner_required_update
+        BEFORE UPDATE ON projects
+        WHEN NEW.owner_user_id IS NULL AND NOT (
+            OLD.owner_user_id IS NULL
+            AND NEW.id IS OLD.id
+            AND NEW.name IS OLD.name
+            AND NEW.language IS OLD.language
+            AND NEW.created_at IS OLD.created_at
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'projects.owner_user_id is required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_deletion_state_insert
+        BEFORE INSERT ON projects
+        WHEN (
+            NEW.deletion_state='active' AND NEW.deletion_reservation_id IS NOT NULL
+        ) OR (
+            NEW.deletion_state='deleting' AND NEW.deletion_reservation_id IS NULL
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid project deletion reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS projects_deletion_state_update
+        BEFORE UPDATE ON projects
+        WHEN (
+            NEW.deletion_state='active' AND NEW.deletion_reservation_id IS NOT NULL
+        ) OR (
+            NEW.deletion_state='deleting' AND NEW.deletion_reservation_id IS NULL
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid project deletion reservation');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "legacy_compatibility", _legacy_compatibility),
     (2, "worker_protocol_v1", _worker_protocol_v1),
@@ -514,6 +603,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (4, "gpu_push_dispatch_v2", _gpu_push_dispatch_v2),
     (5, "user_authentication_v1", _user_authentication_v1),
     (6, "dataset_ownership_v1", _dataset_ownership_v1),
+    (7, "recoverable_project_deletion", _recoverable_project_deletion),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
