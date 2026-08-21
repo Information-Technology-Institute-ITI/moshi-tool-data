@@ -176,8 +176,19 @@ export function watchJob(
 ): () => void {
   const events = new EventSource(`/api/jobs/${jobId}/events`);
   events.onmessage = (event) => {
-    const job = JSON.parse(event.data);
-    onUpdate(job);
+    // A malformed frame must not kill the stream, and a listener that throws
+    // must not take the page down with it.
+    let job: import("./types").Job;
+    try {
+      job = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    try {
+      onUpdate(job);
+    } catch (error) {
+      console.error("Job update failed", error);
+    }
     if (job.status === "complete" || job.status === "failed") {
       events.close();
     }

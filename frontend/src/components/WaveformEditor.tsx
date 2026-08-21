@@ -33,10 +33,17 @@ type Props = {
   focusRange?: FocusRange | null;
   /** Reports the playhead so the parent can follow along in the transcript. */
   onTimeChange?: (sample: number) => void;
-  /** Fired when the user clicks an A/B activity region on the timeline. */
-  onRegionClick?: (regionId: string) => void;
-  /** Fired when the user marks a range with `[` then a selection key. */
-  onRangeSelect?: (startSample: number, endSample: number) => void;
+  /**
+   * Fired when the user clicks an A/B activity region on the timeline, with the
+   * point they clicked. One region often spans several transcript segments, so
+   * the position is what tells the parent which one they meant.
+   */
+  onRegionClick?: (regionId: string, atSample: number) => void;
+  /**
+   * Asks the parent to remove a speaker rectangle. Removing one can also take a
+   * transcript segment with it, so the parent confirms first.
+   */
+  onRegionDelete?: (regionId: string) => void;
   readOnly?: boolean;
 };
 
@@ -50,7 +57,7 @@ export default function WaveformEditor({
   focusRange,
   onTimeChange,
   onRegionClick,
-  onRangeSelect,
+  onRegionDelete,
   readOnly = false,
 }: Props) {
   const container = useRef<HTMLDivElement>(null);
@@ -68,11 +75,13 @@ export default function WaveformEditor({
   const syncing = useRef(false);
   const selectionStart = useRef<number | null>(null);
   const loopRangeRef = useRef<[number, number] | null>(null);
+  // State, not just the ref, because the regions are drawn from an effect that
+  // has to re-run the moment the audio is decoded.
+  const [ready, setReady] = useState(false);
   const [current, setCurrent] = useState(0);
   const [zoom, setZoom] = useState(35);
   const [rate, setRate] = useState(1);
   const [anchor, setAnchor] = useState<number | null>(null);
-  const [loopAnchor, setLoopAnchor] = useState<number | null>(null);
   const [loopRange, setLoopRange] = useState<[number, number] | null>(null);
 
   annotationRef.current = annotation;
@@ -97,10 +106,12 @@ export default function WaveformEditor({
     });
     wave.current = instance;
     waveReady.current = false;
+    setReady(false);
     regions.current = regionPlugin;
     instance.on("ready", () => {
       waveReady.current = true;
       instance.zoom(zoom);
+      setReady(true);
     });
     instance.on("timeupdate", (time) => {
       setCurrent(time);
@@ -118,12 +129,24 @@ export default function WaveformEditor({
     instance.on("play", () => video.current?.play().catch(() => undefined));
     instance.on("pause", () => video.current?.pause());
     regionPlugin.on("region-updated", (region) => updateRegion(region));
-    regionPlugin.on("region-clicked", (region) => onRegionClickRef.current?.(region.id));
+    regionPlugin.on("region-clicked", (region, event) => {
+      // Read the pointer rather than the player: the click seeks by bubbling to
+      // the waveform wrapper, which has not happened yet at this point.
+      const wrapper = instance.getWrapper();
+      const rect = wrapper.getBoundingClientRect();
+      const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+      const bounded = Math.max(0, Math.min(1, ratio));
+      onRegionClickRef.current?.(
+        region.id,
+        Math.round(bounded * instance.getDuration() * SAMPLE_RATE),
+      );
+    });
     return () => {
       instance.destroy();
       wave.current = null;
       waveReady.current = false;
       regions.current = null;
+      setReady(false);
     };
   }, [audioUrl]);
 
@@ -155,9 +178,13 @@ export default function WaveformEditor({
     if (video.current) video.current.playbackRate = rate;
   }, [rate]);
 
+  // Waits for the decoded audio. Regions added before then have no duration to
+  // position against, and the plugin only re-checks whether to draw them on the
+  // next scroll, zoom or resize — which is why the speaker colours used to
+  // appear only after clicking the waveform or dragging a region.
   useEffect(() => {
     const plugin = regions.current;
-    if (!plugin) return;
+    if (!plugin || !ready) return;
     plugin.clearRegions();
     const add = (
       id: string,
@@ -188,7 +215,7 @@ export default function WaveformEditor({
         `Exclude · ${item.kind}`,
       ),
     );
-  }, [annotation.activities, annotation.exclusions, readOnly]);
+  }, [annotation.activities, annotation.exclusions, readOnly, ready]);
 
   useEffect(() => {
     const keys = (event: KeyboardEvent) => {
@@ -204,13 +231,6 @@ export default function WaveformEditor({
         if (!readOnly) finishActivity("A");
       } else if (event.key.toLowerCase() === "b") {
         if (!readOnly) finishActivity("B");
-      } else if (event.key.toLowerCase() === "x") {
-        if (!readOnly) finishExclusion();
-      } else if (event.key.toLowerCase() === "t") {
-        if (!readOnly && onRangeSelect) {
-          const bounds = selectionBounds();
-          if (bounds) onRangeSelect(bounds[0], bounds[1]);
-        }
       } else if (event.key === "ArrowLeft") {
         seekRelative(-1);
       } else if (event.key === "ArrowRight") {
@@ -219,8 +239,6 @@ export default function WaveformEditor({
         seekRelative(-1 / frameRate);
       } else if (event.key === ".") {
         seekRelative(1 / frameRate);
-      } else if (event.key.toLowerCase() === "l") {
-        setLoopPoint();
       }
     };
     window.addEventListener("keydown", keys);
@@ -286,22 +304,6 @@ export default function WaveformEditor({
     onChange({ ...annotationRef.current, activities: [...annotationRef.current.activities, region] });
   }
 
-  function finishExclusion() {
-    const bounds = selectionBounds();
-    if (!bounds) return;
-    const region: ExclusionRegion = {
-      id: sampleId("exclude"),
-      kind: "unusable",
-      start_sample: bounds[0],
-      end_sample: bounds[1],
-      note: "",
-    };
-    onChange({
-      ...annotationRef.current,
-      exclusions: [...annotationRef.current.exclusions, region],
-    });
-  }
-
   function removeSelected(id: string) {
     onChange({
       ...annotationRef.current,
@@ -317,20 +319,6 @@ export default function WaveformEditor({
         item.id === id ? { ...item, ...patch } : item,
       ),
     });
-  }
-
-  function setLoopPoint() {
-    const time = wave.current?.getCurrentTime() ?? current;
-    if (loopAnchor === null) {
-      setLoopAnchor(time);
-      return;
-    }
-    const bounds: [number, number] = [
-      Math.min(loopAnchor, time),
-      Math.max(loopAnchor, time),
-    ];
-    setLoopAnchor(null);
-    if (bounds[1] - bounds[0] >= 0.05) setLoopRange(bounds);
   }
 
   function seekRelative(delta: number) {
@@ -364,7 +352,7 @@ export default function WaveformEditor({
         <div ref={container} aria-label="Editable source waveform" />
         {anchor !== null && (
           <div className="selection-hint">
-            Selection starts at {anchor.toFixed(2)}s — seek and choose A, B, or Exclude
+            Selection starts at {anchor.toFixed(2)}s — seek, then choose A or B
           </div>
         )}
       </div>
@@ -396,9 +384,6 @@ export default function WaveformEditor({
             onChange={(event) => setZoom(Number(event.target.value))}
           />
         </label>
-        <button className={loopRange ? "active" : ""} onClick={setLoopPoint}>
-          {loopAnchor === null ? "Set loop start" : "Finish loop"}
-        </button>
         {loopRange && <button onClick={() => setLoopRange(null)}>Clear loop</button>}
       </div>
       {!readOnly && (
@@ -406,18 +391,7 @@ export default function WaveformEditor({
           <button onClick={beginSelection}>Set selection start [</button>
           <button className="speaker-a" onClick={() => finishActivity("A")}>Finish as A</button>
           <button className="speaker-b" onClick={() => finishActivity("B")}>Finish as B</button>
-          <button className="danger-soft" onClick={finishExclusion}>Finish as Exclude</button>
-          {onRangeSelect && (
-            <button
-              onClick={() => {
-                const bounds = selectionBounds();
-                if (bounds) onRangeSelect(bounds[0], bounds[1]);
-              }}
-            >
-              Finish as transcript segment
-            </button>
-          )}
-          <span className="shortcut-note">Shortcuts: [ then A / B / X / T · arrows seek · ,/. frame-step · L sets loop · space plays</span>
+          <span className="shortcut-note">Shortcuts: [ then A / B · arrows seek · ,/. frame-step · space plays</span>
         </div>
       )}
       <div className="lane-grid">
@@ -435,8 +409,21 @@ export default function WaveformEditor({
                       left: `${(item.start_sample / durationSamples) * 100}%`,
                       width: `${((item.end_sample - item.start_sample) / durationSamples) * 100}%`,
                     }}
-                    onClick={() => onRegionClick?.(item.id)}
-                    onDoubleClick={() => !readOnly && removeSelected(item.id)}
+                    onClick={(event) => {
+                      // The lane is a miniature of the whole source, so the click
+                      // position maps straight onto a sample. Seeking there keeps
+                      // the player, the playhead and the transcript in step.
+                      const rect = event.currentTarget.parentElement!.getBoundingClientRect();
+                      const ratio = rect.width > 0
+                        ? (event.clientX - rect.left) / rect.width
+                        : 0;
+                      const at = Math.round(
+                        Math.max(0, Math.min(1, ratio)) * durationSamples,
+                      );
+                      wave.current?.setTime(at / SAMPLE_RATE);
+                      onRegionClick?.(item.id, at);
+                    }}
+                    onDoubleClick={() => !readOnly && onRegionDelete?.(item.id)}
                     title={
                       `${seconds(item.start_sample)}–${seconds(item.end_sample)}s`
                       + (readOnly ? "" : " · double-click to remove")

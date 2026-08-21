@@ -10,19 +10,10 @@ import type {
 export const SAMPLE_RATE = 24_000;
 
 /**
- * Flags the GPU produces and the reviewer may add or remove. Flags are editable
- * metadata only: they never mute audio, start processing, or gate approval.
+ * Renders a GPU quality flag for display. Flags are read-only information from
+ * the pipeline: nothing in the review screen adds or removes them, and they
+ * never mute audio, start processing, or gate approval.
  */
-export const SUPPORTED_QUALITY_FLAGS = [
-  "abnormally_high_word_rate",
-  "abnormally_low_word_rate",
-  "decode_disagreement",
-  "low_average_log_probability",
-  "overlapping_speech",
-  "repeated_ngram",
-  "suspicious_character_sequence",
-] as const;
-
 export function flagLabel(flag: string): string {
   return flag.replaceAll("_", " ");
 }
@@ -165,23 +156,6 @@ export function updateSegment(
   return moved
     ? withSyncedTranscript(annotation, transcript, [before], [after])
     : withTranscript(annotation, transcript);
-}
-
-export function toggleFlag(
-  annotation: Annotation,
-  id: string,
-  flag: string,
-): Annotation {
-  return withTranscript(
-    annotation,
-    annotation.transcript.map((item) => {
-      if (item.id !== id) return item;
-      const flags = item.quality_flags.includes(flag)
-        ? item.quality_flags.filter((value) => value !== flag)
-        : [...item.quality_flags, flag];
-      return { ...item, quality_flags: flags };
-    }),
-  );
 }
 
 export function newSegment(
@@ -419,12 +393,22 @@ export function splitSegment(
 }
 
 export type JoinResult =
-  | { ok: true; annotation: Annotation; id: string }
+  | {
+      ok: true;
+      annotation: Annotation;
+      id: string;
+      /** Set when the two sides had different speakers and one had to win. */
+      absorbedSpeaker: Speaker | null;
+    }
   | { ok: false; reason: string };
 
 /**
- * Joins two same-speaker segments using union bounds and chronological text
- * order. Cross-speaker joins fail safely and change nothing.
+ * Joins two segments using union bounds and chronological text order.
+ *
+ * The earlier segment's speaker wins. Diarisation nearly always alternates
+ * speakers between neighbours, so refusing a cross-speaker join would leave the
+ * action permanently unavailable on real material; instead the caller is told
+ * which speaker was absorbed so it can say so.
  */
 export function joinSegments(
   annotation: Annotation,
@@ -435,21 +419,22 @@ export function joinSegments(
   const right = annotation.transcript.find((item) => item.id === secondId);
   if (!left || !right) return { ok: false, reason: "Both segments must still exist." };
   if (left.id === right.id) return { ok: false, reason: "Choose two different segments." };
-  if (left.speaker !== right.speaker) {
-    return { ok: false, reason: "Only segments with the same speaker can be joined." };
-  }
   const ordered = chronological([left, right]);
+  const speaker = (ordered[0].speaker || "A") as Speaker;
+  const absorbed = ordered[1].speaker && ordered[1].speaker !== speaker
+    ? (ordered[1].speaker as Speaker)
+    : null;
   const merged = newSegment(
     Math.min(left.start_sample, right.start_sample),
     Math.max(left.end_sample, right.end_sample),
-    (left.speaker || "A") as Speaker,
+    speaker,
     ordered.map((item) => item.text.trim()).filter(Boolean).join(" "),
   );
   merged.model_text = ordered
     .map((item) => item.model_text.trim())
     .filter(Boolean)
     .join(" ");
-  merged.model_speaker = left.model_speaker ?? right.model_speaker ?? null;
+  merged.model_speaker = ordered[0].model_speaker ?? ordered[1].model_speaker ?? null;
   merged.quality_flags = Array.from(
     new Set([...left.quality_flags, ...right.quality_flags]),
   );
@@ -468,6 +453,7 @@ export function joinSegments(
       [merged],
     ),
     id: merged.id,
+    absorbedSpeaker: absorbed,
   };
 }
 
@@ -495,4 +481,360 @@ export function boundsError(
     return "End must stay inside the source.";
   }
   return null;
+}
+
+/** One speaker-lane rectangle a segment covers, clipped to that segment. */
+export type SegmentTurn = { start_sample: number; end_sample: number };
+
+/**
+ * The speaker-lane rectangles a segment covers, clipped to it and merged where
+ * they overlap.
+ *
+ * The timeline can show one speaker talking across several rectangles while the
+ * transcript still holds a single segment spanning all of them. These are the
+ * turns that segment would divide into.
+ */
+export function turnsForSegment(
+  activities: ActivityRegion[],
+  segment: TranscriptUtterance,
+): SegmentTurn[] {
+  const speaker = segment.speaker || "A";
+  const clipped = activities
+    .filter((region) => region.speaker === speaker)
+    .map((region) => ({
+      start_sample: Math.max(region.start_sample, segment.start_sample),
+      end_sample: Math.min(region.end_sample, segment.end_sample),
+    }))
+    .filter((region) => region.end_sample > region.start_sample)
+    .sort(
+      (left, right) =>
+        left.start_sample - right.start_sample || left.end_sample - right.end_sample,
+    );
+
+  // Rectangles that overlap each other would claim the same words twice, so
+  // they count as one turn. Rectangles that merely touch stay separate: the
+  // timeline draws them as two, so they divide into two.
+  const merged: SegmentTurn[] = [];
+  for (const region of clipped) {
+    const last = merged.at(-1);
+    if (last && region.start_sample < last.end_sample) {
+      last.end_sample = Math.max(last.end_sample, region.end_sample);
+      continue;
+    }
+    merged.push({ ...region });
+  }
+  return merged;
+}
+
+/**
+ * Places each aligned word on the turn it was spoken in, keeping spoken order.
+ *
+ * Overlap decides the owner. A word falling in the silence between two turns has
+ * negative overlap with all of them, and the largest of those is the nearest
+ * turn, so the word joins its closest neighbour instead of being dropped.
+ */
+function wordsByTurn(words: AlignedWord[], turns: SegmentTurn[]): AlignedWord[][] {
+  const buckets: AlignedWord[][] = turns.map(() => []);
+  for (const word of words) {
+    const start = wordStartSample(word)!;
+    const end = wordEndSample(word)!;
+    let best = 0;
+    let bestOverlap = Number.NEGATIVE_INFINITY;
+    turns.forEach((turn, index) => {
+      const shared =
+        Math.min(turn.end_sample, end) - Math.max(turn.start_sample, start);
+      if (shared > bestOverlap) {
+        bestOverlap = shared;
+        best = index;
+      }
+    });
+    buckets[best].push(word);
+  }
+  return buckets;
+}
+
+export type TurnSplitResult =
+  | { ok: true; annotation: Annotation; ids: string[] }
+  | { ok: false; reason: string };
+
+/**
+ * Divides one segment into a segment per speaker-lane rectangle it covers, with
+ * the word timings deciding which text lands on each turn.
+ *
+ * The lanes are the input here rather than the result, so they are left exactly
+ * as they were: afterwards every rectangle carries its own transcript segment,
+ * and the silence between rectangles carries none.
+ */
+export function splitSegmentByTurns(
+  annotation: Annotation,
+  id: string,
+): TurnSplitResult {
+  const segment = annotation.transcript.find((item) => item.id === id);
+  if (!segment) return { ok: false, reason: "That segment no longer exists." };
+
+  const turns = turnsForSegment(annotation.activities, segment);
+  if (turns.length < 2) {
+    return {
+      ok: false,
+      reason:
+        "This segment sits on a single speaker turn, so there is nothing to divide"
+        + " it at.",
+    };
+  }
+
+  const words = wordsForSegment(
+    annotation.aligned_words,
+    segment.start_sample,
+    segment.end_sample,
+  );
+  if (!words.length) {
+    return {
+      ok: false,
+      reason:
+        "This segment has no word timings, so its text cannot be shared out across"
+        + " the turns. Split it by hand instead.",
+    };
+  }
+
+  const buckets = wordsByTurn(words, turns);
+  const speaker = (segment.speaker || "A") as Speaker;
+  const parts = turns.map((turn, index) => {
+    const part = newSegment(
+      turn.start_sample,
+      turn.end_sample,
+      speaker,
+      joinWords(buckets[index]),
+    );
+    // Every part keeps the original flags; the reviewer resolves them per turn.
+    part.quality_flags = [...segment.quality_flags];
+    part.model_speaker = segment.model_speaker ?? null;
+    return part;
+  });
+  parts[0].model_text = segment.model_text;
+
+  return {
+    ok: true,
+    annotation: withTranscript(annotation, [
+      ...annotation.transcript.filter((item) => item.id !== id),
+      ...parts,
+    ]),
+    ids: parts.map((part) => part.id),
+  };
+}
+
+/** A stretch of a segment where the other speaker is also active. */
+export type OverlapWindow = {
+  start_sample: number;
+  end_sample: number;
+  /** The speaker talking over the segment, so the duplicate is assigned to them. */
+  speaker: Speaker;
+};
+
+function mergeRanges(ranges: SegmentTurn[]): SegmentTurn[] {
+  const sorted = [...ranges].sort(
+    (left, right) =>
+      left.start_sample - right.start_sample || left.end_sample - right.end_sample,
+  );
+  const merged: SegmentTurn[] = [];
+  for (const range of sorted) {
+    const last = merged.at(-1);
+    if (last && range.start_sample <= last.end_sample) {
+      last.end_sample = Math.max(last.end_sample, range.end_sample);
+      continue;
+    }
+    merged.push({ ...range });
+  }
+  return merged;
+}
+
+/**
+ * Stretches of a segment where the timeline also shows the other speaker.
+ *
+ * Diarisation gives an overlapped stretch to whichever speaker dominates, so the
+ * transcript ends up with one segment for it while the lanes clearly show two
+ * people talking. These are the windows the quieter speaker is missing.
+ *
+ * A window already carrying a segment for that speaker is left out, so asking
+ * twice adds nothing the second time.
+ */
+export function overlapsForSegment(
+  annotation: Annotation,
+  segment: TranscriptUtterance,
+): OverlapWindow[] {
+  const speaker = segment.speaker || "A";
+  const other: Speaker = speaker === "A" ? "B" : "A";
+  const windows = mergeRanges(
+    annotation.activities
+      .filter((region) => region.speaker === other)
+      .map((region) => ({
+        start_sample: Math.max(region.start_sample, segment.start_sample),
+        end_sample: Math.min(region.end_sample, segment.end_sample),
+      }))
+      .filter((region) => region.end_sample > region.start_sample),
+  );
+  return windows
+    .filter(
+      (window) =>
+        !annotation.transcript.some(
+          (item) =>
+            (item.speaker || "A") === other
+            && item.start_sample < window.end_sample
+            && item.end_sample > window.start_sample,
+        ),
+    )
+    .map((window) => ({ ...window, speaker: other }));
+}
+
+/** Every overlap window across the whole transcript, in time order. */
+export function overlapsForAnnotation(
+  annotation: Annotation,
+): { segment: TranscriptUtterance; windows: OverlapWindow[] }[] {
+  return chronological(annotation.transcript)
+    .map((segment) => ({ segment, windows: overlapsForSegment(annotation, segment) }))
+    .filter((entry) => entry.windows.length > 0);
+}
+
+function overlapSegment(
+  annotation: Annotation,
+  source: TranscriptUtterance,
+  window: OverlapWindow,
+): TranscriptUtterance {
+  const words = wordsForSegment(
+    annotation.aligned_words,
+    window.start_sample,
+    window.end_sample,
+  );
+  const text = joinWords(words);
+  const part = newSegment(
+    window.start_sample,
+    window.end_sample,
+    window.speaker,
+    text,
+  );
+  part.model_text = text;
+  // The model gave these words to the dominant speaker, so it never assigned
+  // this segment: leaving model_speaker unset keeps that honest.
+  part.model_speaker = null;
+  part.alignment_status = words.length ? "aligned" : "not_run";
+  part.quality_flags = Array.from(
+    new Set([...source.quality_flags, "overlapping_speech"]),
+  );
+  return part;
+}
+
+/**
+ * Gives the quieter speaker their own segment over each overlapped stretch.
+ *
+ * The original segment is left exactly as it is, words and all: the overlapped
+ * words are copied, not moved, because both people really were talking. Saving
+ * then keeps both — the full range under its original speaker, and the short
+ * overlapped range under the other one.
+ *
+ * The lanes already show the overlap, so they are not touched.
+ */
+export function addOverlapSegments(
+  annotation: Annotation,
+  id: string,
+): { annotation: Annotation; ids: string[] } {
+  const segment = annotation.transcript.find((item) => item.id === id);
+  if (!segment) return { annotation, ids: [] };
+  const windows = overlapsForSegment(annotation, segment);
+  if (!windows.length) return { annotation, ids: [] };
+  const parts = windows.map((window) => overlapSegment(annotation, segment, window));
+  return {
+    annotation: withTranscript(annotation, [...annotation.transcript, ...parts]),
+    ids: parts.map((part) => part.id),
+  };
+}
+
+/** Runs {@link addOverlapSegments} over every segment that has an overlap. */
+export function addAllOverlapSegments(
+  annotation: Annotation,
+): { annotation: Annotation; ids: string[] } {
+  let current = annotation;
+  const ids: string[] = [];
+  // Recomputed per segment, so a window covered by a part just added is skipped.
+  for (const segment of chronological(annotation.transcript)) {
+    const result = addOverlapSegments(current, segment.id);
+    current = result.annotation;
+    ids.push(...result.ids);
+  }
+  return { annotation: current, ids };
+}
+
+/** A segment counts as this region's own when the region covers ~all of it. */
+const OWNED_COVERAGE = 0.99;
+
+/**
+ * The transcript segments belonging to one speaker-lane rectangle.
+ *
+ * A rectangle owns a segment when they share a speaker and the rectangle covers
+ * essentially the whole segment. A long segment spanning several rectangles is
+ * owned by none of them, so removing one rectangle of an un-split run leaves the
+ * transcript alone. The small tolerance absorbs a hand-resized region drifting a
+ * few samples off the segment it was cut from.
+ */
+export function segmentsForActivity(
+  transcript: TranscriptUtterance[],
+  region: ActivityRegion,
+): TranscriptUtterance[] {
+  return chronological(
+    transcript.filter((segment) => {
+      if ((segment.speaker || "A") !== region.speaker) return false;
+      const duration = segment.end_sample - segment.start_sample;
+      if (duration <= 0) return false;
+      const shared = overlap(region, segment);
+      return shared / duration >= OWNED_COVERAGE;
+    }),
+  );
+}
+
+/**
+ * Removes a speaker-lane rectangle, and with it any transcript segment that
+ * rectangle owned. Segments spanning other rectangles are left in place.
+ */
+export function deleteActivity(
+  annotation: Annotation,
+  regionId: string,
+): { annotation: Annotation; removedSegments: TranscriptUtterance[] } {
+  const region = annotation.activities.find((item) => item.id === regionId);
+  if (!region) return { annotation, removedSegments: [] };
+  const owned = segmentsForActivity(annotation.transcript, region);
+  const doomed = new Set(owned.map((segment) => segment.id));
+  return {
+    annotation: {
+      ...annotation,
+      activities: annotation.activities.filter((item) => item.id !== regionId),
+      transcript: chronological(
+        annotation.transcript.filter((segment) => !doomed.has(segment.id)),
+      ),
+    },
+    removedSegments: owned,
+  };
+}
+
+/**
+ * Divides every segment that sits across more than one speaker-lane rectangle,
+ * so each rectangle carries its own transcription.
+ *
+ * Applied once when a source is opened rather than on every edit: re-running it
+ * on the result is a no-op, but doing it continuously would undo a join the
+ * reviewer made on purpose. Segments with no word timings are left alone, since
+ * there is nothing to divide their text by.
+ */
+export function splitAllByTurns(
+  annotation: Annotation,
+): { annotation: Annotation; dividedSegments: number; addedSegments: number } {
+  let current = annotation;
+  let dividedSegments = 0;
+  let addedSegments = 0;
+  // Iterating the original ids keeps the loop off the segments it creates.
+  for (const segment of chronological(annotation.transcript)) {
+    const result = splitSegmentByTurns(current, segment.id);
+    if (!result.ok) continue;
+    current = result.annotation;
+    dividedSegments += 1;
+    addedSegments += result.ids.length - 1;
+  }
+  return { annotation: current, dividedSegments, addedSegments };
 }

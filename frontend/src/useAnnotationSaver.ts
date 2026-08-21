@@ -29,7 +29,18 @@ export function readDraft(
 ): Annotation | null {
   try {
     const raw = window.localStorage.getItem(draftKey(userId, sourceId, baseVersion));
-    return raw ? (JSON.parse(raw) as Annotation) : null;
+    if (!raw) return null;
+    const draft = JSON.parse(raw) as Annotation;
+    // A draft written by an older build could be missing a list the review
+    // screen reads, which would throw while rendering. Ignoring it costs the
+    // user one recovery offer; installing it would blank the screen.
+    const lists = [
+      draft?.transcript,
+      draft?.activities,
+      draft?.exclusions,
+      draft?.aligned_words,
+    ];
+    return lists.every(Array.isArray) ? draft : null;
   } catch {
     return null;
   }
@@ -135,7 +146,16 @@ export function useAnnotationSaver({
         if (reason instanceof ApiError && reason.status === 409) {
           // Never overwrite the server and never discard local content.
           try {
-            const server = await api<Annotation>(`/api/sources/${sourceId}/annotations`);
+            // This endpoint answers with an envelope, not a bare annotation.
+            // Reading it as one left `server.transcript` undefined and the
+            // conflict dialog threw while rendering it.
+            const envelope = await api<{ annotation: Annotation }>(
+              `/api/sources/${sourceId}/annotations`,
+            );
+            const server = envelope?.annotation;
+            if (!server || !Array.isArray(server.transcript)) {
+              throw new Error("The server sent an annotation this app cannot read.");
+            }
             callbacks.current.onConflict({ local: value, server });
           } catch {
             callbacks.current.onError(

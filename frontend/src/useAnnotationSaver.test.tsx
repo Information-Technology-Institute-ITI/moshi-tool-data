@@ -197,12 +197,41 @@ describe("recoverable local drafts", () => {
   });
 });
 
+describe("draft recovery is defensive", () => {
+  it("ignores a stored draft that is missing a list the screen reads", () => {
+    // A draft from an older build could lack a field; installing it would throw
+    // while rendering and blank the screen, so it is discarded instead.
+    window.localStorage.setItem(
+      "moshi.draft.user_a.source_1.v3",
+      JSON.stringify({ source_id: "source_1", version: 3, note: "old shape" }),
+    );
+    expect(readDraft("user_a", "source_1", 3)).toBeNull();
+  });
+
+  it("returns a complete draft unchanged", () => {
+    window.localStorage.setItem(
+      "moshi.draft.user_a.source_1.v3",
+      JSON.stringify(annotation(3, "kept")),
+    );
+    expect(readDraft("user_a", "source_1", 3)?.note).toBe("kept");
+  });
+});
+
 describe("version conflicts", () => {
+  /**
+   * What GET /api/sources/{id}/annotations really answers with. The previous
+   * test mocked a bare annotation, which is not the server's contract, so a
+   * mismatch here went unnoticed until the conflict dialog crashed on it.
+   */
+  function envelope(value: Annotation) {
+    return { annotation: value, revisions: [{ version: value.version }] };
+  }
+
   it("reports both copies on 409 and creates no revision", async () => {
     const server = annotation(9, "server copy");
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       if (init?.method === "PUT") return response({ detail: "stale" }, 409);
-      return response(server);
+      return response(envelope(server));
     });
     vi.stubGlobal("fetch", fetchMock);
     await mount();
@@ -216,6 +245,44 @@ describe("version conflicts", () => {
     expect(conflicts[0].server.version).toBe(9);
     // Nothing was reported as saved, and the local copy survives.
     expect(saved).toEqual([]);
+    expect(readDraft("user_a", "source_1", 3)?.note).toBe("my work");
+  });
+
+  it("unwraps the server envelope so the conflict carries a usable annotation", async () => {
+    const server = annotation(9, "server copy");
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "PUT") return response({ detail: "stale" }, 409);
+      return response(envelope(server));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.schedule(annotation(3, "my work")));
+    await act(async () => harness.saveNow());
+    await settle();
+
+    // Regression: this arrived as {annotation, revisions}, so every field the
+    // conflict dialog reads was undefined and reading .length threw.
+    expect(Array.isArray(conflicts[0].server.transcript)).toBe(true);
+    expect(conflicts[0].server.source_id).toBe("source_1");
+    expect(conflicts[0].server).not.toHaveProperty("revisions");
+  });
+
+  it("reports an error rather than a broken conflict when the shape is wrong", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "PUT") return response({ detail: "stale" }, 409);
+      return response({ unexpected: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.schedule(annotation(3, "my work")));
+    await act(async () => harness.saveNow());
+    await settle();
+
+    expect(conflicts).toEqual([]);
+    expect(errors[0]).toContain("could not be loaded");
+    // The local copy is still recoverable.
     expect(readDraft("user_a", "source_1", 3)?.note).toBe("my work");
   });
 });

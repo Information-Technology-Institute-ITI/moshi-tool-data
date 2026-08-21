@@ -1,11 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { seconds } from "../api";
 import {
-  SUPPORTED_QUALITY_FLAGS,
   boundsError,
   chronological,
   flagLabel,
   neighbourAfter,
+  overlapsForAnnotation,
+  overlapsForSegment,
   resolveSplitSample,
   updateSegment,
   wordsForSegment,
@@ -34,6 +35,8 @@ type Props = {
   onPlay: (segment: TranscriptUtterance, loop: boolean) => void;
   onChange: (next: Annotation) => void;
   onSplit: (id: string, atSample: number, textOffset: number) => void;
+  onAddOverlap: (id: string) => void;
+  onAddAllOverlaps: () => void;
   onJoin: (firstId: string, secondId: string) => void;
   onDelete: (id: string) => void;
   onAdd: () => void;
@@ -51,6 +54,8 @@ export default function TranscriptPanel({
   onPlay,
   onChange,
   onSplit,
+  onAddOverlap,
+  onAddAllOverlaps,
   onJoin,
   onDelete,
   onAdd,
@@ -62,6 +67,22 @@ export default function TranscriptPanel({
     [ordered, filteredIds],
   );
   const selected = ordered.find((item) => item.id === selectedId) || null;
+  // Stepping follows the visible list, so a time filter does not jump the user
+  // to an entry that is not on screen.
+  const position = selected ? visible.findIndex((item) => item.id === selected.id) : -1;
+  const previousEntry = position > 0 ? visible[position - 1] : null;
+  const nextEntry =
+    position >= 0 && position + 1 < visible.length ? visible[position + 1] : null;
+  // Stretches where the lanes show two speakers but the transcript has only one
+  // segment. Each one is a segment the quieter speaker is still missing.
+  const missingOverlaps = useMemo(
+    () => overlapsForAnnotation(annotation),
+    [annotation],
+  );
+  const missingOverlapCount = missingOverlaps.reduce(
+    (total, entry) => total + entry.windows.length,
+    0,
+  );
 
   return (
     <section className="transcript-panel">
@@ -74,6 +95,19 @@ export default function TranscriptPanel({
           {filteredIds && (
             <button type="button" onClick={onClearFilter}>
               Clear time filter ({visible.length})
+            </button>
+          )}
+          {!readOnly && missingOverlapCount > 0 && (
+            <button
+              type="button"
+              title={
+                `The timeline shows both speakers over ${missingOverlapCount} stretch`
+                + `${missingOverlapCount === 1 ? "" : "es"} that only one segment covers.`
+                + " This gives the other speaker their own segment for each."
+              }
+              onClick={onAddAllOverlaps}
+            >
+              Add overlap segments ({missingOverlapCount})
             </button>
           )}
           {!readOnly && (
@@ -133,6 +167,14 @@ export default function TranscriptPanel({
         <SegmentInspector
           key={selected.id}
           segment={selected}
+          position={position}
+          total={visible.length}
+          previousEntry={previousEntry}
+          nextEntry={nextEntry}
+          onStep={(entry) => {
+            onSelect(entry.id);
+            onPlay(entry, false);
+          }}
           annotation={annotation}
           durationSamples={durationSamples}
           playheadSample={playheadSample}
@@ -140,6 +182,7 @@ export default function TranscriptPanel({
           onPlay={onPlay}
           onChange={onChange}
           onSplit={onSplit}
+          onAddOverlap={onAddOverlap}
           onJoin={onJoin}
           onDelete={onDelete}
         />
@@ -150,6 +193,11 @@ export default function TranscriptPanel({
 
 function SegmentInspector({
   segment,
+  position,
+  total,
+  previousEntry,
+  nextEntry,
+  onStep,
   annotation,
   durationSamples,
   playheadSample,
@@ -157,10 +205,17 @@ function SegmentInspector({
   onPlay,
   onChange,
   onSplit,
+  onAddOverlap,
   onJoin,
   onDelete,
 }: {
   segment: TranscriptUtterance;
+  /** Zero-based place in the visible list, for the "3 of 12" readout. */
+  position: number;
+  total: number;
+  previousEntry: TranscriptUtterance | null;
+  nextEntry: TranscriptUtterance | null;
+  onStep: (entry: TranscriptUtterance) => void;
   annotation: Annotation;
   durationSamples: number;
   playheadSample: number;
@@ -168,6 +223,7 @@ function SegmentInspector({
   onPlay: (segment: TranscriptUtterance, loop: boolean) => void;
   onChange: (next: Annotation) => void;
   onSplit: (id: string, atSample: number, textOffset: number) => void;
+  onAddOverlap: (id: string) => void;
   onJoin: (firstId: string, secondId: string) => void;
   onDelete: (id: string) => void;
 }) {
@@ -175,9 +231,30 @@ function SegmentInspector({
   const [end, setEnd] = useState(toSeconds(segment.end_sample));
   const [caret, setCaret] = useState(segment.text.length);
   const next = neighbourAfter(annotation.transcript, segment.id);
-  const canJoin = !!next && next.speaker === segment.speaker;
-  const splitInside =
+  const canJoin = !!next;
+
+  // The split point is its own value rather than the live playhead. Selecting a
+  // segment parks the playhead exactly on its start, and clicking the waveform
+  // lands on a speaker region, so on real material the playhead is almost never
+  // strictly inside the segment being edited and Split stayed greyed out.
+  // It still follows the playhead while that is inside the segment, so playing
+  // to a point and splitting there works as before.
+  const midpoint = Math.round((segment.start_sample + segment.end_sample) / 2);
+  const [splitPoint, setSplitPoint] = useState(toSeconds(midpoint));
+  const [splitEdited, setSplitEdited] = useState(false);
+  const editedRef = useRef(splitEdited);
+  editedRef.current = splitEdited;
+  const playheadInside =
     playheadSample > segment.start_sample && playheadSample < segment.end_sample;
+  useEffect(() => {
+    if (playheadInside && !editedRef.current) setSplitPoint(toSeconds(playheadSample));
+  }, [playheadSample, playheadInside]);
+
+  const requestedSample = fromSeconds(splitPoint);
+  const splitInside =
+    Number.isFinite(requestedSample)
+    && requestedSample > segment.start_sample
+    && requestedSample < segment.end_sample;
 
   // Word timings decide where a split can land, so show the user the point the
   // split will actually use before they commit to it.
@@ -191,13 +268,17 @@ function SegmentInspector({
         annotation.aligned_words,
         segment.start_sample,
         segment.end_sample,
-        playheadSample,
+        requestedSample,
       )
     : null;
   const splitWouldEmpty =
     !!resolved
     && (resolved.sample <= segment.start_sample || resolved.sample >= segment.end_sample);
   const canSplit = splitInside && !splitWouldEmpty;
+
+  // Where the other speaker talks over this segment without a segment of their own.
+  const overlaps = overlapsForSegment(annotation, segment);
+  const otherSpeaker = (segment.speaker || "A") === "A" ? "B" : "A";
 
   // Routed through updateSegment so a speaker or timing change also moves the
   // speaker lanes on the timeline.
@@ -220,8 +301,36 @@ function SegmentInspector({
   return (
     <div className="segment-inspector card">
       <header>
-        <span className="eyebrow">Selected segment</span>
+        <span className="eyebrow">
+          Selected segment{position >= 0 ? ` · ${position + 1} of ${total}` : ""}
+        </span>
         <div className="inspector-play">
+          <button
+            type="button"
+            className="step"
+            disabled={!previousEntry}
+            title={
+              previousEntry
+                ? `Go to segment ${position} · ${toSeconds(previousEntry.start_sample)}s`
+                : "This is the first segment"
+            }
+            onClick={() => previousEntry && onStep(previousEntry)}
+          >
+            ‹ Previous
+          </button>
+          <button
+            type="button"
+            className="step"
+            disabled={!nextEntry}
+            title={
+              nextEntry
+                ? `Go to segment ${position + 2} · ${toSeconds(nextEntry.start_sample)}s`
+                : "This is the last segment"
+            }
+            onClick={() => nextEntry && onStep(nextEntry)}
+          >
+            Next ›
+          </button>
           <button type="button" onClick={() => onPlay(segment, false)}>Play</button>
           <button type="button" onClick={() => onPlay(segment, true)}>Loop</button>
         </div>
@@ -290,28 +399,23 @@ function SegmentInspector({
             onBlur={commitBounds}
           />
         </label>
-      </div>
-
-      <fieldset className="flag-editor">
-        <legend>Quality flags</legend>
-        {SUPPORTED_QUALITY_FLAGS.map((flag) => (
-          <label className="checkbox" key={flag}>
+        {!readOnly && (
+          <label className="split-point">
+            Split at (s)
             <input
-              type="checkbox"
-              checked={segment.quality_flags.includes(flag)}
-              disabled={readOnly}
-              onChange={() =>
-                patch({
-                  quality_flags: segment.quality_flags.includes(flag)
-                    ? segment.quality_flags.filter((value) => value !== flag)
-                    : [...segment.quality_flags, flag],
-                })
-              }
+              type="number"
+              step="0.01"
+              min={toSeconds(segment.start_sample)}
+              max={toSeconds(segment.end_sample)}
+              value={splitPoint}
+              onChange={(event) => {
+                setSplitEdited(true);
+                setSplitPoint(event.target.value);
+              }}
             />
-            {flagLabel(flag)}
           </label>
-        ))}
-      </fieldset>
+        )}
+      </div>
 
       {!readOnly && (
         <div className="inspector-actions">
@@ -320,26 +424,42 @@ function SegmentInspector({
             disabled={!canSplit}
             title={
               !splitInside
-                ? "Move the playhead inside this segment to split it"
+                ? `The split point must fall between ${toSeconds(segment.start_sample)}s`
+                  + ` and ${toSeconds(segment.end_sample)}s`
                 : splitWouldEmpty
                   ? "The word here runs to the end of the segment, so nothing would follow it"
                   : resolved?.snappedFrom !== null && resolved
                     ? `Splits at ${toSeconds(resolved.sample)}s, after the word being spoken`
                     : `Splits at ${toSeconds(resolved!.sample)}s`
             }
-            onClick={() => onSplit(segment.id, playheadSample, caret)}
+            onClick={() => onSplit(segment.id, requestedSample, caret)}
           >
             Split here
           </button>
+          {overlaps.length > 0 && (
+            <button
+              type="button"
+              title={
+                `Speaker ${otherSpeaker} also talks over this segment. This adds a`
+                + ` segment for them across each overlapped stretch, and leaves this`
+                + ` one exactly as it is.`
+              }
+              onClick={() => onAddOverlap(segment.id)}
+            >
+              Add speaker {otherSpeaker} overlap ({overlaps.length})
+            </button>
+          )}
           <button
             type="button"
             disabled={!canJoin}
             title={
-              next
-                ? canJoin
-                  ? "Join with the next segment"
-                  : "Only segments with the same speaker can be joined"
-                : "There is no following segment"
+              !next
+                ? "There is no following segment"
+                : next.speaker === segment.speaker
+                  ? "Join with the next segment and run the two texts together"
+                  : `Join with the next segment. The merged segment keeps speaker`
+                    + ` ${segment.speaker || "A"} and takes speaker ${next.speaker}'s text`
+                    + " as well."
             }
             onClick={() => next && onJoin(segment.id, next.id)}
           >
@@ -358,6 +478,23 @@ function SegmentInspector({
         <p className="inspector-note split-hint">
           A word is still being spoken at {toSeconds(resolved.snappedFrom)}s, so the split
           moves to {toSeconds(resolved.sample)}s and keeps that word whole.
+        </p>
+      )}
+      {!readOnly && overlaps.length > 0 && (
+        <p className="inspector-note split-hint">
+          The timeline shows speaker {otherSpeaker} talking over this segment at{" "}
+          {overlaps
+            .map((window) => `${toSeconds(window.start_sample)}–${toSeconds(window.end_sample)}s`)
+            .join(", ")}
+          . Adding their overlap copies the words spoken there into a segment of their
+          own; this segment keeps all of its own text.
+        </p>
+      )}
+      {!readOnly && next && next.speaker !== segment.speaker && (
+        <p className="inspector-note">
+          The next segment is speaker {next.speaker}. Joining keeps speaker{" "}
+          {segment.speaker || "A"} for the merged segment and runs both texts together;
+          undo puts them back.
         </p>
       )}
       <p className="inspector-note">

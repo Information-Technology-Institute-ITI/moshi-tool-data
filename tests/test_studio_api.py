@@ -154,6 +154,80 @@ def test_annotation_save_clamps_small_model_overrun(tmp_path) -> None:
     assert annotation["transcript"][0]["end_sample"] == 48_000
 
 
+def test_annotation_save_keeps_both_speakers_over_an_overlap(tmp_path) -> None:
+    """Overlapped speech is saved twice: the full turn, and the short overlap.
+
+    Diarisation gives an overlapped stretch to whichever speaker dominates, so
+    the reviewer adds a segment for the other one on top of it. Saving must keep
+    both ranges rather than collapsing them into a single speaker.
+    """
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    service = app.state.studio
+    project = service.catalog.create_project(
+        "Overlap test", owner_user_id=service.catalog.ensure_local_admin()["id"]
+    )
+    original = service.paths.originals / "overlap.wav"
+    original.write_bytes(b"placeholder")
+    source = service.catalog.create_source(
+        project["id"],
+        "overlap.wav",
+        service.paths.relative(original),
+        "audio/wav",
+        "f" * 64,
+        len(b"placeholder"),
+    )
+    service.catalog.update_source(source["id"], duration_samples=30 * 24_000, status="ready")
+    payload = {
+        "expected_version": 0,
+        "annotation": {
+            "source_id": source["id"],
+            "activities": [
+                {
+                    "speaker": "A",
+                    "start_sample": 10 * 24_000,
+                    "end_sample": 20 * 24_000,
+                    "origin": "model",
+                },
+                {
+                    "speaker": "B",
+                    "start_sample": 16 * 24_000,
+                    "end_sample": 18 * 24_000,
+                    "origin": "model",
+                },
+            ],
+            "transcript": [
+                {
+                    "speaker": "A",
+                    "start_sample": 10 * 24_000,
+                    "end_sample": 20 * 24_000,
+                    "text": "واحد اتنين تلاتة",
+                },
+                {
+                    "speaker": "B",
+                    "start_sample": 16 * 24_000,
+                    "end_sample": 18 * 24_000,
+                    "text": "اتنين",
+                    "quality_flags": ["overlapping_speech"],
+                },
+            ],
+        },
+    }
+    with TestClient(app) as client:
+        response = client.put(f"/api/sources/{source['id']}/annotations", json=payload)
+        assert response.status_code == 200
+        reloaded = client.get(f"/api/sources/{source['id']}").json()["annotation"]
+
+    ranges = [
+        (item["speaker"], item["start_sample"], item["end_sample"])
+        for item in reloaded["transcript"]
+    ]
+    assert ("A", 10 * 24_000, 20 * 24_000) in ranges
+    assert ("B", 16 * 24_000, 18 * 24_000) in ranges
+    # The dominant speaker keeps every word; the overlap is a copy, not a move.
+    dominant = next(item for item in reloaded["transcript"] if item["speaker"] == "A")
+    assert dominant["text"] == "واحد اتنين تلاتة"
+
+
 def test_startup_repairs_legacy_annotation_past_source_end(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     paths = StudioPaths(workspace)

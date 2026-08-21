@@ -13,16 +13,22 @@ import {
   watchJob,
 } from "./api";
 import AuthScreen from "./components/AuthScreen";
+import ErrorBoundary from "./components/ErrorBoundary";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
 import TranscriptPanel from "./components/TranscriptPanel";
 import WaveformEditor, { type FocusRange } from "./components/WaveformEditor";
 import {
+  addAllOverlapSegments,
+  addOverlapSegments,
   addSegment,
+  deleteActivity,
   deleteSegment,
   intersecting,
   joinSegments,
+  segmentsForActivity,
+  splitAllByTurns,
   splitSegment,
 } from "./transcript";
 import {
@@ -66,6 +72,11 @@ function App() {
   const [error, setError] = useState("");
   const [page, setPage] = useState<"workspace" | "gpu">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
+  // The job watcher is a server-sent-event stream that outlives the render that
+  // started it. Reading the open screen from refs keeps it from acting on a
+  // dataset the user has already navigated away from.
+  const openSourceId = useRef<string | null>(null);
+  const openProjectId = useRef<string | null>(null);
   const isAdmin = authUser?.role === "admin";
 
   useEffect(() => {
@@ -175,19 +186,23 @@ function App() {
     stopWatching.current?.();
     stopWatching.current = watchJob(next.id, async (value) => {
       setJob(value);
-      if (value.status === "complete") {
-        setNotice(`${value.kind.replaceAll("_", " ")} complete`);
-        if (source) {
-          await openSource(source.id);
-          if (project) {
-            const refreshed = await run(() =>
-              api<ProjectDetail>(`/api/projects/${project.project.id}`),
-            );
-            if (refreshed) setProject(refreshed);
-          }
-        } else if (project) {
-          await openProject(project.project.id);
+      if (value.status !== "complete") return;
+      setNotice(`${value.kind.replaceAll("_", " ")} complete`);
+      // Refresh only what the user is actually looking at now. Reopening a
+      // source they had left used to drop them back into it with no project
+      // loaded behind it, which blanked the page.
+      const sourceId = openSourceId.current;
+      const projectId = openProjectId.current;
+      if (sourceId) {
+        await openSource(sourceId);
+        if (projectId) {
+          const refreshed = await run(() =>
+            api<ProjectDetail>(`/api/projects/${projectId}`),
+          );
+          if (refreshed) setProject(refreshed);
         }
+      } else if (projectId) {
+        await openProject(projectId);
       }
     });
   }
@@ -246,15 +261,18 @@ function App() {
     );
   }
 
+  openSourceId.current = source?.id ?? null;
+  openProjectId.current = project?.project.id ?? null;
+
   const view = page === "gpu" && isAdmin ? (
     <GpuStatusPage />
-  ) : source ? (
+  ) : source && project ? (
     <Studio
       detail={source}
-      project={project!}
+      project={project}
       user={authUser}
       onBack={() => setSource(null)}
-      onDeleted={() => openProject(project!.project.id)}
+      onDeleted={() => openProject(project.project.id)}
       onReload={() => openSource(source.id)}
       onJob={monitor}
       setNotice={setNotice}
@@ -329,7 +347,9 @@ function App() {
       {error && <div className="banner error" role="alert">{error}<button onClick={() => setError("")}>×</button></div>}
       {notice && <div className="banner success">{notice}<button onClick={() => setNotice("")}>×</button></div>}
       <JobProgress job={job} onRetry={retryJob} />
-      {view}
+      <ErrorBoundary onReset={returnToLibrary} resetLabel="Back to my datasets">
+        {view}
+      </ErrorBoundary>
     </main>
   );
 }
@@ -981,6 +1001,7 @@ function Studio({
   const [playhead, setPlayhead] = useState(0);
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [draftOffer, setDraftOffer] = useState<Annotation | null>(null);
+  const [regionToDelete, setRegionToDelete] = useState<string | null>(null);
   const focusNonce = useRef(0);
   const userId = user?.id || "local";
 
@@ -999,16 +1020,33 @@ function Studio({
   });
 
   useEffect(() => {
-    setAnnotation(detail.annotation);
+    // Each speaker rectangle on the timeline gets its own transcription. This
+    // runs when the source opens rather than on every edit, so a join the
+    // reviewer makes afterwards is not undone; it converges, because the result
+    // has nothing left spanning two rectangles.
+    const turned = readOnly
+      ? { annotation: detail.annotation, dividedSegments: 0, addedSegments: 0 }
+      : splitAllByTurns(detail.annotation);
+    setAnnotation(turned.annotation);
     setHistory([]);
     setFuture([]);
     setSelectedId(null);
     setFilteredIds(null);
     setConflict(null);
     saver.reset(detail.annotation);
+    if (turned.dividedSegments) {
+      saver.schedule(turned.annotation);
+      setNotice(
+        `${turned.dividedSegments} segment${turned.dividedSegments === 1 ? "" : "s"}`
+        + ` divided to match the speaker turns on the timeline, adding`
+        + ` ${turned.addedSegments} segment${turned.addedSegments === 1 ? "" : "s"}.`
+        + " Undo reverses it.",
+      );
+      setHistory([detail.annotation]);
+    }
     const draft = readDraft(userId, detail.id, detail.annotation.version);
     setDraftOffer(
-      draft && JSON.stringify(draft) !== JSON.stringify(detail.annotation) ? draft : null,
+      draft && JSON.stringify(draft) !== JSON.stringify(turned.annotation) ? draft : null,
     );
   }, [detail.id, detail.annotation.version]);
 
@@ -1052,7 +1090,7 @@ function Studio({
   }
 
   /** Clicking an A/B region focuses the transcript entries it intersects. */
-  function focusRegion(regionId: string) {
+  function focusRegion(regionId: string, atSample?: number) {
     const region = annotation.activities.find((item) => item.id === regionId);
     if (!region) return;
     const matches = intersecting(
@@ -1061,7 +1099,36 @@ function Studio({
       region.end_sample,
     );
     setFilteredIds(matches.map((item) => item.id));
-    if (matches.length) setSelectedId(matches[0].id);
+    // An overlap region sits on top of the dominant speaker's long segment, so
+    // prefer entries belonging to the region's own speaker.
+    const own = matches.filter((item) => (item.speaker || "A") === region.speaker);
+    const pool = own.length ? own : matches;
+    // One region routinely covers many segments, so select the one actually
+    // under the click rather than whichever comes first.
+    const under = atSample === undefined
+      ? undefined
+      : pool.find(
+          (item) => item.start_sample <= atSample && atSample < item.end_sample,
+        );
+    const best = under || pool[0];
+    if (best) setSelectedId(best.id);
+  }
+
+  /** Removes a speaker rectangle and any segment it owned, once confirmed. */
+  function confirmRegionDelete(regionId: string) {
+    const result = deleteActivity(annotation, regionId);
+    setRegionToDelete(null);
+    if (result.annotation === annotation) return;
+    edit(result.annotation);
+    if (result.removedSegments.some((item) => item.id === selectedId)) {
+      setSelectedId(null);
+    }
+    setNotice(
+      result.removedSegments.length
+        ? `Speaker region removed, along with ${result.removedSegments.length} transcript`
+          + ` segment${result.removedSegments.length === 1 ? "" : "s"}. Undo restores both.`
+        : "Speaker region removed. No transcript segment belonged to it.",
+    );
   }
 
   function addSegmentAt(startSample: number, endSample: number) {
@@ -1100,6 +1167,37 @@ function Studio({
     );
   }
 
+  /** Gives the quieter speaker their own segment over each overlapped stretch. */
+  function addOverlap(id: string) {
+    const result = addOverlapSegments(annotation, id);
+    if (!result.ids.length) {
+      setError("The other speaker already has a segment over every overlap here.");
+      return;
+    }
+    edit(result.annotation);
+    setSelectedId(result.ids[0]);
+    setNotice(
+      result.ids.length === 1
+        ? "Overlap segment added. The original segment is unchanged."
+        : `${result.ids.length} overlap segments added. The original segments are`
+          + " unchanged.",
+    );
+  }
+
+  function addAllOverlaps() {
+    const result = addAllOverlapSegments(annotation);
+    if (!result.ids.length) {
+      setError("Every overlap on the timeline already has a segment.");
+      return;
+    }
+    edit(result.annotation);
+    setSelectedId(result.ids[0]);
+    setNotice(
+      `${result.ids.length} overlap segment${result.ids.length === 1 ? "" : "s"} added.`
+      + " The original segments are unchanged.",
+    );
+  }
+
   function joinWith(firstId: string, secondId: string) {
     const result = joinSegments(annotation, firstId, secondId);
     if (!result.ok) {
@@ -1108,7 +1206,13 @@ function Studio({
     }
     edit(result.annotation);
     setSelectedId(result.id);
-    setNotice("Segments joined.");
+    setNotice(
+      result.absorbedSpeaker
+        ? `Segments joined. The merged segment keeps speaker ${
+          result.annotation.transcript.find((item) => item.id === result.id)?.speaker
+        } and now holds speaker ${result.absorbedSpeaker}'s text too.`
+        : "Segments joined.",
+    );
   }
 
   function removeSegment(id: string) {
@@ -1333,7 +1437,7 @@ function Studio({
           focusRange={focusRange}
           onTimeChange={setPlayhead}
           onRegionClick={focusRegion}
-          onRangeSelect={addSegmentAt}
+          onRegionDelete={setRegionToDelete}
           onChange={edit}
         />
 
@@ -1348,6 +1452,8 @@ function Studio({
           onPlay={playSegment}
           onChange={edit}
           onSplit={splitAt}
+          onAddOverlap={addOverlap}
+          onAddAllOverlaps={addAllOverlaps}
           onJoin={joinWith}
           onDelete={removeSegment}
           onAdd={addSegmentAtPlayhead}
@@ -1355,6 +1461,14 @@ function Studio({
         />
       </div>
 
+      {regionToDelete && (
+        <DeleteRegionDialog
+          annotation={annotation}
+          regionId={regionToDelete}
+          onCancel={() => setRegionToDelete(null)}
+          onConfirm={() => confirmRegionDelete(regionToDelete)}
+        />
+      )}
       {conflict && (
         <ConflictDialog
           conflict={conflict}
@@ -1385,6 +1499,77 @@ function Studio({
  * A stale save creates no revision. Both copies are preserved until the user
  * chooses; nothing is merged automatically and nothing is discarded silently.
  */
+/**
+ * Confirms removing a speaker rectangle, naming the transcript segments that go
+ * with it. A double-click used to delete silently, which was easy to do by
+ * accident and hard to notice.
+ */
+function DeleteRegionDialog({
+  annotation,
+  regionId,
+  onCancel,
+  onConfirm,
+}: {
+  annotation: Annotation;
+  regionId: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEscapeToClose(onCancel);
+  const region = annotation.activities.find((item) => item.id === regionId);
+  const owned = region ? segmentsForActivity(annotation.transcript, region) : [];
+  if (!region) return null;
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div
+        className="modal card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-region-title"
+      >
+        <h2 id="delete-region-title">
+          Remove speaker {region.speaker} from {seconds(region.start_sample)}–
+          {seconds(region.end_sample)}s?
+        </h2>
+        {owned.length ? (
+          <>
+            <p>
+              This region has {owned.length === 1 ? "its own transcript segment" : `${owned.length} transcript segments`},
+              {" "}which {owned.length === 1 ? "is" : "are"} removed with it.
+            </p>
+            <ul className="region-delete-list">
+              {owned.map((segment) => (
+                <li key={segment.id} dir="auto">
+                  <span className="region-delete-time">
+                    {seconds(segment.start_sample)}–{seconds(segment.end_sample)}s
+                  </span>
+                  {segment.text.trim() || <em>(empty)</em>}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p>
+            No transcript segment belongs to this region on its own, so only the
+            region on the timeline is removed. A segment covering this region and
+            others stays as it is.
+          </p>
+        )}
+        <p className="inspector-note">
+          Nothing is deleted on the server until the next save, and Undo restores it.
+        </p>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button type="button" className="danger" onClick={onConfirm}>
+            {owned.length ? "Remove region and segments" : "Remove region"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ConflictDialog({
   conflict,
   onKeepLocal,

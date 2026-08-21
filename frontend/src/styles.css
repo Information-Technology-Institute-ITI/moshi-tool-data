@@ -341,12 +341,20 @@ button.danger:disabled { color: var(--muted); background: #27141b; border-color:
 .inspector-play { display: flex; gap: .5rem; }
 .inspector-play button { padding: .45rem .8rem; font-size: .8rem; }
 .inspector-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; }
+.region-delete-list { margin: 0; padding: 0 0 0 1.1rem; display: grid; gap: .35rem; font-size: .84rem; max-height: 180px; overflow-y: auto; }
+.region-delete-time { color: var(--muted); margin-inline-end: .5rem; font-variant-numeric: tabular-nums; }
+.inspector-play .step { font-weight: 600; }
+.inspector-play .step:disabled { opacity: .45; }
+.error-boundary { margin: 2rem auto; max-width: 640px; padding: 1.5rem; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.error-boundary h2 { margin: 0 0 .6rem; font-size: 1.1rem; }
+.error-boundary p { margin: 0 0 1rem; color: var(--muted); font-size: .88rem; line-height: 1.6; }
+.error-boundary-detail { margin: 0 0 1.2rem; padding: .7rem .9rem; border-radius: 8px; background: #1b2330; color: #ffb0b8; font-size: .8rem; white-space: pre-wrap; overflow-x: auto; }
+.error-boundary-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
+.split-point input { border-color: var(--amber); }
+.split-point { color: var(--amber); }
 .inspector-warning { margin: 0; padding: .5rem .75rem; border-left: 3px solid var(--amber); background: #2a2114; color: #ffd096; font-size: .82rem; }
 .model-text { margin: 0; font-size: .84rem; line-height: 1.6; }
 .model-text strong { color: var(--muted); }
-.flag-editor { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; margin: 0; padding: .8rem 1rem; border: 1px solid var(--line); border-radius: 10px; }
-.flag-editor legend { padding: 0 .4rem; color: var(--muted); font-size: .8rem; }
-.flag-editor .checkbox { font-size: .82rem; }
 .inspector-actions { display: flex; flex-wrap: wrap; gap: .6rem; }
 .inspector-actions button { font-size: .82rem; padding: .5rem .85rem; }
 .inspector-note { margin: 0; font-size: .78rem; color: var(--muted); }
@@ -391,7 +399,6 @@ button.danger:disabled { color: var(--muted); background: #27141b; border-color:
 
 @media (max-width: 900px) {
   .inspector-grid { grid-template-columns: 1fr; }
-  .flag-editor { grid-template-columns: 1fr; }
   .transcript-entry { grid-template-columns: 24px 24px minmax(0, 1fr); gap: .5rem; }
   .draft-recovery { flex-direction: column; align-items: stretch; }
 }
