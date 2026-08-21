@@ -2,10 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ApiError,
+  deleteProject,
   getCurrentUser,
   jsonRequest,
+  listAdminUsers,
+  listProjects,
   seconds,
   signout,
+  transferProjectOwner,
   watchJob,
 } from "./api";
 import AuthScreen from "./components/AuthScreen";
@@ -15,6 +19,7 @@ import JobProgress from "./components/JobProgress";
 import StereoPlayer from "./components/StereoPlayer";
 import WaveformEditor from "./components/WaveformEditor";
 import type {
+  AdminUser,
   Annotation,
   AuthUser,
   ClipArtifact,
@@ -116,6 +121,7 @@ function App() {
   const [error, setError] = useState("");
   const [page, setPage] = useState<"workspace" | "gpu">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
+  const isAdmin = authUser?.role === "admin";
 
   useEffect(() => {
     let active = true;
@@ -137,18 +143,72 @@ function App() {
     return () => stopWatching.current?.();
   }, []);
 
+  /**
+   * Closes anything the signed-in user may no longer reach and returns them to
+   * the authorized library. Used for 404 responses, which the server also
+   * returns for datasets owned by somebody else, so the UI must never imply the
+   * object exists.
+   */
+  function returnToLibrary() {
+    stopWatching.current?.();
+    stopWatching.current = null;
+    setProject(null);
+    setSource(null);
+    setJob(null);
+    setPage("workspace");
+  }
+
+  function handleSessionExpired() {
+    stopWatching.current?.();
+    stopWatching.current = null;
+    setAuthUser(null);
+    setProjects([]);
+    setProject(null);
+    setSource(null);
+    setJob(null);
+    setPage("workspace");
+    setEntryView("auth");
+  }
+
   async function run<T>(action: () => Promise<T>): Promise<T | undefined> {
     setError("");
     try {
       return await action();
     } catch (value) {
+      if (value instanceof ApiError) {
+        if (value.status === 401) {
+          handleSessionExpired();
+          setError("Your session ended. Sign in to continue.");
+          return undefined;
+        }
+        if (value.status === 403) {
+          setError("Administrator access is required for that action.");
+          return undefined;
+        }
+        if (value.status === 404) {
+          // Never disclose whether the dataset exists under another owner.
+          returnToLibrary();
+          setError("That dataset is no longer available in your workspace.");
+          void reloadProjects();
+          return undefined;
+        }
+      }
       setError(value instanceof Error ? value.message : String(value));
       return undefined;
     }
   }
 
+  /** Reloads without recursing through run()'s 404 handling. */
+  async function reloadProjects() {
+    try {
+      setProjects((await listProjects()).projects);
+    } catch {
+      setProjects([]);
+    }
+  }
+
   async function loadProjects() {
-    const value = await run(() => api<{ projects: Project[] }>("/api/projects"));
+    const value = await run(listProjects);
     if (value) setProjects(value.projects);
   }
 
@@ -238,7 +298,7 @@ function App() {
     );
   }
 
-  const view = page === "gpu" ? (
+  const view = page === "gpu" && isAdmin ? (
     <GpuStatusPage />
   ) : source ? (
     <Studio
@@ -261,7 +321,14 @@ function App() {
       setError={setError}
     />
   ) : (
-    <ProjectLibrary projects={projects} onOpen={openProject} onReload={loadProjects} setError={setError} />
+    <ProjectLibrary
+      projects={projects}
+      user={authUser}
+      onOpen={openProject}
+      onReload={loadProjects}
+      setNotice={setNotice}
+      setError={setError}
+    />
   );
 
   return (
@@ -282,14 +349,16 @@ function App() {
           </span>
         </button>
         <div className="top-actions">
-          <button
-            className={`system-nav ${page === "gpu" ? "active" : ""}`}
-            type="button"
-            aria-current={page === "gpu" ? "page" : undefined}
-            onClick={() => setPage("gpu")}
-          >
-            GPU status
-          </button>
+          {isAdmin && (
+            <button
+              className={`system-nav ${page === "gpu" ? "active" : ""}`}
+              type="button"
+              aria-current={page === "gpu" ? "page" : undefined}
+              onClick={() => setPage("gpu")}
+            >
+              GPU status
+            </button>
+          )}
           <div className="top-meta">
             <span className="status-dot" />
             {authUser ? (
@@ -316,22 +385,96 @@ function App() {
   );
 }
 
+function ownerLabel(project: Project): string {
+  if (!project.owner) return "No owner (legacy dataset)";
+  return project.owner.display_name || project.owner.email || project.owner.id;
+}
+
+function updatedLabel(value: string): string {
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return "Unknown";
+  return new Date(parsed).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 function ProjectLibrary({
   projects,
+  user,
   onOpen,
   onReload,
+  setNotice,
   setError,
 }: {
   projects: Project[];
+  user: AuthUser | null;
   onOpen: (id: string) => void;
   onReload: () => void | Promise<void>;
+  setNotice: (message: string) => void;
   setError: (message: string) => void;
 }) {
+  const isAdmin = user?.role === "admin";
   const [name, setName] = useState("");
+  const [scope, setScope] = useState<"mine" | "all">("mine");
+  const [search, setSearch] = useState("");
+  const [ownerFilter, setOwnerFilter] = useState("");
+  const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
+  const [transferFor, setTransferFor] = useState<Project | null>(null);
+  const [deleteFor, setDeleteFor] = useState<Project | null>(null);
+
+  // Only administrators may list users, so never request it as a regular user.
+  useEffect(() => {
+    if (!isAdmin) {
+      setAdminUsers([]);
+      setScope("mine");
+      setSearch("");
+      setOwnerFilter("");
+      return;
+    }
+    let active = true;
+    listAdminUsers()
+      .then((value) => {
+        if (active) setAdminUsers(value.users);
+      })
+      .catch(() => {
+        if (active) setAdminUsers([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isAdmin, user?.id]);
+
+  const visible = useMemo(() => {
+    // The server already scopes /api/projects by role: a regular user only ever
+    // receives their own datasets, so "mine" is a presentation filter for
+    // administrators and never a substitute for server authorization.
+    let rows = projects;
+    if (isAdmin && scope === "mine") {
+      rows = rows.filter((item) => item.owner_user_id === user?.id);
+    }
+    if (isAdmin && ownerFilter) {
+      rows = rows.filter((item) => item.owner_user_id === ownerFilter);
+    }
+    const term = search.trim().toLowerCase();
+    if (isAdmin && term) {
+      rows = rows.filter((item) => {
+        const owner = item.owner;
+        return (
+          item.name.toLowerCase().includes(term) ||
+          (owner?.display_name || "").toLowerCase().includes(term) ||
+          (owner?.email || "").toLowerCase().includes(term)
+        );
+      });
+    }
+    return rows;
+  }, [projects, isAdmin, scope, ownerFilter, search, user?.id]);
 
   async function create(event: React.FormEvent) {
     event.preventDefault();
     try {
+      // Ownership is derived from the session; the server rejects owner/role here.
       await api("/api/projects", jsonRequest("POST", { name, language: "ar-EG" }));
       setName("");
       onReload();
@@ -340,6 +483,33 @@ function ProjectLibrary({
     }
   }
 
+  async function confirmTransfer(project: Project, ownerUserId: string) {
+    try {
+      await transferProjectOwner(project.id, ownerUserId);
+      const next = adminUsers.find((item) => item.id === ownerUserId);
+      setTransferFor(null);
+      setNotice(
+        `"${project.name}" now belongs to ${next?.display_name || next?.email || ownerUserId}.`,
+      );
+      await onReload();
+    } catch (value) {
+      setError(value instanceof Error ? value.message : String(value));
+    }
+  }
+
+  async function confirmDelete(project: Project) {
+    try {
+      await deleteProject(project.id);
+      setDeleteFor(null);
+      setNotice(`"${project.name}" was permanently deleted.`);
+      await onReload();
+    } catch (value) {
+      setError(value instanceof Error ? value.message : String(value));
+    }
+  }
+
+  const heading = isAdmin && scope === "all" ? "All datasets" : "My datasets";
+
   return (
     <section className="page library-page">
       <div className="hero">
@@ -347,8 +517,8 @@ function ProjectLibrary({
           <span className="eyebrow">Egyptian Arabic · two speakers · 24 kHz</span>
           <h1>Build dialogue data you have actually heard.</h1>
           <p>
-            Upload a podcast, correct who spoke when, resolve mixed overlap, choose natural
-            conversation cuts, and export only clips you personally approved.
+            Upload a podcast, correct who spoke when, fix the draft transcript against the
+            original audio, and save your reviewed annotation.
           </p>
         </div>
         <form className="create-card" onSubmit={create}>
@@ -364,29 +534,298 @@ function ProjectLibrary({
           <button className="primary" type="submit">Create dataset</button>
         </form>
       </div>
+
+      {isAdmin && (
+        <div className="library-controls">
+          <div className="scope-toggle" role="tablist" aria-label="Dataset scope">
+            {(["mine", "all"] as const).map((value) => (
+              <button
+                key={value}
+                role="tab"
+                type="button"
+                aria-selected={scope === value}
+                className={scope === value ? "active" : ""}
+                onClick={() => setScope(value)}
+              >
+                {value === "mine" ? "My datasets" : "All datasets"}
+              </button>
+            ))}
+          </div>
+          {scope === "all" && (
+            <div className="library-filters">
+              <label>
+                Search
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Dataset or owner name / email"
+                />
+              </label>
+              <label>
+                Owner
+                <select
+                  value={ownerFilter}
+                  onChange={(event) => setOwnerFilter(event.target.value)}
+                >
+                  <option value="">All owners</option>
+                  {adminUsers.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.display_name} · {item.email}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="section-heading">
         <div>
           <span className="eyebrow">Your workspace</span>
-          <h2>Dataset projects</h2>
+          <h2>{heading}</h2>
         </div>
-        <span>{projects.length} projects</span>
+        <span>{visible.length} datasets</span>
       </div>
+
       <div className="project-grid">
-        {projects.map((item) => (
-          <button className="project-card" key={item.id} onClick={() => onOpen(item.id)}>
-            <span className="project-index">{String(projects.indexOf(item) + 1).padStart(2, "0")}</span>
-            <h3>{item.name}</h3>
-            <p>Primary language: Egyptian Arabic</p>
-            <div className="project-stats">
-              <span><strong>{item.source_count || 0}</strong> sources</span>
-              <span><strong>{item.ready_sources || 0}</strong> ready</span>
+        {visible.map((item, index) => (
+          <div className="project-card" key={item.id}>
+            <button className="project-card-open" onClick={() => onOpen(item.id)}>
+              <span className="project-index">{String(index + 1).padStart(2, "0")}</span>
+              <h3>{item.name}</h3>
+              {isAdmin && scope === "all" && (
+                <p className="project-owner">
+                  {ownerLabel(item)}
+                  {item.owner?.email && <small>{item.owner.email}</small>}
+                </p>
+              )}
+              <div className="project-stats">
+                <span><strong>{item.source_count || 0}</strong> sources</span>
+                <span><strong>{item.ready_sources || 0}</strong> ready</span>
+                <span>Updated {updatedLabel(item.updated_at)}</span>
+              </div>
+            </button>
+            <div className="project-card-actions">
+              {isAdmin && (
+                <button type="button" onClick={() => setTransferFor(item)}>
+                  Transfer owner
+                </button>
+              )}
+              <button
+                type="button"
+                className="danger-soft"
+                onClick={() => setDeleteFor(item)}
+              >
+                Delete
+              </button>
             </div>
-          </button>
+          </div>
         ))}
-        {!projects.length && <div className="empty-card">Create the first dataset to begin.</div>}
+        {!visible.length && (
+          <div className="empty-card">
+            {projects.length
+              ? "No datasets match the current filters."
+              : "Create the first dataset to begin."}
+          </div>
+        )}
       </div>
+
+      {transferFor && (
+        <TransferOwnerDialog
+          project={transferFor}
+          users={adminUsers}
+          onCancel={() => setTransferFor(null)}
+          onConfirm={(ownerUserId) => confirmTransfer(transferFor, ownerUserId)}
+        />
+      )}
+      {deleteFor && (
+        <DeleteDatasetDialog
+          project={deleteFor}
+          onCancel={() => setDeleteFor(null)}
+          onConfirm={() => confirmDelete(deleteFor)}
+        />
+      )}
     </section>
   );
+}
+
+/** Closes a modal on Escape so it is dismissible without a pointer. */
+function useEscapeToClose(onCancel: () => void) {
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onCancel();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onCancel]);
+}
+
+function TransferOwnerDialog({
+  project,
+  users,
+  onCancel,
+  onConfirm,
+}: {
+  project: Project;
+  users: AdminUser[];
+  onCancel: () => void;
+  onConfirm: (ownerUserId: string) => void | Promise<void>;
+}) {
+  const [selected, setSelected] = useState("");
+  const candidates = users.filter((item) => item.id !== project.owner_user_id);
+  const next = candidates.find((item) => item.id === selected);
+  useEscapeToClose(onCancel);
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div
+        className="modal card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="transfer-title"
+      >
+        <h2 id="transfer-title">Transfer “{project.name}”</h2>
+        <p>
+          The current owner immediately loses access unless they are an administrator.
+        </p>
+        <dl className="transfer-summary">
+          <div>
+            <dt>Current owner</dt>
+            <dd>{ownerLabel(project)}</dd>
+          </div>
+          <div>
+            <dt>New owner</dt>
+            <dd>{next ? `${next.display_name} · ${next.email}` : "Not chosen yet"}</dd>
+          </div>
+        </dl>
+        <label>
+          Choose a new owner
+          <select value={selected} onChange={(event) => setSelected(event.target.value)}>
+            <option value="">Select an active user…</option>
+            {candidates.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.display_name} · {item.email}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button
+            type="button"
+            className="primary"
+            disabled={!selected}
+            onClick={() => void onConfirm(selected)}
+          >
+            Transfer dataset
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DeleteDatasetDialog({
+  project,
+  onCancel,
+  onConfirm,
+}: {
+  project: Project;
+  onCancel: () => void;
+  onConfirm: () => void | Promise<void>;
+}) {
+  const [typed, setTyped] = useState("");
+  const matches = typed.trim() === project.name.trim();
+  useEscapeToClose(onCancel);
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div
+        className="modal card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-title"
+      >
+        <h2 id="delete-title">Delete “{project.name}”</h2>
+        <p className="danger-text">
+          This permanently removes the dataset, its sources, uploaded media, and every saved
+          annotation revision. It cannot be undone.
+        </p>
+        <label>
+          Type the dataset name to confirm
+          <input
+            value={typed}
+            onChange={(event) => setTyped(event.target.value)}
+            placeholder={project.name}
+            autoComplete="off"
+          />
+        </label>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button
+            type="button"
+            className="danger"
+            disabled={!matches}
+            onClick={() => void onConfirm()}
+          >
+            Delete forever
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Derives the one-pass source state from existing source and job fields.
+ * A source has exactly one initialization attempt: it is waiting for the
+ * Manual/Assisted choice, running it, ready for editing, or retryable after a
+ * failure. Nothing here can start a second pass on a successful source.
+ */
+function sourceState(
+  source: Source,
+  jobs: Job[],
+): { label: string; tone: string; description: string; failedJob: Job | null } {
+  const initJobs = jobs.filter(
+    (job) => job.kind === "initialize" && job.source_id === source.id,
+  );
+  const activeInit = initJobs.find(
+    (job) => job.status === "queued" || job.status === "running",
+  );
+  const failedInit = initJobs.find((job) => job.status === "failed");
+
+  if (source.status === "failed" || (failedInit && source.status === "uploaded")) {
+    return {
+      label: "Failed",
+      tone: "bad",
+      description: failedInit?.error || failedInit?.message || "Preparation did not finish.",
+      failedJob: failedInit || null,
+    };
+  }
+  if (source.status === "processing" || activeInit) {
+    return {
+      label: "Processing",
+      tone: "warn",
+      description: activeInit?.message || "Preparing audio, speakers, and draft transcript…",
+      failedJob: null,
+    };
+  }
+  if (source.status === "ready" || source.status === "clips_ready") {
+    return {
+      label: "Ready",
+      tone: "good",
+      description: "Ready to review and edit.",
+      failedJob: null,
+    };
+  }
+  return {
+    label: "Not started",
+    tone: "warn",
+    description: "Open to choose Manual or Assisted preparation.",
+    failedJob: null,
+  };
 }
 
 function ProjectWorkspace({
@@ -498,7 +937,7 @@ function ProjectWorkspace({
 
   return (
     <section className="page">
-      <button className="back" onClick={onBack}>← All datasets</button>
+      <button className="back" onClick={onBack}>← Datasets</button>
       <div className="workspace-heading">
         <div>
           <span className="eyebrow">Dataset project</span>
@@ -531,23 +970,41 @@ function ProjectWorkspace({
         </form>
       </div>
       <div className="source-list">
-        {detail.sources.map((item, index) => (
-          <button className="source-row" key={item.id} onClick={() => onOpenSource(item.id)}>
-            <span className="source-number">{String(index + 1).padStart(2, "0")}</span>
-            <span className="source-main"><strong>{item.original_name}</strong><small>{item.status.replaceAll("_", " ")}</small></span>
-            <span className={`pill ${item.rights_confirmed ? "good" : "warn"}`}>
-              {item.rights_confirmed ? "Rights recorded" : "Rights needed"}
-            </span>
-            <span className="source-arrow">→</span>
-          </button>
-        ))}
+        {detail.sources.map((item, index) => {
+          const state = sourceState(item, detail.jobs);
+          return (
+            <div className="source-row" key={item.id}>
+              <button
+                className="source-row-open"
+                onClick={() => onOpenSource(item.id)}
+              >
+                <span className="source-number">{String(index + 1).padStart(2, "0")}</span>
+                <span className="source-main">
+                  <strong>{item.original_name}</strong>
+                  <small>{state.description}</small>
+                </span>
+                <span className={`pill ${state.tone}`}>{state.label}</span>
+                <span className="source-arrow">→</span>
+              </button>
+              {state.failedJob && (
+                <button
+                  type="button"
+                  className="source-retry"
+                  onClick={() => retry(state.failedJob!)}
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          );
+        })}
         {!detail.sources.length && <div className="empty-card">Upload the first two-person podcast source.</div>}
       </div>
       {!!detail.jobs.length && (
         <section className="job-history card">
           <div>
-            <span className="eyebrow">Durable worker</span>
-            <h2>Recent jobs</h2>
+            <span className="eyebrow">Progress</span>
+            <h2>Recent activity</h2>
           </div>
           {detail.jobs.slice(0, 10).map((item) => (
             <div key={item.id}>
@@ -556,7 +1013,11 @@ function ProjectWorkspace({
                 {item.status}
               </span>
               <small>{item.error || item.message}</small>
-              {item.status === "failed" && <button onClick={() => retry(item)}>Retry</button>}
+              {/* Only a failed first pass may be retried; nothing here can start
+                  a second pass on a source that already succeeded. */}
+              {item.status === "failed" && item.kind === "initialize" && (
+                <button onClick={() => retry(item)}>Retry</button>
+              )}
             </div>
           ))}
         </section>

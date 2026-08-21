@@ -1,8 +1,11 @@
 import type {
+  AdminUser,
   AuthUser,
   GpuCheckHistory,
   GpuCheckTriggerResult,
   GpuSystemStatus,
+  Project,
+  ProjectDeletionResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -94,6 +97,42 @@ export function signin(
 export function signout(): Promise<{ signed_out: boolean }> {
   return api<{ signed_out: boolean }>("/api/auth/signout", {
     ...jsonRequest("POST"),
+    credentials: "same-origin",
+  });
+}
+
+export function listProjects(): Promise<{ projects: Project[] }> {
+  return api<{ projects: Project[] }>("/api/projects", {
+    credentials: "same-origin",
+  });
+}
+
+/** Administrator-only. Used to populate the ownership transfer selector. */
+export function listAdminUsers(): Promise<{ users: AdminUser[] }> {
+  return api<{ users: AdminUser[] }>("/api/admin/users", {
+    credentials: "same-origin",
+  });
+}
+
+/** Administrator-only ownership transfer. The server rejects inactive owners. */
+export function transferProjectOwner(
+  projectId: string,
+  ownerUserId: string,
+): Promise<Project> {
+  return api<Project>(`/api/admin/projects/${projectId}/owner`, {
+    ...jsonRequest("PATCH", { owner_user_id: ownerUserId }),
+    credentials: "same-origin",
+  });
+}
+
+/**
+ * Permanently deletes a dataset. The server requires X-Confirm-Delete to equal
+ * the project id exactly, so the caller confirms intent before reaching here.
+ */
+export function deleteProject(projectId: string): Promise<ProjectDeletionResult> {
+  return api<ProjectDeletionResult>(`/api/projects/${projectId}`, {
+    method: "DELETE",
+    headers: { "x-confirm-delete": projectId },
     credentials: "same-origin",
   });
 }

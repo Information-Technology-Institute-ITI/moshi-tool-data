@@ -10,14 +10,34 @@ export interface AuthUser {
   email_verified_at?: string | null;
 }
 
+export interface ProjectOwner {
+  id: string;
+  display_name?: string | null;
+  email?: string | null;
+}
+
+export interface AdminUser {
+  id: string;
+  display_name: string;
+  email: string;
+}
+
 export interface Project {
   id: string;
   name: string;
   language: string;
   source_count?: number;
   ready_sources?: number;
+  owner_user_id?: string | null;
+  owner?: ProjectOwner | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ProjectDeletionResult {
+  deleted: string;
+  recoverable: boolean;
+  cleanup_state: string;
 }
 
 export interface Source {
@@ -219,6 +239,7 @@ export interface Job {
   status: "queued" | "running" | "complete" | "failed";
   progress: number;
   message: string;
+  source_id?: string | null;
   error?: string | null;
   result?: Record<string, unknown> | null;
 }

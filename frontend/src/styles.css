@@ -122,9 +122,22 @@ label { display: grid; gap: .42rem; color: var(--muted); font-size: .85rem; }
 .section-heading h2 { font-size: 2rem; }
 .section-heading > span { color: var(--muted); }
 .project-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
-.project-card { min-height: 240px; padding: 1.5rem; text-align: left; background: linear-gradient(145deg, #102026, #0b1519); display: flex; flex-direction: column; align-items: flex-start; }
+.project-card { min-height: 240px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(145deg, #102026, #0b1519); display: flex; flex-direction: column; overflow: hidden; }
+.project-card-open { flex: 1; padding: 1.5rem; text-align: left; background: none; border: 0; border-radius: 0; display: flex; flex-direction: column; align-items: flex-start; width: 100%; }
 .project-card h3 { font-size: 1.35rem; margin: auto 0 .5rem; }
 .project-card p { font-size: .9rem; }
+.project-owner { display: flex; flex-direction: column; gap: .1rem; margin-bottom: .5rem; }
+.project-owner small { color: var(--muted); font-size: .78rem; }
+.project-card-actions { display: flex; gap: .5rem; padding: .8rem 1.5rem; border-top: 1px solid var(--line); background: rgba(0,0,0,.18); }
+.project-card-actions button { font-size: .78rem; padding: .4rem .7rem; }
+
+.library-controls { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+.scope-toggle { display: inline-flex; gap: .25rem; padding: .25rem; border: 1px solid var(--line); border-radius: 999px; background: rgba(13,24,29,.72); }
+.scope-toggle button { border: 0; border-radius: 999px; padding: .45rem 1rem; background: none; font-size: .85rem; }
+.scope-toggle button.active { background: var(--yellow); color: #0b1519; font-weight: 700; }
+.library-filters { display: flex; flex-wrap: wrap; gap: 1rem; }
+.library-filters label { display: flex; flex-direction: column; gap: .3rem; font-size: .8rem; color: var(--muted); }
+.library-filters input, .library-filters select { min-width: 240px; }
 .project-index, .source-number { color: var(--yellow); font-family: ui-monospace, monospace; font-weight: 700; }
 .project-stats { width: 100%; display: flex; gap: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .project-stats span { color: var(--muted); font-size: .82rem; }
@@ -140,7 +153,9 @@ label { display: grid; gap: .42rem; color: var(--muted); font-size: .85rem; }
 .file-drop { border: 1px dashed #4b6670; border-radius: 8px; padding: 1.2rem; cursor: pointer; color: var(--ink); }
 .file-drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .source-list { display: grid; gap: .6rem; margin: 2rem 0 4rem; }
-.source-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) auto 30px; align-items: center; gap: 1rem; text-align: left; padding: 1rem 1.2rem; background: rgba(13,24,29,.72); }
+.source-row { display: flex; align-items: stretch; gap: .75rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(13,24,29,.72); overflow: hidden; }
+.source-row-open { flex: 1; display: grid; grid-template-columns: 48px minmax(0, 1fr) auto 30px; align-items: center; gap: 1rem; text-align: left; padding: 1rem 1.2rem; background: none; border: 0; border-radius: 0; }
+.source-retry { align-self: center; margin-right: 1rem; font-size: .78rem; padding: .4rem .8rem; }
 .source-main strong, .source-main small { display: block; }
 .source-main small { color: var(--muted); margin-top: .25rem; }
 .source-arrow { font-size: 1.3rem; }
@@ -152,6 +167,19 @@ label { display: grid; gap: .42rem; color: var(--muted); font-size: .85rem; }
 .pill.warn { color: #ffd096; background: #332516; }
 .pill.bad { color: #ff9bad; background: #351821; }
 .card { border: 1px solid var(--line); border-radius: 12px; background: rgba(13,24,29,.84); padding: 1.4rem; }
+
+.modal-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 1.5rem; background: rgba(4,9,11,.72); backdrop-filter: blur(3px); }
+.modal { width: min(100%, 460px); display: grid; gap: 1rem; background: #0d181d; box-shadow: 0 24px 60px rgba(0,0,0,.55); }
+.modal h2 { font-size: 1.3rem; }
+.modal label { display: flex; flex-direction: column; gap: .35rem; font-size: .85rem; color: var(--muted); }
+.modal-actions { display: flex; justify-content: flex-end; gap: .6rem; }
+.danger-text { color: #ff9eac; font-size: .9rem; }
+button.danger { color: #0b1519; background: #ff7d92; border-color: #ff7d92; font-weight: 700; }
+button.danger:disabled { color: var(--muted); background: #27141b; border-color: #69323e; font-weight: 400; }
+.transfer-summary { display: grid; gap: .6rem; padding: .8rem 1rem; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.2); }
+.transfer-summary > div { display: flex; justify-content: space-between; gap: 1rem; }
+.transfer-summary dt { color: var(--muted); font-size: .8rem; }
+.transfer-summary dd { font-size: .85rem; text-align: right; }
 .export-panel { display: grid; grid-template-columns: 1fr auto; gap: 1.5rem; align-items: end; }
 .export-action { display: grid; grid-template-columns: 220px auto auto; gap: .6rem; }
 .validation-box { grid-column: 1 / -1; display: grid; gap: .35rem; border-left: 3px solid var(--red); padding: .9rem 1rem; background: #28151a; }
@@ -361,8 +389,13 @@ label { display: grid; gap: .42rem; color: var(--muted); font-size: .85rem; }
   .top-actions { gap: .35rem; }
   .system-nav { padding: .45rem .6rem; }
   .page { width: min(100% - 1.25rem, 1180px); padding-top: 1.5rem; }
-  .source-row { grid-template-columns: 34px 1fr 22px; }
-  .source-row .pill { display: none; }
+  .source-row-open { grid-template-columns: 34px 1fr 22px; }
+  .source-row-open .pill { display: none; }
+  .library-controls { flex-direction: column; align-items: stretch; }
+  .library-filters { flex-direction: column; }
+  .library-filters input, .library-filters select { min-width: 0; width: 100%; }
+  .modal-actions { flex-direction: column-reverse; }
+  .modal-actions button { width: 100%; }
   .export-panel, .export-action, .choice-grid, .rights-card, .planner, .utterance, .identity-lock, .candidate-card, .stem-transcripts, .exclusion-editor > div, .boundary-editor > label { grid-template-columns: 1fr; }
   .job-history > div:not(:first-child) { grid-template-columns: 1fr; }
   .export-action, .export-list, .rights-card .wide, .planner .wide { grid-column: 1; }
