@@ -203,6 +203,7 @@ class StudioService:
             source_id=source_id,
             payload=job_payload,
             principal=principal,
+            source_updates=source_updates,
         )
         job = self.catalog.create_job(
             project_id,

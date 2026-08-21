@@ -228,6 +228,62 @@ def test_annotation_save_keeps_both_speakers_over_an_overlap(tmp_path) -> None:
     assert dominant["text"] == "واحد اتنين تلاتة"
 
 
+def test_enqueue_fingerprints_the_state_the_job_will_run_against(tmp_path) -> None:
+    """A job must not be superseded for a change enqueuing it made itself.
+
+    Enqueuing an initialization sets the source to processing and records the
+    chosen mode. The fingerprint was taken before those landed, so it described a
+    row state that never existed once the job started; every completion was then
+    rejected with "Authoritative inputs changed" and the result thrown away.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class Principal:
+        user_id: str
+
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    service = app.state.studio
+    admin = service.catalog.ensure_local_admin()
+    principal = Principal(user_id=str(admin["id"]))
+    project = service.catalog.create_project("Fingerprint", owner_user_id=str(admin["id"]))
+
+    def enqueue(name: str, digest: str) -> dict:
+        original = service.paths.originals / name
+        original.write_bytes(b"placeholder-" + digest.encode() * 4)
+        source = service.catalog.create_source(
+            project["id"],
+            name,
+            service.paths.relative(original),
+            "audio/wav",
+            digest * 64,
+            original.stat().st_size,
+        )
+        return service.enqueue(
+            project["id"],
+            "initialize",
+            str(source["id"]),
+            {"mode": "assisted"},
+            principal=principal,
+            source_updates={"status": "processing", "init_mode": "assisted"},
+        )
+
+    # Every source behaves the same, not just the first one in a project.
+    for name, digest in (("first.wav", "a"), ("second.wav", "b"), ("third.wav", "c")):
+        job = enqueue(name, digest)
+        assert service.contexts.current_fingerprint(job) == job["input_fingerprint"], name
+
+    # The mode the reviewer chose is still part of the frozen inputs.
+    job = enqueue("fourth.wav", "d")
+    assert job["preconditions"]["source"]["init_mode"] == "assisted"
+    # Status is the source's own lifecycle, not an input, so it is not frozen.
+    assert "status" not in job["preconditions"]["source"]
+
+    # A real change to the inputs is still caught.
+    service.catalog.update_source(str(job["source_id"]), duration_samples=999)
+    assert service.contexts.current_fingerprint(job) != job["input_fingerprint"]
+
+
 def test_startup_repairs_legacy_annotation_past_source_end(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     paths = StudioPaths(workspace)

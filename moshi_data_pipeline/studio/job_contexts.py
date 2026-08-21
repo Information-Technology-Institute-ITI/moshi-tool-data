@@ -177,7 +177,11 @@ class JobContextBuilder:
 
     @staticmethod
     def _source_snapshot(source: dict[str, Any]) -> dict[str, Any]:
-        omitted = {"created_at", "updated_at", "inspection_json"}
+        # `status` tracks where the source is in its own lifecycle — uploaded,
+        # processing, ready — and moves while a job runs. It is bookkeeping, not
+        # an input to the computation, so fingerprinting it would supersede every
+        # job for a change the job itself caused.
+        omitted = {"created_at", "updated_at", "inspection_json", "status"}
         return {key: value for key, value in source.items() if key not in omitted}
 
     def snapshot(
@@ -188,7 +192,16 @@ class JobContextBuilder:
         source_id: str | None,
         payload: dict[str, Any],
         principal: PrincipalLike | None = None,
+        source_updates: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        """Freezes the inputs a job will run against.
+
+        `source_updates` are the changes the caller is about to apply to the
+        source row as part of enqueuing, such as the chosen initialization mode.
+        They belong in the fingerprint because the job runs after they land;
+        leaving them out froze a row state that never existed once the job
+        started, and every completion was then rejected as changed.
+        """
         project = self.catalog.get_project(project_id)
         preconditions: dict[str, Any] = {
             "project": {
@@ -202,7 +215,14 @@ class JobContextBuilder:
         if source_id is not None:
             source = self.catalog.get_source(source_id)
             annotation = self.catalog.latest_annotation(source_id)
-            preconditions["source"] = self._source_snapshot(source)
+            preconditions["source"] = {
+                **self._source_snapshot(source),
+                **{
+                    key: value
+                    for key, value in (source_updates or {}).items()
+                    if key in source and key not in {"status"}
+                },
+            }
             preconditions["annotation"] = annotation.model_dump(mode="json")
             if kind in {"generate", "export"}:
                 plan = self.catalog.get_clip_plan(source_id)

@@ -166,8 +166,32 @@ export function seconds(samples: number): string {
   return (samples / 24_000).toFixed(2);
 }
 
+/**
+ * A 32-character hex id for a locally created segment or region.
+ *
+ * `crypto.randomUUID` only exists in a secure context, so a deployment served
+ * over plain HTTP does not have it and every id-minting action — adding,
+ * splitting, joining a segment — threw. `crypto.getRandomValues` is available
+ * everywhere, and `Math.random` is a last resort: these ids only have to be
+ * unique inside one annotation, and the server never trusts them for identity.
+ */
 export function sampleId(prefix: string): string {
-  return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
+  return `${prefix}_${randomHex(32)}`;
+}
+
+function randomHex(length: number): string {
+  const bytes = new Uint8Array(Math.ceil(length / 2));
+  const source = globalThis.crypto;
+  if (source && typeof source.getRandomValues === "function") {
+    source.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, length);
 }
 
 export function watchJob(
