@@ -16,18 +16,32 @@ import AuthScreen from "./components/AuthScreen";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
-import StereoPlayer from "./components/StereoPlayer";
-import WaveformEditor from "./components/WaveformEditor";
+import TranscriptPanel from "./components/TranscriptPanel";
+import WaveformEditor, { type FocusRange } from "./components/WaveformEditor";
+import {
+  addSegment,
+  deleteSegment,
+  intersecting,
+  joinSegments,
+  splitSegment,
+} from "./transcript";
+import {
+  clearDraft,
+  clearDraftsForUser,
+  readDraft,
+  useAnnotationSaver,
+  type Conflict,
+} from "./useAnnotationSaver";
 import type {
   AdminUser,
   Annotation,
   AuthUser,
-  ClipArtifact,
   Job,
   Project,
   Source,
   SourceDetail,
   Speaker,
+  TranscriptUtterance,
 } from "./types";
 
 type ProjectDetail = {
@@ -35,67 +49,6 @@ type ProjectDetail = {
   sources: Source[];
   jobs: Job[];
 };
-
-const highRiskTranscriptFlags = new Set([
-  "abnormally_high_word_rate",
-  "decode_disagreement",
-  "low_average_log_probability",
-  "overlapping_speech",
-  "repeated_ngram",
-  "suspicious_character_sequence",
-]);
-
-function alignmentInputSignature(annotation: Annotation): string {
-  return JSON.stringify(
-    annotation.transcript.map((value) => ({
-      id: value.id,
-      speaker: value.speaker,
-      start_sample: value.start_sample,
-      end_sample: value.end_sample,
-      text: value.text,
-    })),
-  );
-}
-
-function cleanSpeakerTurns(annotation: Annotation, speaker: Speaker) {
-  const other = annotation.activities.filter((value) => value.speaker !== speaker);
-  return annotation.activities
-    .filter((value) => value.speaker === speaker)
-    .filter((value) => value.end_sample - value.start_sample >= 36_000)
-    .filter((value) =>
-      !other.some((second) =>
-        second.end_sample > value.start_sample
-        && second.start_sample < value.end_sample
-      )
-    )
-    .sort(
-      (first, second) =>
-        (second.end_sample - second.start_sample)
-        - (first.end_sample - first.start_sample),
-    )
-    .slice(0, 25);
-}
-
-function transcriptPriority(
-  item: Annotation["transcript"][number],
-  assistantSpeaker?: Speaker | null,
-): number {
-  const weights: Record<string, number> = {
-    suspicious_character_sequence: 100,
-    repeated_ngram: 90,
-    overlapping_speech: 70,
-    decode_disagreement: 55,
-    low_average_log_probability: 45,
-    abnormally_high_word_rate: 40,
-    unaligned_words: 35,
-    low_confidence_alignment: 25,
-  };
-  if (item.human_verified) return 0;
-  return item.quality_flags.reduce(
-    (total, flag) => total + (weights[flag] || 10),
-    item.speaker === assistantSpeaker ? 20 : 0,
-  ) + (item.alignment_status === "aligned" ? 0 : 30);
-}
 
 function App() {
   const activationLink = window.location.hash.startsWith("#/activate?");
@@ -247,6 +200,9 @@ function App() {
   }
 
   async function handleSignout() {
+    // Drafts are scoped per user and must never surface for the next person
+    // signing in on this browser.
+    if (authUser) clearDraftsForUser(authUser.id);
     await run(signout);
     stopWatching.current?.();
     setAuthUser(null);
@@ -296,6 +252,7 @@ function App() {
     <Studio
       detail={source}
       project={project!}
+      user={authUser}
       onBack={() => setSource(null)}
       onDeleted={() => openProject(project!.project.id)}
       onReload={() => openSource(source.id)}
@@ -984,9 +941,20 @@ function ProjectWorkspace({
   );
 }
 
+
+/**
+ * The single Review audio and transcript screen.
+ *
+ * Video frames, waveform, speaker A/B lanes, the complete chronological
+ * transcript, and quality flags share one sample timeline. Selecting anything
+ * focuses the matching content elsewhere. Every edit changes annotation only:
+ * no action here creates, cuts, or re-encodes audio, and no action enqueues GPU
+ * work. A successful source can never be reprocessed from this screen.
+ */
 function Studio({
   detail,
   project,
+  user,
   onBack,
   onDeleted,
   onReload,
@@ -996,6 +964,7 @@ function Studio({
 }: {
   detail: SourceDetail;
   project: ProjectDetail;
+  user: AuthUser | null;
   onBack: () => void;
   onDeleted: () => void;
   onReload: () => void;
@@ -1003,115 +972,52 @@ function Studio({
   setNotice: (message: string) => void;
   setError: (message: string) => void;
 }) {
-  const [tab, setTab] = useState<"source" | "transcript" | "overlap" | "clips">("source");
   const [annotation, setAnnotation] = useState<Annotation>(detail.annotation);
   const [history, setHistory] = useState<Annotation[]>([]);
   const [future, setFuture] = useState<Annotation[]>([]);
-  const [saving, setSaving] = useState(false);
-  const saveTimer = useRef<number | null>(null);
-  const annotationRef = useRef<Annotation>(detail.annotation);
-  const savingRef = useRef(false);
-  const pendingSave = useRef<Annotation | null>(null);
-  const realignAfterSave = useRef(false);
-  const saveFailed = useRef(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [filteredIds, setFilteredIds] = useState<string[] | null>(null);
+  const [focusRange, setFocusRange] = useState<FocusRange | null>(null);
+  const [playhead, setPlayhead] = useState(0);
+  const [conflict, setConflict] = useState<Conflict | null>(null);
+  const [draftOffer, setDraftOffer] = useState<Annotation | null>(null);
+  const focusNonce = useRef(0);
+  const userId = user?.id || "local";
+
+  const processing = detail.status === "processing";
+  const readOnly = processing;
+
+  const saver = useAnnotationSaver({
+    sourceId: detail.id,
+    userId,
+    onSaved: (saved) => {
+      setAnnotation((current) => ({ ...current, version: saved.version }));
+      setNotice(`Annotation revision ${saved.version} saved`);
+    },
+    onConflict: (value) => setConflict(value),
+    onError: setError,
+  });
 
   useEffect(() => {
-    annotationRef.current = detail.annotation;
-    saveFailed.current = false;
     setAnnotation(detail.annotation);
     setHistory([]);
     setFuture([]);
+    setSelectedId(null);
+    setFilteredIds(null);
+    setConflict(null);
+    saver.reset(detail.annotation);
+    const draft = readDraft(userId, detail.id, detail.annotation.version);
+    setDraftOffer(
+      draft && JSON.stringify(draft) !== JSON.stringify(detail.annotation) ? draft : null,
+    );
   }, [detail.id, detail.annotation.version]);
 
-  useEffect(
-    () => () => {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    },
-    [],
-  );
-
-  function applyLocal(next: Annotation) {
-    if (alignmentInputSignature(next) !== alignmentInputSignature(annotation)) {
-      realignAfterSave.current = true;
-    }
-    annotationRef.current = next;
-    setAnnotation(next);
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => void save(next), 1200);
-  }
-
+  /** Records an undoable edit and schedules an autosave. */
   function edit(next: Annotation) {
-    const activitiesChanged =
-      JSON.stringify(next.activities) !== JSON.stringify(annotation.activities);
-    const regionsChanged =
-      activitiesChanged || next.assistant_speaker !== annotation.assistant_speaker;
-    const prepared = regionsChanged
-      ? {
-          ...next,
-          activities_finalized: false,
-          speaker_references: activitiesChanged ? [] : next.speaker_references,
-        }
-      : next;
     setHistory((values) => [...values.slice(-49), annotation]);
     setFuture([]);
-    applyLocal(prepared);
-  }
-
-  async function save(value = annotationRef.current) {
-    if (saveTimer.current) {
-      window.clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-    }
-    if (savingRef.current) {
-      pendingSave.current = value;
-      return;
-    }
-    savingRef.current = true;
-    setSaving(true);
-    let completed = false;
-    try {
-      const saved = await api<Annotation>(
-        `/api/sources/${detail.id}/annotations`,
-        jsonRequest("PUT", { expected_version: value.version, annotation: value }),
-      );
-      if (annotationRef.current === value) {
-        annotationRef.current = saved;
-        pendingSave.current = null;
-        setAnnotation(saved);
-      } else {
-        const rebased = { ...annotationRef.current, version: saved.version };
-        annotationRef.current = rebased;
-        pendingSave.current = rebased;
-        setAnnotation(rebased);
-      }
-      completed = true;
-      saveFailed.current = false;
-      setNotice(`Annotation revision ${saved.version} saved`);
-    } catch (reason) {
-      saveFailed.current = true;
-      pendingSave.current = null;
-      if (reason instanceof ApiError && reason.status === 409) {
-        realignAfterSave.current = false;
-        setError(
-          "The annotation changed in another job. The latest revision was reloaded; "
-          + "please apply your last edit again.",
-        );
-        await onReload();
-      } else {
-        setError(reason instanceof Error ? reason.message : String(reason));
-      }
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-      const pending = pendingSave.current;
-      pendingSave.current = null;
-      if (completed && pending) {
-        void save(pending);
-      } else if (completed && realignAfterSave.current) {
-        realignAfterSave.current = false;
-        void queue("realign");
-      }
-    }
+    setAnnotation(next);
+    saver.schedule(next);
   }
 
   function undo() {
@@ -1119,7 +1025,9 @@ function Studio({
     if (!previous) return;
     setFuture((values) => [annotation, ...values]);
     setHistory((values) => values.slice(0, -1));
-    applyLocal({ ...previous, version: annotationRef.current.version });
+    const restored = { ...previous, version: annotation.version };
+    setAnnotation(restored);
+    saver.schedule(restored);
   }
 
   function redo() {
@@ -1127,7 +1035,93 @@ function Studio({
     if (!next) return;
     setHistory((values) => [...values, annotation]);
     setFuture((values) => values.slice(1));
-    applyLocal({ ...next, version: annotationRef.current.version });
+    const restored = { ...next, version: annotation.version };
+    setAnnotation(restored);
+    saver.schedule(restored);
+  }
+
+  /** Moves the playhead to a segment and optionally loops its original audio. */
+  function playSegment(segment: TranscriptUtterance, loop: boolean) {
+    focusNonce.current += 1;
+    setFocusRange({
+      startSample: segment.start_sample,
+      endSample: segment.end_sample,
+      loop,
+      nonce: focusNonce.current,
+    });
+  }
+
+  /** Clicking an A/B region focuses the transcript entries it intersects. */
+  function focusRegion(regionId: string) {
+    const region = annotation.activities.find((item) => item.id === regionId);
+    if (!region) return;
+    const matches = intersecting(
+      annotation.transcript,
+      region.start_sample,
+      region.end_sample,
+    );
+    setFilteredIds(matches.map((item) => item.id));
+    if (matches.length) setSelectedId(matches[0].id);
+  }
+
+  function addSegmentAt(startSample: number, endSample: number) {
+    const speaker: Speaker = annotation.transcript.at(-1)?.speaker === "A" ? "B" : "A";
+    const result = addSegment(annotation, startSample, endSample, speaker);
+    edit(result.annotation);
+    setSelectedId(result.id);
+    setNotice("Segment added. Type its text in the inspector.");
+  }
+
+  function addSegmentAtPlayhead() {
+    const start = Math.max(0, playhead);
+    const limit = detail.duration_samples || start + 2 * 24_000;
+    const end = Math.min(limit, start + 2 * 24_000);
+    if (end <= start) {
+      setError("Move the playhead before the end of the source to add a segment.");
+      return;
+    }
+    addSegmentAt(start, end);
+  }
+
+  function splitAt(id: string, atSample: number, textOffset: number) {
+    const result = splitSegment(annotation, id, atSample, textOffset);
+    if (!result.ok) {
+      setError(result.reason);
+      return;
+    }
+    edit(result.annotation);
+    setSelectedId(result.ids[0]);
+    setNotice("Segment split into two timestamped ranges.");
+  }
+
+  function joinWith(firstId: string, secondId: string) {
+    const result = joinSegments(annotation, firstId, secondId);
+    if (!result.ok) {
+      setError(result.reason);
+      return;
+    }
+    edit(result.annotation);
+    setSelectedId(result.id);
+    setNotice("Segments joined.");
+  }
+
+  function removeSegment(id: string) {
+    edit(deleteSegment(annotation, id));
+    setSelectedId(null);
+    setNotice("Segment deleted. Undo restores it.");
+  }
+
+  /** Flushes pending edits before leaving, and stays put if the save failed. */
+  async function leave(action: () => void) {
+    if (readOnly || !saver.hasUnsaved()) {
+      action();
+      return;
+    }
+    if (await saver.flush()) {
+      action();
+    } else {
+      setError("Your latest edit could not be saved, so this source stayed open.");
+    }
   }
 
   async function deleteSource() {
@@ -1150,29 +1144,22 @@ function Studio({
       const previous = await api<Annotation>(
         `/api/sources/${detail.id}/annotations/${version}`,
       );
-      edit({ ...previous, version: annotationRef.current.version });
+      edit({ ...previous, version: annotation.version });
       setNotice(`Revision ${version} restored locally and queued as a new revision`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
-  async function flushAnnotation(): Promise<boolean> {
-    if (saveTimer.current || savingRef.current || pendingSave.current) {
-      await save(annotationRef.current);
-    }
-    while (savingRef.current || pendingSave.current) {
-      await new Promise((resolve) => window.setTimeout(resolve, 50));
-    }
-    return !saveFailed.current;
-  }
-
-  async function queue(kind: string, body?: unknown) {
+  /**
+   * Starts the one allowed preparation pass. Reachable only before a source has
+   * succeeded, so there is no path from this screen to a second pass.
+   */
+  async function startInitialization(mode: "assisted" | "manual") {
     try {
-      if (!(await flushAnnotation())) return;
       const job = await api<Job>(
-        `/api/sources/${detail.id}/${kind}`,
-        jsonRequest("POST", body),
+        `/api/sources/${detail.id}/initialize`,
+        jsonRequest("POST", { mode }),
       );
       onJob(job);
     } catch (reason) {
@@ -1180,95 +1167,94 @@ function Studio({
     }
   }
 
-  async function queueOverlapTranscription(regionId: string) {
-    try {
-      if (!(await flushAnnotation())) return;
-      const job = await api<Job>(
-        `/api/sources/${detail.id}/overlaps/${regionId}/transcribe`,
-        jsonRequest("POST"),
-      );
-      onJob(job);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
+  const failedInit = project.jobs.find(
+    (job) =>
+      job.kind === "initialize" && job.source_id === detail.id && job.status === "failed",
+  );
 
-  function setSpeakerReference(speaker: Speaker, activityId: string) {
-    const remaining = (annotation.speaker_references || []).filter(
-      (value) => value.speaker !== speaker,
-    );
-    const activity = annotation.activities.find((value) => value.id === activityId);
-    const speakerReferences = activity
-      ? [
-          ...remaining,
-          {
-            id: `speaker_reference_${crypto.randomUUID().replaceAll("-", "")}`,
-            speaker,
-            start_sample: activity.start_sample,
-            end_sample: Math.min(
-              activity.end_sample,
-              activity.start_sample + 8 * 24_000,
-            ),
-            note: "Human-confirmed clean reference turn",
-          },
-        ]
-      : remaining;
-    edit({ ...annotation, speaker_references: speakerReferences });
-  }
-
-  if (detail.status === "uploaded" || detail.status === "processing") {
+  if (detail.status === "uploaded" || detail.status === "failed") {
     return (
       <section className="page">
         <button className="back" onClick={onBack}>← {project.project.name}</button>
         <div className="onboarding card">
           <span className="eyebrow">New source</span>
           <h1>{detail.original_name}</h1>
-          <p>
-            Choose whether the studio should suggest speakers and text, or prepare only the
-            synchronized media editor.
-          </p>
-          <div className="choice-grid">
-            <button onClick={() => queue("initialize", { mode: "assisted" })}>
-              <strong>Assisted start</strong>
-              <span>Diarization, overlap, transcription, and word alignment suggestions.</span>
-            </button>
-            <button onClick={() => queue("initialize", { mode: "manual" })}>
-              <strong>Manual start</strong>
-              <span>Waveform and video proxy only. Add transcription when ready.</span>
-            </button>
-          </div>
+          {failedInit ? (
+            <>
+              <p className="danger-text">
+                Preparation did not finish: {failedInit.error || failedInit.message}
+              </p>
+              <p>Retrying reuses this same source and its original media.</p>
+              <div className="choice-grid">
+                <button onClick={() => startInitialization("assisted")}>
+                  <strong>Retry assisted preparation</strong>
+                  <span>Speaker timestamps, draft transcript, word timing, and quality flags.</span>
+                </button>
+                <button onClick={() => startInitialization("manual")}>
+                  <strong>Retry manual preparation</strong>
+                  <span>Waveform and video proxy only, with no draft transcript.</span>
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p>
+                Choose once how this source is prepared. Assisted runs a single pass that
+                returns speaker timestamps, a complete draft transcript, word timing, and
+                quality flags. It cannot be repeated after it succeeds.
+              </p>
+              <div className="choice-grid">
+                <button onClick={() => startInitialization("assisted")}>
+                  <strong>Assisted start</strong>
+                  <span>Speaker timestamps, draft transcript, word timing, and quality flags.</span>
+                </button>
+                <button onClick={() => startInitialization("manual")}>
+                  <strong>Manual start</strong>
+                  <span>Waveform and video proxy only. You write the transcript yourself.</span>
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </section>
     );
   }
 
+  const saveLabel =
+    saver.status === "saving"
+      ? "Saving…"
+      : saver.status === "failed"
+        ? "Save failed"
+        : saver.status === "saved"
+          ? "Saved"
+          : "No unsaved changes";
+
   return (
     <section className="studio-page">
       <aside className="studio-rail">
-        <button className="back" onClick={onBack}>← {project.project.name}</button>
-        <span className="eyebrow">Source studio</span>
+        <button className="back" onClick={() => void leave(onBack)}>
+          ← {project.project.name}
+        </button>
+        <span className="eyebrow">Source review</span>
         <h2>{detail.original_name}</h2>
         <div className="source-facts">
           <span><strong>{seconds(detail.duration_samples || 0)}s</strong> duration</span>
           <span><strong>v{annotation.version}</strong> annotation</span>
-          <span><strong>{detail.overlaps.length}</strong> overlaps</span>
+          <span><strong>{annotation.transcript.length}</strong> segments</span>
         </div>
-        <nav>
-          {[
-            ["source", "1", "Source activity"],
-            ["transcript", "2", "Transcript"],
-            ["overlap", "3", "Overlap recovery"],
-            ["clips", "4", "Clips and review"],
-          ].map(([value, number, label]) => (
-            <button key={value} className={tab === value ? "active" : ""} onClick={() => setTab(value as typeof tab)}>
-              <span>{number}</span>{label}
-            </button>
-          ))}
-        </nav>
+        <div className={`save-state ${saver.status}`} role="status" aria-live="polite">
+          {saveLabel}
+        </div>
         <div className="rail-actions">
-          <button onClick={undo} disabled={!history.length}>Undo</button>
-          <button onClick={redo} disabled={!future.length}>Redo</button>
-          <button className="primary" onClick={() => save()} disabled={saving}>{saving ? "Saving…" : "Save now"}</button>
+          <button onClick={undo} disabled={readOnly || !history.length}>Undo</button>
+          <button onClick={redo} disabled={readOnly || !future.length}>Redo</button>
+          <button
+            className="primary"
+            onClick={saver.saveNow}
+            disabled={readOnly || saver.status === "saving"}
+          >
+            {saver.status === "saving" ? "Saving…" : "Save now"}
+          </button>
           <details className="revision-history">
             <summary>{detail.annotation_revisions.length} saved revisions</summary>
             {detail.annotation_revisions.map((revision) => (
@@ -1280,875 +1266,155 @@ function Studio({
           <button className="danger-soft" onClick={deleteSource}>Delete source</button>
         </div>
       </aside>
+
       <div className="studio-main">
-        {tab === "source" && (
-          <>
-            <section className="studio-heading">
-              <div>
-                <span className="eyebrow">Authoritative source annotation</span>
-                <h1>Who spoke when?</h1>
-                <p>Speaker lanes may overlap. Red regions are removed from both exported channels.</p>
-              </div>
-              <div className="assistant-settings">
-                <label className="assistant-choice">
-                  Moshi speaker
-                  <select
-                    value={annotation.assistant_speaker || ""}
-                    onChange={(event) => edit({ ...annotation, assistant_speaker: event.target.value as Speaker })}
-                  >
-                    <option value="">Choose…</option>
-                    <option value="A">Speaker A</option>
-                    <option value="B">Speaker B</option>
-                  </select>
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={annotation.activities_finalized}
-                    disabled={!annotation.assistant_speaker || !annotation.activities.length}
-                    onChange={(event) =>
-                      edit({ ...annotation, activities_finalized: event.target.checked })
-                    }
-                  />
-                  Human speaker regions are finalized
-                </label>
-              </div>
-            </section>
-            {detail.inspection?.channel_routing && (
-              <section className="card identity-lock">
-                <div>
-                  <span className="eyebrow">Channel-first routing</span>
-                  <h2>Preserve isolated source channels</h2>
-                  <p>
-                    The inspector recommends {detail.inspection.channel_routing.recommended_mode.replaceAll("_", " ")}.
-                    Independent routing is never enabled without your confirmation.
-                  </p>
-                  <div className="reason-list">
-                    <span>{detail.inspection.channel_routing.reason.replaceAll("_", " ")}</span>
-                    {detail.inspection.channel_routing.absolute_correlation !== undefined && (
-                      <span>correlation {detail.inspection.channel_routing.absolute_correlation.toFixed(3)}</span>
-                    )}
-                    {detail.inspection.channel_routing.estimated_lag_ms !== undefined && (
-                      <span>lag {detail.inspection.channel_routing.estimated_lag_ms.toFixed(2)} ms</span>
-                    )}
-                    {detail.inspection.channel_routing.dual_mono && <span>dual mono</span>}
-                  </div>
-                </div>
-                <label>
-                  Routing mode
-                  <select
-                    value={annotation.channel_routing_mode}
-                    onChange={(event) => {
-                      const mode = event.target.value as Annotation["channel_routing_mode"];
-                      edit({
-                        ...annotation,
-                        channel_routing_mode: mode,
-                        channel_routing_verified: false,
-                        speaker_channel_map: mode === "independent_stereo"
-                          ? {
-                              A: detail.inspection?.channel_routing
-                                ?.suggested_speaker_channel_map?.A ?? 0,
-                              B: detail.inspection?.channel_routing
-                                ?.suggested_speaker_channel_map?.B ?? 1,
-                            }
-                          : {},
-                      });
-                    }}
-                  >
-                    <option value="mono">Mixed/mono analysis</option>
-                    <option
-                      value="independent_stereo"
-                      disabled={
-                        !detail.urls.canonical_channels
-                        || detail.inspection?.channel_routing?.channel_count !== 2
-                      }
-                    >
-                      Independent stereo channels
-                    </option>
-                  </select>
-                </label>
-                {annotation.channel_routing_mode === "independent_stereo" && (
-                  <>
-                    <label>
-                      Speaker A channel
-                      <select
-                        value={annotation.speaker_channel_map.A ?? 0}
-                        onChange={(event) => {
-                          const channel = Number(event.target.value);
-                          edit({
-                            ...annotation,
-                            channel_routing_verified: false,
-                            speaker_channel_map: { A: channel, B: 1 - channel },
-                          });
-                        }}
-                      >
-                        <option value={0}>Channel 1 / left</option>
-                        <option value={1}>Channel 2 / right</option>
-                      </select>
-                    </label>
-                    <label>
-                      Speaker B channel
-                      <strong>
-                        {annotation.speaker_channel_map.B === 0
-                          ? "Channel 1 / left"
-                          : "Channel 2 / right"}
-                      </strong>
-                    </label>
-                    {detail.urls.canonical_channels && (
-                      <label className="wide">
-                        Preserved stereo preview
-                        <audio controls preload="metadata" src={detail.urls.canonical_channels} />
-                      </label>
-                    )}
-                    <label className="checkbox wide">
-                      <input
-                        type="checkbox"
-                        checked={annotation.channel_routing_verified}
-                        onChange={(event) =>
-                          edit({
-                            ...annotation,
-                            channel_routing_verified: event.target.checked,
-                          })
-                        }
-                      />
-                      I confirmed that A and B are isolated on the selected channels.
-                    </label>
-                  </>
-                )}
-              </section>
-            )}
-            <section className="card identity-lock">
-              <div>
-                <span className="eyebrow">Stable speaker identity</span>
-                <h2>Lock A and B to confirmed voices</h2>
-                <p>
-                  Choose one clean, non-overlapping turn for each person. Stable diarization
-                  matches future detected labels to these voice references.
-                </p>
-              </div>
-              {(["A", "B"] as Speaker[]).map((speaker) => {
-                const reference = (annotation.speaker_references || []).find(
-                  (value) => value.speaker === speaker,
-                );
-                const turns = cleanSpeakerTurns(annotation, speaker);
-                const selected = turns.find(
-                  (turn) =>
-                    turn.start_sample === reference?.start_sample
-                    && Math.min(
-                      turn.end_sample,
-                      turn.start_sample + 8 * 24_000,
-                    ) === reference?.end_sample,
-                );
-                return (
-                  <label key={speaker}>
-                    Speaker {speaker} reference
-                    <select
-                      value={selected?.id || ""}
-                      onChange={(event) =>
-                        setSpeakerReference(speaker, event.target.value)
-                      }
-                    >
-                      <option value="">Choose clean turn…</option>
-                      {turns.map((turn) => (
-                        <option key={turn.id} value={turn.id}>
-                          {seconds(turn.start_sample)}–{seconds(turn.end_sample)}s ·{" "}
-                          first {Math.min(
-                            8,
-                            Number(seconds(turn.end_sample - turn.start_sample)),
-                          )}s
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                );
-              })}
+        <section className="studio-heading">
+          <div>
+            <span className="eyebrow">Review audio and transcript</span>
+            <h1>Check what was said, and when.</h1>
+            <p>
+              Select a speaker region to focus its transcript entries, or select an entry to
+              play its range from the original recording.
+            </p>
+          </div>
+        </section>
+
+        {processing && (
+          <div className="inline-banner" role="status">
+            Preparing this source. Editing unlocks when the result is committed.
+          </div>
+        )}
+
+        {draftOffer && !readOnly && (
+          <div className="draft-recovery card" role="alert">
+            <div>
+              <strong>Unsaved edits were recovered</strong>
+              <p>
+                A local draft for this source differs from revision {annotation.version}.
+                Restore it, or discard it and keep the saved revision.
+              </p>
+            </div>
+            <div className="draft-actions">
               <button
                 className="primary"
-                disabled={
-                  new Set((annotation.speaker_references || []).map((value) => value.speaker))
-                    .size !== 2
-                }
-                onClick={() => queue("rediarize")}
+                onClick={() => {
+                  edit({ ...draftOffer, version: annotation.version });
+                  setDraftOffer(null);
+                  setNotice("Local draft restored. It will save as the next revision.");
+                }}
               >
-                Run stable diarization
+                Restore draft
               </button>
-            </section>
-            <QualityDashboard detail={detail} annotation={annotation} />
-            <WaveformEditor
-              audioUrl={detail.urls.canonical_audio}
-              videoUrl={detail.urls.video_proxy}
-              annotation={annotation}
-              durationSamples={detail.duration_samples || 1}
-              frameRate={detail.inspection?.video_frame_rate || 30}
-              onChange={edit}
-            />
-            <Rights detail={detail} onReload={onReload} setError={setError} />
-          </>
-        )}
-        {tab === "transcript" && (
-          <Transcript
-            detail={detail}
-            annotation={annotation}
-            onChange={edit}
-            onTranscribe={() => queue("transcribe")}
-            onRealign={() => queue("realign")}
-            onReview={() => queue("review-transcript")}
-          />
-        )}
-        {tab === "overlap" && (
-          <Overlap
-            detail={detail}
-            annotation={annotation}
-            onRecover={() => queue("recover-overlap")}
-            onTranscribe={queueOverlapTranscription}
-            onReload={onReload}
-            setError={setError}
-          />
-        )}
-        {tab === "clips" && (
-          <Clips
-            detail={detail}
-            onGenerate={() => queue("generate")}
-            onReload={onReload}
-            setError={setError}
-          />
-        )}
-      </div>
-    </section>
-  );
-}
-
-function QualityDashboard({
-  detail,
-  annotation,
-}: {
-  detail: SourceDetail;
-  annotation: Annotation;
-}) {
-  const metrics = detail.quality_dashboard || {
-    assistant_alignment_coverage: 0,
-    golden_target: 20,
-    model_character_error_rate: null,
-    speaker_correction_rate: null,
-  };
-  const unresolved = annotation.transcript.filter(
-    (value) =>
-      value.quality_flags.some((flag) => highRiskTranscriptFlags.has(flag))
-      && !value.human_verified,
-  );
-  const goldenExamples = annotation.transcript.filter(
-    (value) => value.human_verified && value.text.trim(),
-  ).length;
-  const percent = (value?: number | null) =>
-    value == null ? "Not measured" : `${(value * 100).toFixed(1)}%`;
-  return (
-    <section className="card quality-dashboard">
-      <div>
-        <span className="eyebrow">Accuracy dashboard</span>
-        <h2>Review evidence, not just model confidence</h2>
-      </div>
-      <div className="metric-grid">
-        <span>
-          <small>Review queue</small>
-          <strong>{unresolved.length}</strong>
-        </span>
-        <span>
-          <small>Moshi unresolved</small>
-          <strong>
-            {unresolved.filter(
-              (value) => value.speaker === annotation.assistant_speaker,
-            ).length}
-          </strong>
-        </span>
-        <span>
-          <small>Moshi alignment</small>
-          <strong>{percent(metrics.assistant_alignment_coverage)}</strong>
-        </span>
-        <span>
-          <small>Golden examples</small>
-          <strong>{goldenExamples}/{metrics.golden_target}</strong>
-        </span>
-        <span>
-          <small>Model character error</small>
-          <strong>{percent(metrics.model_character_error_rate)}</strong>
-        </span>
-        <span>
-          <small>Speaker correction rate</small>
-          <strong>{percent(metrics.speaker_correction_rate)}</strong>
-        </span>
-      </div>
-      <p>
-        Human-verified utterances form the exported golden regression set. Aim for at
-        least {metrics.golden_target} representative Egyptian-Arabic and code-switching
-        examples before comparing model or configuration changes.
-      </p>
-    </section>
-  );
-}
-
-function Rights({ detail, onReload, setError }: { detail: SourceDetail; onReload: () => void; setError: (value: string) => void }) {
-  const [origin, setOrigin] = useState(detail.origin);
-  const [basis, setBasis] = useState(detail.rights_basis || "licensed");
-  const [notes, setNotes] = useState(detail.rights_notes);
-  const [confirmed, setConfirmed] = useState(detail.rights_confirmed);
-
-  async function save() {
-    const normalizedOrigin = origin.trim();
-    if (!normalizedOrigin) {
-      setError("Enter the recording origin or source URL before saving rights.");
-      return;
-    }
-    try {
-      await api(`/api/sources/${detail.id}/rights`, jsonRequest("PUT", {
-        origin: normalizedOrigin,
-        rights_basis: basis,
-        rights_notes: notes,
-        rights_confirmed: confirmed,
-      }));
-      onReload();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
-  return (
-    <section className="card rights-card">
-      <div><span className="eyebrow">Required before export</span><h2>Source rights and provenance</h2></div>
-      <label>Origin or source URL<input value={origin} onChange={(event) => setOrigin(event.target.value)} placeholder="Owned recording or source URL" /></label>
-      <label>Rights basis<select value={basis} onChange={(event) => setBasis(event.target.value)}><option value="owned">Owned</option><option value="consent">Participant consent</option><option value="licensed">Licensed</option><option value="public_domain">Public domain</option><option value="other">Other</option></select></label>
-      <label className="wide">Notes<textarea value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
-      <label className="checkbox wide"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I confirm this source may be used for model training.</label>
-      <button className="primary" onClick={save}>Save declaration</button>
-    </section>
-  );
-}
-
-function Transcript({
-  detail,
-  annotation,
-  onChange,
-  onTranscribe,
-  onRealign,
-  onReview,
-}: {
-  detail: SourceDetail;
-  annotation: Annotation;
-  onChange: (value: Annotation) => void;
-  onTranscribe: () => void;
-  onRealign: () => void;
-  onReview: () => void;
-}) {
-  const [view, setView] = useState<"queue" | "all">("queue");
-  const priorities = new Map(
-    annotation.transcript
-      .map((value) => [
-        value.id,
-        transcriptPriority(value, annotation.assistant_speaker),
-      ] as const)
-      .filter(([, priority]) => priority > 0),
-  );
-  const unresolvedFlagged = annotation.transcript.filter(
-    (value) =>
-      value.quality_flags.some((flag) => highRiskTranscriptFlags.has(flag))
-      && !value.human_verified,
-  ).length;
-  const display = annotation.transcript
-    .map((item, index) => ({ item, index }))
-    .filter(({ item }) => view === "all" || priorities.has(item.id))
-    .sort((first, second) =>
-      view === "queue"
-        ? (priorities.get(second.item.id) || 0)
-          - (priorities.get(first.item.id) || 0)
-        : first.index - second.index
-    );
-  return (
-    <section>
-      <div className="studio-heading">
-        <div><span className="eyebrow">Text then realign</span><h1>Correct the conversation.</h1><p>Only the selected Moshi speaker’s aligned words enter the official sidecar. Flagged Moshi utterances must be corrected, realigned, then verified against the audio before export.</p></div>
-        <div className="heading-actions">
-          <button onClick={onTranscribe}>Generate transcript</button>
-          <button
-            onClick={onReview}
-            disabled={!unresolvedFlagged}
-          >
-            Generate second-pass candidates
-          </button>
-          <button className="primary" onClick={onRealign}>Realign corrected text</button>
-        </div>
-      </div>
-      <div className="review-toolbar card">
-        <div>
-          <strong>{priorities.size} prioritized items</strong>
-          <small>
-            Character corruption, repeated text, overlap, decoder disagreement, and
-            alignment failures appear first.
-          </small>
-        </div>
-        <div className="heading-actions">
-          <button className={view === "queue" ? "primary" : ""} onClick={() => setView("queue")}>
-            Review queue
-          </button>
-          <button className={view === "all" ? "primary" : ""} onClick={() => setView("all")}>
-            All utterances
-          </button>
-        </div>
-      </div>
-      <div className="transcript-list">
-        {display.map(({ item, index }) => {
-          const requiresVerification = item.quality_flags.some((flag) =>
-            highRiskTranscriptFlags.has(flag)
-          );
-          return (
-          <article className={`utterance ${requiresVerification ? "needs-verification" : ""}`} key={item.id}>
-            <div className="utterance-meta">
-              <span>{seconds(item.start_sample)}–{seconds(item.end_sample)}s</span>
-              {priorities.has(item.id) && (
-                <span className="pill warn">
-                  Priority {priorities.get(item.id)}
-                </span>
-              )}
-              <select
-                value={item.speaker || ""}
-                onChange={(event) => onChange({
-                  ...annotation,
-                  transcript: annotation.transcript.map((value, itemIndex) => itemIndex === index ? {
-                    ...value,
-                    speaker: event.target.value as Speaker,
-                    alignment_status: "not_run",
-                    human_verified: false,
-                  } : value),
-                })}
+              <button
+                onClick={() => {
+                  clearDraft(userId, detail.id, annotation.version);
+                  setDraftOffer(null);
+                }}
               >
-                <option value="">Unknown</option><option value="A">Speaker A</option><option value="B">Speaker B</option>
-              </select>
-              <span className={`pill ${item.alignment_status === "aligned" ? "good" : "warn"}`}>{item.alignment_status.replaceAll("_", " ")}</span>
-              {item.quality_flags.map((flag) => (
-                <span className="quality-flag" key={flag}>{flag.replaceAll("_", " ")}</span>
-              ))}
-              <label className="checkbox transcript-verification">
-                <input
-                  type="checkbox"
-                  checked={item.human_verified}
-                  disabled={item.alignment_status !== "aligned"}
-                  onChange={(event) => onChange({
-                    ...annotation,
-                    transcript: annotation.transcript.map((value, itemIndex) =>
-                      itemIndex === index
-                        ? { ...value, human_verified: event.target.checked }
-                        : value
-                    ),
-                  })}
-                />
-                {requiresVerification ? "Verified against audio" : "Add to golden set"}
-              </label>
+                Discard draft
+              </button>
             </div>
-            <div className="utterance-editor">
-              <audio
-                controls
-                preload="metadata"
-                src={`${detail.urls.canonical_audio}#t=${seconds(item.start_sample)},${seconds(item.end_sample)}`}
-              />
-              <textarea
-                dir="rtl"
-                lang="ar"
-                value={item.text}
-                onChange={(event) => onChange({
-                  ...annotation,
-                  transcript: annotation.transcript.map((value, itemIndex) => itemIndex === index ? {
-                    ...value,
-                    text: event.target.value,
-                    alignment_status: "not_run",
-                    human_verified: false,
-                  } : value),
-                })}
-              />
-              {!!item.review_candidates?.length && (
-                <div className="candidate-list">
-                  {item.review_candidates.map((candidate, candidateIndex) => (
-                    <div className="candidate-card" key={`${candidate.source}-${candidateIndex}`}>
-                      <div>
-                        <strong>{candidate.source.replaceAll("_", " ")}</strong>
-                        <small>{candidate.model}</small>
-                      </div>
-                      <p dir="rtl" lang="ar">{candidate.text || "No speech decoded"}</p>
-                      <div className="reason-list">
-                        {candidate.quality_flags.map((flag) => (
-                          <span key={flag}>{flag.replaceAll("_", " ")}</span>
-                        ))}
-                      </div>
-                      <button
-                        disabled={!candidate.text.trim()}
-                        onClick={() => onChange({
-                          ...annotation,
-                          transcript: annotation.transcript.map((value, itemIndex) =>
-                            itemIndex === index
-                              ? {
-                                  ...value,
-                                  text: candidate.text,
-                                  alignment_status: "not_run",
-                                  human_verified: false,
-                                }
-                              : value
-                          ),
-                        })}
-                      >
-                        Use this candidate
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </article>
-          );
-        })}
-        {!display.length && (
-          <div className="empty-card">
-            {annotation.transcript.length
-              ? "The prioritized review queue is clear."
-              : "Generate a transcript or add source text after manual annotation."}
           </div>
         )}
+
+        <WaveformEditor
+          audioUrl={detail.urls.canonical_audio}
+          videoUrl={detail.urls.video_proxy}
+          annotation={annotation}
+          durationSamples={detail.duration_samples || 0}
+          frameRate={detail.inspection?.video_frame_rate || 25}
+          readOnly={readOnly}
+          focusRange={focusRange}
+          onTimeChange={setPlayhead}
+          onRegionClick={focusRegion}
+          onRangeSelect={addSegmentAt}
+          onChange={edit}
+        />
+
+        <TranscriptPanel
+          annotation={annotation}
+          durationSamples={detail.duration_samples || 0}
+          selectedId={selectedId}
+          filteredIds={filteredIds}
+          playheadSample={playhead}
+          readOnly={readOnly}
+          onSelect={setSelectedId}
+          onPlay={playSegment}
+          onChange={edit}
+          onSplit={splitAt}
+          onJoin={joinWith}
+          onDelete={removeSegment}
+          onAdd={addSegmentAtPlayhead}
+          onClearFilter={() => setFilteredIds(null)}
+        />
       </div>
-    </section>
-  );
-}
 
-function Overlap({ detail, annotation, onRecover, onTranscribe, onReload, setError }: { detail: SourceDetail; annotation: Annotation; onRecover: () => void; onTranscribe: (regionId: string) => void; onReload: () => void; setError: (value: string) => void }) {
-  const [auditioned, setAuditioned] = useState<Record<string, boolean>>({});
-  const recoveryReady = Boolean(
-    annotation.assistant_speaker && annotation.activities_finalized,
-  );
-
-  async function decide(regionId: string, decision: "approve" | "reject") {
-    try {
-      await api(
-        `/api/sources/${detail.id}/overlaps/${regionId}/decision`,
-        jsonRequest("POST", { decision, auditioned: Boolean(auditioned[regionId]) }),
-      );
-      onReload();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
-  return (
-    <section>
-      <div className="studio-heading">
-        <div><span className="eyebrow">Mixed audio safeguard</span><h1>Recover overlap, region by region.</h1><p>Unapproved or failed regions remain muted in both output channels.</p></div>
-        <button className="primary" disabled={!recoveryReady} onClick={onRecover}>
-          Run overlap recovery
-        </button>
-      </div>
-      {!recoveryReady && (
-        <div className="validation-box invalid">
-          <strong>Overlap recovery is locked</strong>
-          <span>
-            Return to Source activity, choose the Moshi speaker, review the A/B
-            regions, enable “Human speaker regions are finalized,” and wait for the
-            saved revision.
-          </span>
-        </div>
-      )}
-      <div className="overlap-list">
-        {detail.overlap_recoveries.map((item, index) => (
-          <article className="overlap-card card" key={item.region_id}>
-            <div className="overlap-title"><span className="source-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{seconds(item.start_sample)}–{seconds(item.end_sample)}s</strong><small>{item.status}</small></div><span className={`pill ${item.decision === "approve" ? "good" : "warn"}`}>{item.decision || "needs review"}</span></div>
-            <div className="audition-grid">
-              <label>Original mixture<audio controls src={`/media/${detail.id}/overlap/${item.region_id}/original`} /></label>
-              {item.status === "recovered" && <><label>Recovered Moshi<audio controls src={`/media/${detail.id}/overlap/${item.region_id}/assistant`} /></label><label>Recovered user<audio controls src={`/media/${detail.id}/overlap/${item.region_id}/user`} /></label></>}
-            </div>
-            {item.status === "recovered" && (
-              <>
-              <div className="stem-transcript-tools">
-                <button onClick={() => onTranscribe(item.region_id)}>
-                  Transcribe isolated stems
-                </button>
-                <small>
-                  Compare isolated-voice text with the mixed transcript before approval.
-                </small>
-              </div>
-              {Boolean(item.details.stem_transcripts) && (
-                <div className="stem-transcripts">
-                  {Object.entries(
-                    item.details.stem_transcripts as Record<
-                      string,
-                      { text: string; model: string; quality_flags: string[] }
-                    >,
-                  ).map(([role, candidate]) => (
-                    <div key={role}>
-                      <strong>{role === "assistant" ? "Recovered Moshi" : "Recovered user"}</strong>
-                      <small>{candidate.model}</small>
-                      <p dir="rtl" lang="ar">{candidate.text || "No speech decoded"}</p>
-                      <div className="reason-list">
-                        {candidate.quality_flags.map((flag) => (
-                          <span key={flag}>{flag.replaceAll("_", " ")}</span>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div className="clip-decision">
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(auditioned[item.region_id] || item.auditioned)}
-                    onChange={(event) =>
-                      setAuditioned((values) => ({
-                        ...values,
-                        [item.region_id]: event.target.checked,
-                      }))
-                    }
-                  />
-                  I auditioned the original and both recovered voices.
-                </label>
-                <div className="heading-actions">
-                  <button
-                    className="primary"
-                    disabled={!auditioned[item.region_id] && !item.auditioned}
-                    onClick={() => decide(item.region_id, "approve")}
-                  >
-                    Approve recovery
-                  </button>
-                  <button
-                    className="danger-soft"
-                    disabled={!auditioned[item.region_id] && !item.auditioned}
-                    onClick={() => decide(item.region_id, "reject")}
-                  >
-                    Reject and mute
-                  </button>
-                </div>
-              </div>
-              </>
-            )}
-          </article>
-        ))}
-        {!detail.overlap_recoveries.length && <div className="empty-card">{detail.overlaps.length ? `${detail.overlaps.length} overlap regions are ready for recovery.` : "No overlap is currently derived from the speaker lanes."}</div>}
-      </div>
-    </section>
-  );
-}
-
-function Clips({ detail, onGenerate, onReload, setError }: { detail: SourceDetail; onGenerate: () => void; onReload: () => void; setError: (value: string) => void }) {
-  const [mode, setMode] = useState<"" | "count" | "target_duration" | "manual">("");
-  const [value, setValue] = useState("5");
-  const [manual, setManual] = useState("0, 60");
-  const [boundaries, setBoundaries] = useState<number[]>([]);
-  const plan = detail.clip_plan;
-  const artifacts = detail.clip_artifacts?.artifacts || [];
-  const minimumClipCount = Math.max(
-    1,
-    Math.ceil((detail.duration_samples || 0) / (100 * 24_000)),
-  );
-
-  useEffect(() => {
-    if (!plan?.clips.length) {
-      setBoundaries([]);
-      return;
-    }
-    setBoundaries([
-      plan.clips[0].start_sample,
-      ...plan.clips.map((clip) => clip.end_sample),
-    ]);
-    if (plan.mode === "count" || plan.mode === "target_duration" || plan.mode === "manual") {
-      setMode(plan.mode);
-    }
-    if (plan.mode === "count" && plan.request.count) {
-      setValue(String(plan.request.count));
-    } else if (plan.mode === "target_duration" && plan.request.target_duration_seconds) {
-      setValue(String(plan.request.target_duration_seconds));
-    }
-  }, [plan]);
-
-  async function propose(
-    selectedMode = mode,
-    adjusted = boundaries,
-    countOverride?: number,
-  ) {
-    if (!selectedMode) {
-      setError("Choose a planning mode first");
-      return;
-    }
-    const body = selectedMode === "count"
-      ? { mode: selectedMode, count: countOverride ?? Number(value) }
-      : selectedMode === "target_duration"
-        ? { mode: selectedMode, target_duration_seconds: Number(value) }
-        : {
-            mode: "manual",
-            boundaries_samples: adjusted.length >= 2
-              ? adjusted
-              : manual.split(",").map((item) => Math.round(Number(item.trim()) * 24_000)),
-          };
-    try {
-      await api(`/api/sources/${detail.id}/clip-plan`, jsonRequest("POST", body));
-      onReload();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
-  function moveBoundary(index: number, position: number) {
-    setBoundaries((current) =>
-      current.map((valueAtIndex, itemIndex) =>
-        itemIndex === index
-          ? Math.max(current[index - 1] + 1, Math.min(current[index + 1] - 1, position))
-          : valueAtIndex,
-      ),
-    );
-  }
-
-  function addBoundary() {
-    if (boundaries.length < 2) return;
-    let longestIndex = 0;
-    for (let index = 1; index < boundaries.length - 1; index += 1) {
-      if (
-        boundaries[index + 1] - boundaries[index]
-        > boundaries[longestIndex + 1] - boundaries[longestIndex]
-      ) {
-        longestIndex = index;
-      }
-    }
-    const position = Math.round(
-      (boundaries[longestIndex] + boundaries[longestIndex + 1]) / 2,
-    );
-    setBoundaries([
-      ...boundaries.slice(0, longestIndex + 1),
-      position,
-      ...boundaries.slice(longestIndex + 1),
-    ]);
-  }
-
-  return (
-    <section>
-      <div className="studio-heading"><div><span className="eyebrow">Conversation-aware boundaries</span><h1>Plan, render, then listen.</h1><p>Final clips must be 20–100 seconds and contain both speakers plus an exchange.</p></div></div>
-      <div className="planner card">
-        <label>Planning mode<select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}><option value="">Choose a mode…</option><option value="count">Desired clip count</option><option value="target_duration">Target duration</option><option value="manual">Manual boundaries</option></select></label>
-        {mode === "manual" ? <label className="wide">Boundary seconds, comma separated<input value={manual} onChange={(event) => setManual(event.target.value)} /></label> : mode ? <label>{mode === "count" ? "Clip count" : "Target seconds"}<input type="number" value={value} onChange={(event) => setValue(event.target.value)} /></label> : null}
-        <button className="primary" disabled={!mode} onClick={() => propose()}>Propose boundaries</button>
-        <button
-          onClick={() => {
-            setMode("count");
-            setValue(String(minimumClipCount));
-            void propose("count", boundaries, minimumClipCount);
+      {conflict && (
+        <ConflictDialog
+          conflict={conflict}
+          onKeepLocal={() => {
+            // Rebase the user's content onto the newer server version so the next
+            // save is accepted without discarding either side.
+            const rebased = { ...conflict.local, version: conflict.server.version };
+            setConflict(null);
+            setAnnotation(rebased);
+            saver.schedule(rebased);
+            setNotice("Your edits were kept and will save onto the newer revision.");
           }}
-        >
-          Find safe {minimumClipCount}+-clip plan
-        </button>
-        <small className="wide">
-          This {seconds(detail.duration_samples || 0)}s source needs at least {minimumClipCount} clips.
-          Automatic planning searches aligned-word pauses inside long speaker turns.
-        </small>
-      </div>
-      {plan && <div className="plan-summary"><span className={`pill ${plan.feasible ? "good" : "bad"}`}>{plan.feasible ? "Feasible" : "Needs adjustment"}</span><p>{plan.message || `${plan.clips.length} valid conversation clips`}</p><button className="primary" disabled={!plan.feasible} onClick={onGenerate}>{detail.clips_stale ? "Generate stereo clips" : "Regenerate clips"}</button></div>}
-      {boundaries.length >= 2 && (
-        <div className="boundary-editor card">
-          <div>
-            <span className="eyebrow">Manual refinement</span>
-            <h2>Drag, add, or remove boundaries</h2>
-            <p>Automatic planning is recommended. Manual markers are re-checked for words, overlap, speaker balance, and duration after saving.</p>
-          </div>
-          {boundaries.slice(1, -1).map((position, innerIndex) => {
-            const index = innerIndex + 1;
-            return (
-              <label key={`boundary-${index}`}>
-                <span>Boundary {index} · {seconds(position)}s</span>
-                <input
-                  type="range"
-                  min={boundaries[index - 1] + 1}
-                  max={boundaries[index + 1] - 1}
-                  step="1"
-                  value={position}
-                  onChange={(event) => moveBoundary(index, Number(event.target.value))}
-                />
-                <button
-                  className="danger-soft"
-                  onClick={() =>
-                    setBoundaries(boundaries.filter((_, itemIndex) => itemIndex !== index))
-                  }
-                >
-                  Remove
-                </button>
-              </label>
-            );
-          })}
-          <div className="heading-actions">
-            <button onClick={addBoundary}>Add approximate boundary</button>
-            <button className="primary" onClick={() => propose("manual", boundaries)}>
-              Save adjusted boundaries
-            </button>
-          </div>
-        </div>
+          onTakeServer={() => {
+            clearDraft(userId, detail.id, conflict.local.version);
+            setConflict(null);
+            setAnnotation(conflict.server);
+            saver.reset(conflict.server);
+            onReload();
+            setNotice("The server revision was loaded.");
+          }}
+        />
       )}
-      <div className="clip-list">
-        {(artifacts.length ? artifacts : (plan?.clips || []).map((clip) => ({ clip } as ClipArtifact))).map((item, index) => (
-          <ClipReview key={item.clip.id} detail={detail} item={item} index={index} rendered={artifacts.length > 0} onReload={onReload} setError={setError} />
-        ))}
-      </div>
     </section>
   );
 }
 
-function ClipReview({ detail, item, index, rendered, onReload, setError }: { detail: SourceDetail; item: ClipArtifact; index: number; rendered: boolean; onReload: () => void; setError: (value: string) => void }) {
-  const [listened, setListened] = useState(item.decision?.auditioned || false);
-
-  async function decide(decision: "approve" | "reject" | "needs_work") {
-    try {
-      await api(`/api/sources/${detail.id}/clips/${item.clip.id}/decision`, jsonRequest("POST", { decision, auditioned: listened }));
-      onReload();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
+/**
+ * A stale save creates no revision. Both copies are preserved until the user
+ * chooses; nothing is merged automatically and nothing is discarded silently.
+ */
+function ConflictDialog({
+  conflict,
+  onKeepLocal,
+  onTakeServer,
+}: {
+  conflict: Conflict;
+  onKeepLocal: () => void;
+  onTakeServer: () => void;
+}) {
   return (
-    <article className="clip-card card">
-      <div className="clip-heading"><span className="source-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{seconds(item.clip.start_sample)}–{seconds(item.clip.end_sample)}s</strong><small>{Number(item.clip.metrics.duration_seconds).toFixed(1)} seconds · {item.clip.metrics.speaker_exchanges} exchanges</small></div><span className={`pill ${rendered && item.qc?.status === "PASS" ? "good" : item.clip.status === "valid" ? "warn" : "bad"}`}>{rendered ? item.qc.status : item.clip.status}</span></div>
-      {rendered && (
-        <>
-          <div className="playback-compare">
-            <label>
-              Original mixture
-              <audio
-                controls
-                preload="metadata"
-                src={`${detail.urls.canonical_audio}#t=${seconds(item.clip.start_sample)},${seconds(item.clip.end_sample)}`}
-              />
-            </label>
-            <label>
-              Rendered stereo
-              <StereoPlayer src={`/media/${detail.id}/clips/${item.clip.id}/audio`} />
-            </label>
+    <div className="modal-backdrop" role="presentation">
+      <div className="modal card" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+        <h2 id="conflict-title">This annotation changed elsewhere</h2>
+        <p>
+          Your edits were based on revision {conflict.local.version}, but the server is now at
+          revision {conflict.server.version}. Nothing was overwritten and no revision was
+          created.
+        </p>
+        <dl className="transfer-summary">
+          <div>
+            <dt>Your copy</dt>
+            <dd>{conflict.local.transcript.length} segments</dd>
           </div>
-          <div className="metric-grid">
-            {Object.entries(item.qc.metrics).slice(0, 8).map(([name, metric]) => (
-              <span key={name}>
-                <small>{name.replaceAll("_", " ")}</small>
-                <strong>{typeof metric === "number" ? metric.toFixed(3) : String(metric)}</strong>
-              </span>
-            ))}
+          <div>
+            <dt>Server copy</dt>
+            <dd>{conflict.server.transcript.length} segments</dd>
           </div>
-          <div className="reason-list">
-            {Number(item.clip.metrics.exclusion_ratio) > 0 && <span>contains muted exclusions</span>}
-            {item.raw_overlap_ratio > 0 && <span>contains overlap</span>}
-            {item.separation_used && <span>approved overlap recovery used</span>}
-            {item.routing_method && (
-              <span>routing: {item.routing_method.replaceAll("_", " ")}</span>
-            )}
-            {item.recovery_method && (
-              <span>recovery: {item.recovery_method.replaceAll("_", " ")}</span>
-            )}
-          </div>
-          {!!item.transcript?.original_and_normalized.length && (
-            <p className="clip-transcript" dir="rtl" lang="ar">
-              {item.transcript.original_and_normalized.map((word) => word.original).join(" ")}
-            </p>
-          )}
-        </>
-      )}
-      <div className="reason-list">{(rendered ? item.qc.reasons : item.clip.reasons).map((reason) => <span key={reason}>{reason.replaceAll("_", " ")}</span>)}</div>
-      {rendered && <div className="clip-decision"><label className="checkbox"><input type="checkbox" checked={listened} onChange={(event) => setListened(event.target.checked)} /> I listened to the complete stereo clip.</label><div className="heading-actions"><button className="primary" disabled={!listened || item.qc.status === "REJECT"} onClick={() => decide("approve")}>Approve</button><button onClick={() => decide("needs_work")}>Needs work</button><button className="danger-soft" onClick={() => decide("reject")}>Reject</button></div>{item.decision && <span className="pill good">Saved: {item.decision.decision}</span>}</div>}
-    </article>
+        </dl>
+        <div className="modal-actions">
+          <button type="button" onClick={onTakeServer}>Load server revision</button>
+          <button type="button" className="primary" onClick={onKeepLocal}>
+            Keep my edits
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

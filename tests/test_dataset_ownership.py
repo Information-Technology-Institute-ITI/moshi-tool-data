@@ -518,45 +518,16 @@ def test_cross_user_authorization_precedes_validation_and_causes_no_side_effects
             f"/api/projects/{project['id']}/sources",
             {"content": b"attack", "headers": {"x-filename": "attack.wav"}},
         ),
-        ("post", f"/api/projects/{project['id']}/exports", {"json": {}}),
-        ("get", f"/api/projects/{project['id']}/validate", {}),
-        ("get", f"/api/projects/{project['id']}/exports", {}),
         ("get", f"/api/sources/{source['id']}", {}),
         (
             "delete",
             f"/api/sources/{source['id']}",
             {},
         ),
-        ("put", f"/api/sources/{source['id']}/rights", {"json": {}}),
         ("post", f"/api/sources/{source['id']}/initialize", {"json": {}}),
-        ("post", f"/api/sources/{source['id']}/transcribe", {}),
-        ("post", f"/api/sources/{source['id']}/review-transcript", {}),
-        ("post", f"/api/sources/{source['id']}/rediarize", {}),
-        ("post", f"/api/sources/{source['id']}/realign", {}),
-        ("post", f"/api/sources/{source['id']}/recover-overlap", {}),
-        (
-            "post",
-            f"/api/sources/{source['id']}/overlaps/region_private/transcribe",
-            {},
-        ),
         ("get", f"/api/sources/{source['id']}/annotations", {}),
         ("get", f"/api/sources/{source['id']}/annotations/{annotation.version}", {}),
         ("put", f"/api/sources/{source['id']}/annotations", {"json": {}}),
-        ("get", f"/api/sources/{source['id']}/overlaps", {}),
-        (
-            "post",
-            f"/api/sources/{source['id']}/overlaps/region_private/decision",
-            {"json": {}},
-        ),
-        ("post", f"/api/sources/{source['id']}/clip-plan", {"json": {}}),
-        ("get", f"/api/sources/{source['id']}/clip-plan", {}),
-        ("post", f"/api/sources/{source['id']}/generate", {}),
-        ("get", f"/api/sources/{source['id']}/clips", {}),
-        (
-            "post",
-            f"/api/sources/{source['id']}/clips/{clip_id}/decision",
-            {"json": {}},
-        ),
         ("get", f"/api/jobs/{job['id']}", {}),
         ("post", f"/api/jobs/{job['id']}/retry", {}),
         ("get", f"/api/jobs/{job['id']}/events", {}),
@@ -565,30 +536,18 @@ def test_cross_user_authorization_precedes_validation_and_causes_no_side_effects
         ("get", f"/media/{source['id']}/channels", {}),
         ("get", f"/media/{source['id']}/proxy", {}),
         ("get", f"/media/{source['id']}/peaks", {}),
-        ("get", f"/media/{source['id']}/overlap/region_private/original", {}),
-        ("get", f"/media/{source['id']}/clips/{clip_id}/audio", {}),
-        ("get", f"/media/{source['id']}/clips/{clip_id}/alignment", {}),
-        ("get", f"/media/exports/{export['id']}/bundle", {}),
     ]
     protected_reads = [
         f"/api/projects/{project['id']}",
-        f"/api/projects/{project['id']}/exports",
         f"/api/sources/{source_id}",
         f"/api/sources/{source_id}/annotations",
         f"/api/sources/{source_id}/annotations/{annotation.version}",
-        f"/api/sources/{source_id}/overlaps",
-        f"/api/sources/{source_id}/clip-plan",
-        f"/api/sources/{source_id}/clips",
         f"/api/jobs/{job['id']}",
         f"/media/{source_id}/original",
         f"/media/{source_id}/canonical",
         f"/media/{source_id}/channels",
         f"/media/{source_id}/proxy",
         f"/media/{source_id}/peaks",
-        f"/media/{source_id}/overlap/region_private/original",
-        f"/media/{source_id}/clips/{clip_id}/audio",
-        f"/media/{source_id}/clips/{clip_id}/alignment",
-        f"/media/exports/{export['id']}/bundle",
     ]
 
     with (
@@ -614,8 +573,6 @@ def test_cross_user_authorization_precedes_validation_and_causes_no_side_effects
                 assert response.status_code == 200, (path, response.text)
                 if path.startswith("/media/"):
                     assert response.headers["cache-control"] == "private, no-store"
-        downloaded = bob_client.get(f"/media/exports/{export['id']}/bundle")
-        assert downloaded.content == b"private bundle"
 
     assert _snapshot_project_state(catalog, service.paths.root) == before
     assert not [path for path in service.paths.incoming.rglob("*") if path.is_file()]
@@ -817,7 +774,8 @@ def test_transfer_during_upload_and_enqueue_cannot_commit_for_former_owner(
 
         def enqueue() -> None:
             enqueue_result["response"] = owner_client.post(
-                f"/api/sources/{source['id']}/transcribe"
+                f"/api/sources/{source['id']}/initialize",
+                json={"mode": "assisted"},
             )
 
         enqueue_thread = threading.Thread(target=enqueue, daemon=True)

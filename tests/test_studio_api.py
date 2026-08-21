@@ -24,7 +24,7 @@ def test_state_changes_reject_untrusted_browser_origins(tmp_path) -> None:
         assert accepted.status_code == 201
 
 
-def test_studio_project_upload_rights_and_delete(tmp_path) -> None:
+def test_studio_project_upload_and_delete(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     with TestClient(app) as client:
         project = client.post(
@@ -39,9 +39,6 @@ def test_studio_project_upload_rights_and_delete(tmp_path) -> None:
         assert settings.status_code == 200
         assert settings.json()["name"] == "Cairo podcast set"
         assert settings.json()["language"] == "ar-EG"
-        validation = client.get(f"/api/projects/{project_id}/validate")
-        assert validation.status_code == 200
-        assert validation.json()["valid"] is False
         upload = client.post(
             f"/api/projects/{project_id}/sources",
             content=b"RIFF-not-yet-processed",
@@ -49,17 +46,6 @@ def test_studio_project_upload_rights_and_delete(tmp_path) -> None:
         )
         assert upload.status_code == 201
         source_id = upload.json()["id"]
-        rights = client.put(
-            f"/api/sources/{source_id}/rights",
-            json={
-                "origin": "Owned studio recording",
-                "rights_basis": "owned",
-                "rights_notes": "Participant releases recorded",
-                "rights_confirmed": True,
-            },
-        )
-        assert rights.status_code == 200
-        assert rights.json()["rights_confirmed"] is True
         assert client.get(f"/api/sources/{source_id}").status_code == 200
         missing_confirmation = client.delete(f"/api/sources/{source_id}")
         assert missing_confirmation.status_code == 422
@@ -209,52 +195,63 @@ def test_startup_repairs_legacy_annotation_past_source_end(tmp_path) -> None:
     assert repaired.activities[0].end_sample == 48_000
 
 
-def test_overlap_job_is_not_queued_until_regions_are_finalized(tmp_path) -> None:
+def test_removed_processing_surface_is_not_served(tmp_path) -> None:
+    """The product is one Assisted pass followed by editing and saving.
+
+    Every regeneration, overlap, clip, export, and rights route is gone from the
+    user API, so no browser action can start a second pass on a source.
+    """
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
-    service = app.state.studio
-    project = service.catalog.create_project(
-        "Overlap gate", owner_user_id=service.catalog.ensure_local_admin()["id"]
-    )
-    original = service.paths.originals / "overlap.wav"
-    original.write_bytes(b"placeholder")
-    source = service.catalog.create_source(
-        project["id"],
-        "overlap.wav",
-        service.paths.relative(original),
-        "audio/wav",
-        "a" * 64,
-        len(b"placeholder"),
-    )
-    service.catalog.update_source(source["id"], duration_samples=48_000, status="ready")
-    annotation = AnnotationDocument(
-        source_id=source["id"],
-        assistant_speaker="A",
-        activities=[
-            ActivityRegion(
-                speaker="A",
-                start_sample=0,
-                end_sample=30_000,
-            ),
-            ActivityRegion(
-                speaker="B",
-                start_sample=20_000,
-                end_sample=48_000,
-            ),
-        ],
-    )
-    saved = service.catalog.save_annotation(source["id"], 0, annotation)
-
     with TestClient(app) as client:
-        blocked = client.post(f"/api/sources/{source['id']}/recover-overlap")
-        assert blocked.status_code == 400
-        assert "Finalize and save" in blocked.json()["detail"]
-        assert not service.catalog.list_jobs(project["id"])
-
-        service.catalog.save_annotation(
-            source["id"],
-            saved.version,
-            saved.model_copy(update={"activities_finalized": True}),
+        project = client.post(
+            "/api/projects", json={"name": "One pass", "language": "ar"}
+        ).json()
+        upload = client.post(
+            f"/api/projects/{project['id']}/sources",
+            content=b"RIFF-not-yet-processed",
+            headers={"x-filename": "episode.wav", "content-type": "audio/wav"},
         )
-        accepted = client.post(f"/api/sources/{source['id']}/recover-overlap")
-        assert accepted.status_code == 202
-        assert accepted.json()["kind"] == "recover_overlap"
+        source_id = upload.json()["id"]
+
+        removed_posts = [
+            f"/api/sources/{source_id}/transcribe",
+            f"/api/sources/{source_id}/review-transcript",
+            f"/api/sources/{source_id}/rediarize",
+            f"/api/sources/{source_id}/realign",
+            f"/api/sources/{source_id}/recover-overlap",
+            f"/api/sources/{source_id}/overlaps/region_1/transcribe",
+            f"/api/sources/{source_id}/overlaps/region_1/decision",
+            f"/api/sources/{source_id}/clip-plan",
+            f"/api/sources/{source_id}/generate",
+            f"/api/sources/{source_id}/clips/clip_1/decision",
+            f"/api/projects/{project['id']}/exports",
+        ]
+        # 404 or 405 both mean the route is not served; the SPA catch-all claims
+        # the path for GET, so an unrouted POST surfaces as 405.
+        for path in removed_posts:
+            assert client.post(path, json={}).status_code in {404, 405}, path
+
+        removed_gets = [
+            f"/api/sources/{source_id}/overlaps",
+            f"/api/sources/{source_id}/clip-plan",
+            f"/api/sources/{source_id}/clips",
+            f"/api/projects/{project['id']}/validate",
+            f"/api/projects/{project['id']}/exports",
+            f"/media/{source_id}/overlap/region_1/assistant",
+            f"/media/{source_id}/clips/clip_1/stereo",
+            "/media/exports/export_1/bundle",
+        ]
+        for path in removed_gets:
+            assert client.get(path).status_code == 404, path
+
+        assert client.put(
+            f"/api/sources/{source_id}/rights", json={}
+        ).status_code in {404, 405}
+
+        # The single allowed pass is still reachable, and no job existed before it.
+        assert not client.get(f"/api/projects/{project['id']}").json()["jobs"]
+        started = client.post(
+            f"/api/sources/{source_id}/initialize", json={"mode": "assisted"}
+        )
+        assert started.status_code == 202
+        assert started.json()["kind"] == "initialize"

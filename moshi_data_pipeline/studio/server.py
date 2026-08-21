@@ -37,17 +37,11 @@ from moshi_data_pipeline.studio.catalog import (
     ProtocolMismatchError,
     VersionConflictError,
 )
-from moshi_data_pipeline.studio.clip_registry import clip_artifacts
 from moshi_data_pipeline.studio.domain import (
     AnnotationSave,
-    ClipPlanRequest,
-    DecisionPayload,
-    ExportCreate,
-    OverlapDecisionPayload,
     ProjectCreate,
     ProjectOwnerUpdate,
     ProjectUpdate,
-    SourceRights,
 )
 from moshi_data_pipeline.studio.gpu_dispatcher import GpuDispatcherSettings
 from moshi_data_pipeline.studio.gpu_status import public_gpu_check
@@ -931,14 +925,6 @@ def create_studio_app(
         )
         return {"deleted": deleted["id"], "recoverable": False}
 
-    @app.put("/api/sources/{source_id}/rights")
-    def save_rights(source_id: str, payload: SourceRights, request: Request):
-        return service.save_rights(
-            source_id,
-            payload,
-            principal=require_principal(request),
-        )
-
     @app.post("/api/sources/{source_id}/initialize", status_code=202)
     def initialize_source_job(
         source_id: str,
@@ -967,54 +953,6 @@ def create_studio_app(
             principal=require_principal(request),
         )
 
-    @app.post("/api/sources/{source_id}/transcribe", status_code=202)
-    def transcribe_source_job(source_id: str, request: Request):
-        return enqueue_source(source_id, "transcribe", request)
-
-    @app.post("/api/sources/{source_id}/review-transcript", status_code=202)
-    def review_transcript_job(source_id: str, request: Request):
-        return enqueue_source(source_id, "review_transcript", request)
-
-    @app.post("/api/sources/{source_id}/rediarize", status_code=202)
-    def rediarize_source_job(source_id: str, request: Request):
-        return enqueue_source(source_id, "rediarize", request)
-
-    @app.post("/api/sources/{source_id}/realign", status_code=202)
-    def realign_source_job(source_id: str, request: Request):
-        source = service.catalog.get_source(source_id)
-        return service.enqueue(
-            source["project_id"],
-            "realign",
-            source_id,
-            {"annotation_version": source["active_annotation_version"]},
-            principal=require_principal(request),
-        )
-
-    @app.post("/api/sources/{source_id}/recover-overlap", status_code=202)
-    def overlap_source_job(source_id: str, request: Request):
-        annotation = service.catalog.latest_annotation(source_id)
-        if annotation.assistant_speaker is None:
-            raise ValueError("Choose the Moshi speaker before recovering overlap")
-        if not annotation.activities_finalized:
-            raise ValueError(
-                "Finalize and save the human speaker regions before recovering overlap"
-            )
-        return enqueue_source(source_id, "recover_overlap", request)
-
-    @app.post(
-        "/api/sources/{source_id}/overlaps/{region_id}/transcribe",
-        status_code=202,
-    )
-    def transcribe_overlap_job(source_id: str, region_id: str, request: Request):
-        source = service.catalog.get_source(source_id)
-        return service.enqueue(
-            source["project_id"],
-            "transcribe_overlap",
-            source_id,
-            {"region_id": region_id},
-            principal=require_principal(request),
-        )
-
     @app.get("/api/sources/{source_id}/annotations")
     def get_annotation(source_id: str):
         return {
@@ -1034,77 +972,6 @@ def create_studio_app(
             payload.annotation,
             principal=require_principal(request),
         ).model_dump(mode="json")
-
-    @app.get("/api/sources/{source_id}/overlaps")
-    def get_overlaps(source_id: str):
-        return {"overlaps": service.catalog.overlap_recoveries(source_id)}
-
-    @app.post("/api/sources/{source_id}/overlaps/{region_id}/decision")
-    def decide_overlap(
-        source_id: str,
-        region_id: str,
-        payload: OverlapDecisionPayload,
-        request: Request,
-    ):
-        return service.catalog.decide_overlap(
-            source_id,
-            region_id,
-            payload.decision,
-            payload.auditioned,
-            principal=require_principal(request),
-        )
-
-    @app.post("/api/sources/{source_id}/clip-plan")
-    def create_clip_plan(source_id: str, payload: ClipPlanRequest, request: Request):
-        return service.plan_clips(
-            source_id,
-            payload,
-            principal=require_principal(request),
-        )
-
-    @app.get("/api/sources/{source_id}/clip-plan")
-    def get_clip_plan(source_id: str):
-        plan = service.catalog.get_clip_plan(source_id)
-        return {"plan": plan.model_dump(mode="json") if plan else None}
-
-    @app.post("/api/sources/{source_id}/generate", status_code=202)
-    def generate_source_job(source_id: str, request: Request):
-        return enqueue_source(source_id, "generate", request)
-
-    @app.get("/api/sources/{source_id}/clips")
-    def get_clips(source_id: str):
-        return clip_artifacts(service.catalog, service.paths, source_id)
-
-    @app.post("/api/sources/{source_id}/clips/{clip_id}/decision")
-    def decide_clip(
-        source_id: str,
-        clip_id: str,
-        payload: DecisionPayload,
-        request: Request,
-    ):
-        return service.decide_clip(
-            source_id,
-            clip_id,
-            payload.decision,
-            payload.auditioned,
-            principal=require_principal(request),
-        )
-
-    @app.post("/api/projects/{project_id}/exports", status_code=202)
-    def create_export(project_id: str, payload: ExportCreate, request: Request):
-        return service.create_export(
-            project_id,
-            payload.name,
-            principal=require_principal(request),
-        )
-
-    @app.get("/api/projects/{project_id}/validate")
-    def validate_project(project_id: str):
-        return service.validate_project(project_id)
-
-    @app.get("/api/projects/{project_id}/exports")
-    def list_exports(project_id: str):
-        return {"exports": service.catalog.list_exports(project_id)}
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str):
@@ -1201,61 +1068,6 @@ def create_studio_app(
             path,
             media_type=media_types.get(kind),
             filename=path.name if kind == "original" else None,
-        )
-
-    @app.get("/media/{source_id}/overlap/{region_id}/{channel}")
-    def overlap_media(source_id: str, region_id: str, channel: str):
-        field = {
-            "original": "original_path",
-            "assistant": "assistant_path",
-            "user": "user_path",
-        }.get(channel)
-        if field is None:
-            raise KeyError(channel)
-        record = next(
-            (
-                value
-                for value in service.catalog.overlap_recoveries(source_id)
-                if value["region_id"] == region_id
-            ),
-            None,
-        )
-        if record is None or not record.get(field):
-            raise KeyError(region_id)
-        return FileResponse(
-            service.paths.resolve_relative(record[field]),
-            media_type="audio/wav",
-        )
-
-    @app.get("/media/{source_id}/clips/{clip_id}/{kind}")
-    def clip_media(source_id: str, clip_id: str, kind: str):
-        artifacts = clip_artifacts(service.catalog, service.paths, source_id)
-        item = next(
-            (value for value in artifacts.get("artifacts", []) if value["clip"]["id"] == clip_id),
-            None,
-        )
-        if item is None:
-            raise KeyError(clip_id)
-        field = {"audio": "wav_path", "alignment": "json_path"}.get(kind)
-        if field is None:
-            raise KeyError(kind)
-        return FileResponse(
-            service.paths.resolve_relative(item[field]),
-            media_type="audio/wav" if kind == "audio" else "application/json",
-        )
-
-    @app.get("/media/exports/{export_id}/bundle")
-    def export_bundle_media(export_id: str):
-        export = service.catalog.get_export(export_id)
-        if not export.get("path"):
-            raise KeyError(export_id)
-        path = service.paths.resolve_relative(str(export["path"]))
-        if not path.is_file():
-            raise KeyError(export_id)
-        return FileResponse(
-            path,
-            media_type="application/octet-stream",
-            filename=path.name,
         )
 
     static_root = Path(__file__).with_name("static")

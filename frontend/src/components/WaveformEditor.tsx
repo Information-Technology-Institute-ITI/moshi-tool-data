@@ -11,6 +11,17 @@ const COLORS = {
   exclusion: "rgba(255, 96, 120, .30)",
 };
 
+/**
+ * A range the parent asks the player to move to. `nonce` lets the same range be
+ * requested twice in a row (clicking the same transcript entry again).
+ */
+export type FocusRange = {
+  startSample: number;
+  endSample: number;
+  loop: boolean;
+  nonce: number;
+};
+
 type Props = {
   audioUrl: string;
   videoUrl?: string | null;
@@ -18,6 +29,15 @@ type Props = {
   durationSamples: number;
   frameRate: number;
   onChange: (annotation: Annotation) => void;
+  /** Seek, and optionally loop, the given original-audio range. */
+  focusRange?: FocusRange | null;
+  /** Reports the playhead so the parent can follow along in the transcript. */
+  onTimeChange?: (sample: number) => void;
+  /** Fired when the user clicks an A/B activity region on the timeline. */
+  onRegionClick?: (regionId: string) => void;
+  /** Fired when the user marks a range with `[` then a selection key. */
+  onRangeSelect?: (startSample: number, endSample: number) => void;
+  readOnly?: boolean;
 };
 
 export default function WaveformEditor({
@@ -27,6 +47,11 @@ export default function WaveformEditor({
   durationSamples,
   frameRate,
   onChange,
+  focusRange,
+  onTimeChange,
+  onRegionClick,
+  onRangeSelect,
+  readOnly = false,
 }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
@@ -34,6 +59,12 @@ export default function WaveformEditor({
   const waveReady = useRef(false);
   const regions = useRef<RegionsPlugin | null>(null);
   const annotationRef = useRef(annotation);
+  // Held in refs because the WaveSurfer instance is created once per audioUrl
+  // and its listeners would otherwise capture the first render's callbacks.
+  const onTimeRef = useRef(onTimeChange);
+  const onRegionClickRef = useRef(onRegionClick);
+  const readOnlyRef = useRef(readOnly);
+  const lastFocusNonce = useRef<number | null>(null);
   const syncing = useRef(false);
   const selectionStart = useRef<number | null>(null);
   const loopRangeRef = useRef<[number, number] | null>(null);
@@ -46,6 +77,9 @@ export default function WaveformEditor({
 
   annotationRef.current = annotation;
   loopRangeRef.current = loopRange;
+  onTimeRef.current = onTimeChange;
+  onRegionClickRef.current = onRegionClick;
+  readOnlyRef.current = readOnly;
 
   useEffect(() => {
     if (!container.current) return;
@@ -70,6 +104,7 @@ export default function WaveformEditor({
     });
     instance.on("timeupdate", (time) => {
       setCurrent(time);
+      onTimeRef.current?.(Math.round(time * SAMPLE_RATE));
       const loop = loopRangeRef.current;
       if (loop && time >= loop[1]) {
         instance.setTime(loop[0]);
@@ -83,6 +118,7 @@ export default function WaveformEditor({
     instance.on("play", () => video.current?.play().catch(() => undefined));
     instance.on("pause", () => video.current?.pause());
     regionPlugin.on("region-updated", (region) => updateRegion(region));
+    regionPlugin.on("region-clicked", (region) => onRegionClickRef.current?.(region.id));
     return () => {
       instance.destroy();
       wave.current = null;
@@ -94,6 +130,25 @@ export default function WaveformEditor({
   useEffect(() => {
     if (waveReady.current) wave.current?.zoom(zoom);
   }, [zoom]);
+
+  // Selecting a transcript entry moves the playhead to its start and, when
+  // asked, loops its original-audio range. This never alters stored data.
+  useEffect(() => {
+    if (!focusRange || focusRange.nonce === lastFocusNonce.current) return;
+    const instance = wave.current;
+    if (!instance) return;
+    lastFocusNonce.current = focusRange.nonce;
+    const start = focusRange.startSample / SAMPLE_RATE;
+    const end = focusRange.endSample / SAMPLE_RATE;
+    const apply = () => {
+      instance.setTime(start);
+      if (video.current) video.current.currentTime = start;
+      setLoopRange(focusRange.loop && end > start ? [start, end] : null);
+      if (focusRange.loop) instance.play().catch(() => undefined);
+    };
+    if (waveReady.current) apply();
+    else instance.once("ready", apply);
+  }, [focusRange]);
 
   useEffect(() => {
     wave.current?.setPlaybackRate(rate);
@@ -117,8 +172,8 @@ export default function WaveformEditor({
         end: endSample / SAMPLE_RATE,
         color,
         content,
-        drag: true,
-        resize: true,
+        drag: !readOnly,
+        resize: !readOnly,
         minLength: 0.05,
       });
     annotation.activities.forEach((item) =>
@@ -133,7 +188,7 @@ export default function WaveformEditor({
         `Exclude · ${item.kind}`,
       ),
     );
-  }, [annotation.activities, annotation.exclusions]);
+  }, [annotation.activities, annotation.exclusions, readOnly]);
 
   useEffect(() => {
     const keys = (event: KeyboardEvent) => {
@@ -144,13 +199,18 @@ export default function WaveformEditor({
         event.preventDefault();
         wave.current?.playPause();
       } else if (event.key === "[") {
-        beginSelection();
+        if (!readOnly) beginSelection();
       } else if (event.key.toLowerCase() === "a") {
-        finishActivity("A");
+        if (!readOnly) finishActivity("A");
       } else if (event.key.toLowerCase() === "b") {
-        finishActivity("B");
+        if (!readOnly) finishActivity("B");
       } else if (event.key.toLowerCase() === "x") {
-        finishExclusion();
+        if (!readOnly) finishExclusion();
+      } else if (event.key.toLowerCase() === "t") {
+        if (!readOnly && onRangeSelect) {
+          const bounds = selectionBounds();
+          if (bounds) onRangeSelect(bounds[0], bounds[1]);
+        }
       } else if (event.key === "ArrowLeft") {
         seekRelative(-1);
       } else if (event.key === "ArrowRight") {
@@ -168,7 +228,7 @@ export default function WaveformEditor({
   });
 
   function updateRegion(region: Region) {
-    if (syncing.current) return;
+    if (syncing.current || readOnlyRef.current) return;
     const start = Math.max(0, Math.round(region.start * SAMPLE_RATE));
     const end = Math.min(durationSamples, Math.round(region.end * SAMPLE_RATE));
     const currentAnnotation = annotationRef.current;
@@ -341,13 +401,25 @@ export default function WaveformEditor({
         </button>
         {loopRange && <button onClick={() => setLoopRange(null)}>Clear loop</button>}
       </div>
-      <div className="annotation-actions">
-        <button onClick={beginSelection}>Set selection start [</button>
-        <button className="speaker-a" onClick={() => finishActivity("A")}>Finish as A</button>
-        <button className="speaker-b" onClick={() => finishActivity("B")}>Finish as B</button>
-        <button className="danger-soft" onClick={finishExclusion}>Finish as Exclude</button>
-        <span className="shortcut-note">Shortcuts: [ then A / B / X · arrows seek · ,/. frame-step · L sets loop · space plays</span>
-      </div>
+      {!readOnly && (
+        <div className="annotation-actions">
+          <button onClick={beginSelection}>Set selection start [</button>
+          <button className="speaker-a" onClick={() => finishActivity("A")}>Finish as A</button>
+          <button className="speaker-b" onClick={() => finishActivity("B")}>Finish as B</button>
+          <button className="danger-soft" onClick={finishExclusion}>Finish as Exclude</button>
+          {onRangeSelect && (
+            <button
+              onClick={() => {
+                const bounds = selectionBounds();
+                if (bounds) onRangeSelect(bounds[0], bounds[1]);
+              }}
+            >
+              Finish as transcript segment
+            </button>
+          )}
+          <span className="shortcut-note">Shortcuts: [ then A / B / X / T · arrows seek · ,/. frame-step · L sets loop · space plays</span>
+        </div>
+      )}
       <div className="lane-grid">
         {(["A", "B"] as Speaker[]).map((speaker) => (
           <div className="lane-row" key={speaker}>
@@ -363,8 +435,12 @@ export default function WaveformEditor({
                       left: `${(item.start_sample / durationSamples) * 100}%`,
                       width: `${((item.end_sample - item.start_sample) / durationSamples) * 100}%`,
                     }}
-                    onDoubleClick={() => removeSelected(item.id)}
-                    title={`${seconds(item.start_sample)}–${seconds(item.end_sample)}s · double-click to remove`}
+                    onClick={() => onRegionClick?.(item.id)}
+                    onDoubleClick={() => !readOnly && removeSelected(item.id)}
+                    title={
+                      `${seconds(item.start_sample)}–${seconds(item.end_sample)}s`
+                      + (readOnly ? "" : " · double-click to remove")
+                    }
                   >
                     {speaker}
                   </button>
