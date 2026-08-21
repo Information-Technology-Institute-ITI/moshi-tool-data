@@ -1091,7 +1091,13 @@ function Studio({
     }
     edit(result.annotation);
     setSelectedId(result.ids[0]);
-    setNotice("Segment split into two timestamped ranges.");
+    const at = (result.atSample / 24_000).toFixed(2);
+    setNotice(
+      result.snappedFrom === null
+        ? `Segment split at ${at}s.`
+        : `Segment split at ${at}s, moved from ${(result.snappedFrom / 24_000).toFixed(2)}s`
+          + " to keep the spoken word whole.",
+    );
   }
 
   function joinWith(firstId: string, secondId: string) {

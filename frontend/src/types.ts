@@ -119,6 +119,20 @@ export interface TranscriptUtterance {
   review_candidates: TranscriptCandidate[];
 }
 
+/**
+ * One WhisperX-aligned word. `start` and `end` are seconds on the original
+ * source timeline, and are null when alignment could not place the word.
+ */
+export interface AlignedWord {
+  word: string;
+  start?: number | null;
+  end?: number | null;
+  speaker?: string | null;
+  score?: number | null;
+  original?: string | null;
+  assignment_confidence?: number | null;
+}
+
 export interface Annotation {
   source_id: string;
   version: number;
@@ -131,7 +145,7 @@ export interface Annotation {
   speaker_references: SpeakerReferenceRegion[];
   exclusions: ExclusionRegion[];
   transcript: TranscriptUtterance[];
-  aligned_words: Record<string, unknown>[];
+  aligned_words: AlignedWord[];
   note: string;
 }
 

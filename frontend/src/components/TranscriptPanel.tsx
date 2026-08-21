@@ -6,6 +6,9 @@ import {
   chronological,
   flagLabel,
   neighbourAfter,
+  resolveSplitSample,
+  updateSegment,
+  wordsForSegment,
 } from "../transcript";
 import type { Annotation, Speaker, TranscriptUtterance } from "../types";
 
@@ -176,13 +179,30 @@ function SegmentInspector({
   const splitInside =
     playheadSample > segment.start_sample && playheadSample < segment.end_sample;
 
+  // Word timings decide where a split can land, so show the user the point the
+  // split will actually use before they commit to it.
+  const words = wordsForSegment(
+    annotation.aligned_words,
+    segment.start_sample,
+    segment.end_sample,
+  );
+  const resolved = splitInside
+    ? resolveSplitSample(
+        annotation.aligned_words,
+        segment.start_sample,
+        segment.end_sample,
+        playheadSample,
+      )
+    : null;
+  const splitWouldEmpty =
+    !!resolved
+    && (resolved.sample <= segment.start_sample || resolved.sample >= segment.end_sample);
+  const canSplit = splitInside && !splitWouldEmpty;
+
+  // Routed through updateSegment so a speaker or timing change also moves the
+  // speaker lanes on the timeline.
   function patch(update: Partial<TranscriptUtterance>) {
-    onChange({
-      ...annotation,
-      transcript: annotation.transcript.map((item) =>
-        item.id === segment.id ? { ...item, ...update } : item,
-      ),
-    });
+    onChange(updateSegment(annotation, segment.id, update));
   }
 
   function commitBounds() {
@@ -297,11 +317,15 @@ function SegmentInspector({
         <div className="inspector-actions">
           <button
             type="button"
-            disabled={!splitInside}
+            disabled={!canSplit}
             title={
-              splitInside
-                ? "Split at the playhead and the text cursor"
-                : "Move the playhead inside this segment to split it"
+              !splitInside
+                ? "Move the playhead inside this segment to split it"
+                : splitWouldEmpty
+                  ? "The word here runs to the end of the segment, so nothing would follow it"
+                  : resolved?.snappedFrom !== null && resolved
+                    ? `Splits at ${toSeconds(resolved.sample)}s, after the word being spoken`
+                    : `Splits at ${toSeconds(resolved!.sample)}s`
             }
             onClick={() => onSplit(segment.id, playheadSample, caret)}
           >
@@ -330,8 +354,17 @@ function SegmentInspector({
           </button>
         </div>
       )}
+      {!readOnly && resolved && resolved.snappedFrom !== null && (
+        <p className="inspector-note split-hint">
+          A word is still being spoken at {toSeconds(resolved.snappedFrom)}s, so the split
+          moves to {toSeconds(resolved.sample)}s and keeps that word whole.
+        </p>
+      )}
       <p className="inspector-note">
-        Splitting and joining change timestamps and text only. The original media is
+        {words.length
+          ? `${words.length} aligned words decide how the text divides when you split.`
+          : "This segment has no word timings, so a split divides the text at your cursor."}
+        {" "}Splitting and joining change timestamps and text only. The original media is
         never cut or re-encoded. Duration {seconds(segment.end_sample - segment.start_sample)}s.
       </p>
     </div>
