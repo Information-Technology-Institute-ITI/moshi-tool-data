@@ -25,7 +25,6 @@ import type {
   ClipArtifact,
   Job,
   Project,
-  ProjectValidation,
   Source,
   SourceDetail,
   Speaker,
@@ -35,13 +34,6 @@ type ProjectDetail = {
   project: Project;
   sources: Source[];
   jobs: Job[];
-  exports: {
-    id: string;
-    version: number;
-    name: string;
-    status: string;
-    path?: string;
-  }[];
 };
 
 const highRiskTranscriptFlags = new Set([
@@ -845,10 +837,8 @@ function ProjectWorkspace({
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [exportName, setExportName] = useState(detail.project.name);
   const [projectName, setProjectName] = useState(detail.project.name);
   const [language, setLanguage] = useState(detail.project.language);
-  const [validation, setValidation] = useState<ProjectValidation | null>(null);
   const activeJob = detail.jobs.find((item) =>
     item.status === "queued" || item.status === "running",
   );
@@ -856,8 +846,6 @@ function ProjectWorkspace({
   useEffect(() => {
     setProjectName(detail.project.name);
     setLanguage(detail.project.language);
-    setExportName(detail.project.name);
-    setValidation(null);
   }, [detail.project.id, detail.project.name, detail.project.language]);
 
   useEffect(() => {
@@ -883,26 +871,6 @@ function ProjectWorkspace({
     }
   }
 
-  async function createExport() {
-    try {
-      const checked = await api<ProjectValidation>(
-        `/api/projects/${detail.project.id}/validate`,
-      );
-      setValidation(checked);
-      if (!checked.valid) {
-        setError(checked.blockers.join(" · "));
-        return;
-      }
-      const value = await api<{ job: Job }>(
-        `/api/projects/${detail.project.id}/exports`,
-        jsonRequest("POST", { name: exportName }),
-      );
-      onJob(value.job);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
   async function saveSettings() {
     try {
       await api(
@@ -910,16 +878,6 @@ function ProjectWorkspace({
         jsonRequest("PUT", { name: projectName, language }),
       );
       onReload();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
-  async function validateExport() {
-    try {
-      setValidation(
-        await api<ProjectValidation>(`/api/projects/${detail.project.id}/validate`),
-      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -1022,39 +980,6 @@ function ProjectWorkspace({
           ))}
         </section>
       )}
-      <div className="export-panel card">
-        <div>
-          <span className="eyebrow">Immutable output</span>
-          <h2>Dataset exports</h2>
-          <p>Every generated clip needs a listen-and-decide result before export.</p>
-        </div>
-        <div className="export-action">
-          <input value={exportName} onChange={(event) => setExportName(event.target.value)} />
-          <button onClick={validateExport}>Validate dataset</button>
-          <button className="primary" onClick={createExport}>Create version</button>
-        </div>
-        {validation && (
-          <div className={`validation-box ${validation.valid ? "valid" : "invalid"}`}>
-            <strong>
-              {validation.valid
-                ? `${validation.approved_clips} approved clips are export-ready`
-                : `${validation.blockers.length} export blockers`}
-            </strong>
-            {[...validation.blockers, ...validation.warnings].map((message) => (
-              <span key={message}>{message}</span>
-            ))}
-          </div>
-        )}
-        <div className="export-list">
-          {detail.exports.map((item) => (
-            <div key={item.id}>
-              <strong>v{String(item.version).padStart(3, "0")} · {item.name}</strong>
-              <span className={`pill ${item.status === "complete" ? "good" : "warn"}`}>{item.status}</span>
-              <small>{item.path || "Waiting for reviewed clips"}</small>
-            </div>
-          ))}
-        </div>
-      </div>
     </section>
   );
 }

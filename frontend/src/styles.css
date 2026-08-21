@@ -180,14 +180,9 @@ button.danger:disabled { color: var(--muted); background: #27141b; border-color:
 .transfer-summary > div { display: flex; justify-content: space-between; gap: 1rem; }
 .transfer-summary dt { color: var(--muted); font-size: .8rem; }
 .transfer-summary dd { font-size: .85rem; text-align: right; }
-.export-panel { display: grid; grid-template-columns: 1fr auto; gap: 1.5rem; align-items: end; }
-.export-action { display: grid; grid-template-columns: 220px auto auto; gap: .6rem; }
 .validation-box { grid-column: 1 / -1; display: grid; gap: .35rem; border-left: 3px solid var(--red); padding: .9rem 1rem; background: #28151a; }
 .validation-box.valid { border-color: var(--mint); background: #102b26; }
 .validation-box span { color: var(--muted); font-size: .82rem; }
-.export-list { grid-column: 1 / -1; display: grid; gap: .5rem; }
-.export-list > div { display: grid; grid-template-columns: 1fr auto; gap: .5rem; padding-top: .8rem; border-top: 1px solid var(--line); }
-.export-list small { grid-column: 1 / -1; color: var(--muted); }
 .job-progress { position: fixed; right: 20px; bottom: 20px; z-index: 70; width: min(420px, calc(100vw - 40px)); padding: 1rem; background: #101e24; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 15px 50px #000b; }
 .job-progress.failed { border-color: #723744; }
 .job-copy { display: flex; justify-content: space-between; gap: 1rem; margin-bottom: .7rem; }
@@ -396,9 +391,9 @@ button.danger:disabled { color: var(--muted); background: #27141b; border-color:
   .library-filters input, .library-filters select { min-width: 0; width: 100%; }
   .modal-actions { flex-direction: column-reverse; }
   .modal-actions button { width: 100%; }
-  .export-panel, .export-action, .choice-grid, .rights-card, .planner, .utterance, .identity-lock, .candidate-card, .stem-transcripts, .exclusion-editor > div, .boundary-editor > label { grid-template-columns: 1fr; }
+  .choice-grid, .rights-card, .planner, .utterance, .identity-lock, .candidate-card, .stem-transcripts, .exclusion-editor > div, .boundary-editor > label { grid-template-columns: 1fr; }
   .job-history > div:not(:first-child) { grid-template-columns: 1fr; }
-  .export-action, .export-list, .rights-card .wide, .planner .wide { grid-column: 1; }
+  .rights-card .wide, .planner .wide { grid-column: 1; }
   .studio-main { padding: 2rem .8rem 4rem; }
   .studio-heading, .section-heading { align-items: flex-start; flex-direction: column; }
   .transport .zoom-control, .shortcut-note { margin-left: 0; width: 100%; }
