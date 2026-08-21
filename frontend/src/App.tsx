@@ -1003,6 +1003,9 @@ function Studio({
   const [draftOffer, setDraftOffer] = useState<Annotation | null>(null);
   const [regionToDelete, setRegionToDelete] = useState<string | null>(null);
   const focusNonce = useRef(0);
+  // True between the first keystroke of a run of typing and the moment it is
+  // committed, so a whole edit undoes at once instead of one letter at a time.
+  const typing = useRef(false);
   const userId = user?.id || "local";
 
   const processing = detail.status === "processing";
@@ -1033,6 +1036,7 @@ function Studio({
     setSelectedId(null);
     setFilteredIds(null);
     setConflict(null);
+    typing.current = false;
     saver.reset(detail.annotation);
     if (turned.dividedSegments) {
       saver.schedule(turned.annotation);
@@ -1052,15 +1056,42 @@ function Studio({
 
   /** Records an undoable edit and schedules an autosave. */
   function edit(next: Annotation) {
+    typing.current = false;
     setHistory((values) => [...values.slice(-49), annotation]);
     setFuture([]);
     setAnnotation(next);
     saver.schedule(next);
   }
 
+  /**
+   * Records typing without starting a save.
+   *
+   * Every keystroke used to arm the autosave, so writing a sentence produced a
+   * revision per letter on the server. The text is kept in state and in the
+   * local draft, and {@link commitEdit} sends it once the reviewer is finished
+   * with the box. Only the first keystroke of a run adds to undo history, so
+   * one undo takes back the whole edit rather than one letter.
+   */
+  function editText(next: Annotation) {
+    if (!typing.current) {
+      typing.current = true;
+      setHistory((values) => [...values.slice(-49), annotation]);
+    }
+    setFuture([]);
+    setAnnotation(next);
+    saver.hold(next);
+  }
+
+  /** Ends a run of typing and sends what was written. */
+  function commitEdit() {
+    typing.current = false;
+    saver.commit();
+  }
+
   function undo() {
     const previous = history.at(-1);
     if (!previous) return;
+    typing.current = false;
     setFuture((values) => [annotation, ...values]);
     setHistory((values) => values.slice(0, -1));
     const restored = { ...previous, version: annotation.version };
@@ -1071,6 +1102,7 @@ function Studio({
   function redo() {
     const next = future[0];
     if (!next) return;
+    typing.current = false;
     setHistory((values) => [...values, annotation]);
     setFuture((values) => values.slice(1));
     const restored = { ...next, version: annotation.version };
@@ -1448,9 +1480,15 @@ function Studio({
           filteredIds={filteredIds}
           playheadSample={playhead}
           readOnly={readOnly}
-          onSelect={setSelectedId}
+          onSelect={(id) => {
+            // Moving to another segment finishes the edit in the box.
+            commitEdit();
+            setSelectedId(id);
+          }}
           onPlay={playSegment}
           onChange={edit}
+          onChangeText={editText}
+          onCommitText={commitEdit}
           onSplit={splitAt}
           onAddOverlap={addOverlap}
           onAddAllOverlaps={addAllOverlaps}

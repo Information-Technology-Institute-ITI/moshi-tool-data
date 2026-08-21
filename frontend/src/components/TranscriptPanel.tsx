@@ -34,6 +34,10 @@ type Props = {
   onSelect: (id: string) => void;
   onPlay: (segment: TranscriptUtterance, loop: boolean) => void;
   onChange: (next: Annotation) => void;
+  /** Typing in the text box: recorded locally, not saved until committed. */
+  onChangeText: (next: Annotation) => void;
+  /** The reviewer has finished with the text box, so the edit can be sent. */
+  onCommitText: () => void;
   onSplit: (id: string, atSample: number, textOffset: number) => void;
   onAddOverlap: (id: string) => void;
   onAddAllOverlaps: () => void;
@@ -53,6 +57,8 @@ export default function TranscriptPanel({
   onSelect,
   onPlay,
   onChange,
+  onChangeText,
+  onCommitText,
   onSplit,
   onAddOverlap,
   onAddAllOverlaps,
@@ -181,6 +187,8 @@ export default function TranscriptPanel({
           readOnly={readOnly}
           onPlay={onPlay}
           onChange={onChange}
+          onChangeText={onChangeText}
+          onCommitText={onCommitText}
           onSplit={onSplit}
           onAddOverlap={onAddOverlap}
           onJoin={onJoin}
@@ -204,6 +212,8 @@ function SegmentInspector({
   readOnly,
   onPlay,
   onChange,
+  onChangeText,
+  onCommitText,
   onSplit,
   onAddOverlap,
   onJoin,
@@ -222,6 +232,8 @@ function SegmentInspector({
   readOnly: boolean;
   onPlay: (segment: TranscriptUtterance, loop: boolean) => void;
   onChange: (next: Annotation) => void;
+  onChangeText: (next: Annotation) => void;
+  onCommitText: () => void;
   onSplit: (id: string, atSample: number, textOffset: number) => void;
   onAddOverlap: (id: string) => void;
   onJoin: (firstId: string, secondId: string) => void;
@@ -286,6 +298,12 @@ function SegmentInspector({
     onChange(updateSegment(annotation, segment.id, update));
   }
 
+  // Typing is held rather than saved. Every other change in this panel is a
+  // single deliberate act, so those still save on their own.
+  function patchText(text: string) {
+    onChangeText(updateSegment(annotation, segment.id, { text }));
+  }
+
   function commitBounds() {
     const nextStart = fromSeconds(start);
     const nextEnd = fromSeconds(end);
@@ -345,8 +363,9 @@ function SegmentInspector({
           readOnly={readOnly}
           onChange={(event) => {
             setCaret(event.target.selectionStart ?? event.target.value.length);
-            patch({ text: event.target.value });
+            patchText(event.target.value);
           }}
+          onBlur={onCommitText}
           onSelect={(event) =>
             setCaret((event.target as HTMLTextAreaElement).selectionStart ?? 0)
           }

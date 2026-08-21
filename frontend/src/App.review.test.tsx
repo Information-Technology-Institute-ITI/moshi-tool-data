@@ -809,3 +809,88 @@ describe("speaker turns are divided automatically on open", () => {
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(1);
   });
 });
+
+describe("typing does not save on every keystroke", () => {
+  function type(area: HTMLTextAreaElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!;
+    setter.call(area, value);
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function puts(fetchMock: ReturnType<typeof routedFetch>) {
+    return fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT");
+  }
+
+  it("holds the text while the reviewer writes", async () => {
+    // Regression: each letter armed the autosave, so a sentence became a pile
+    // of revisions on the server.
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    const area = container.querySelector("textarea")!;
+    for (const value of ["ك", "كي", "كيف", "كيف "]) {
+      await act(async () => type(area, value));
+    }
+    // Wait past the autosave debounce: the point is that no timer was ever
+    // armed, not merely that one has not fired yet.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+    });
+    await flush();
+
+    expect(puts(fetchMock)).toHaveLength(0);
+    // What was typed is on screen and recoverable, just not sent yet.
+    expect(container.querySelector("textarea")!.value).toBe("كيف ");
+  });
+
+  it("saves once when the box loses focus", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    const area = container.querySelector("textarea")!;
+    await act(async () => type(area, "مرحبا"));
+    // React's onBlur is delivered through the native focusout event.
+    await act(async () => area.dispatchEvent(new FocusEvent("focusout", { bubbles: true })));
+    await flush();
+
+    const calls = puts(fetchMock);
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(String(calls[0][1]!.body));
+    expect(body.annotation.transcript[0].text).toBe("مرحبا");
+  });
+
+  it("saves when moving to another segment", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    await act(async () => type(container.querySelector("textarea")!, "نص جديد"));
+    await click(container.querySelectorAll(".transcript-entry")[1]);
+    await flush();
+
+    const calls = puts(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0][1]!.body)).annotation.transcript[0].text)
+      .toBe("نص جديد");
+  });
+
+  it("undoes a whole run of typing in one step", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    const area = container.querySelector("textarea")!;
+    for (const value of ["a", "ab", "abc"]) {
+      await act(async () => type(area, value));
+    }
+    await flush();
+
+    await click(byText(".rail-actions button", "Undo"));
+    // One undo, not three.
+    expect(container.querySelector("textarea")!.value).toBe("أهلا بك");
+  });
+});

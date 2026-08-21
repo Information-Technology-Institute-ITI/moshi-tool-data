@@ -186,11 +186,40 @@ export function useAnnotationSaver({
       if (timer.current) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
         timer.current = null;
-        void send(value);
+        // Send whatever is newest, not the document captured when this timer
+        // was armed: an edit held in the meantime must not be skipped.
+        if (latest.current) void send(latest.current);
       }, AUTOSAVE_DEBOUNCE_MS);
     },
     [send, sourceId, userId],
   );
+
+  /**
+   * Records an edit without arming a save.
+   *
+   * Typing is a stream of tiny changes, and saving on a timer turned a sentence
+   * into a pile of revisions. Held edits are kept in the local draft and count
+   * as unsaved, so nothing is lost; {@link commit} sends them when the edit is
+   * finished — leaving the box, choosing another segment, or navigating away.
+   */
+  const hold = useCallback(
+    (value: Annotation) => {
+      latest.current = value;
+      dirty.current = true;
+      writeDraft(userId, sourceId, value.version, value);
+    },
+    [sourceId, userId],
+  );
+
+  /** Sends a held edit, if there is one. Safe to call when there is not. */
+  const commit = useCallback(() => {
+    if (!dirty.current || !latest.current) return;
+    if (timer.current) {
+      window.clearTimeout(timer.current);
+      timer.current = null;
+    }
+    void send(latest.current);
+  }, [send]);
 
   const saveNow = useCallback(() => {
     if (latest.current) void send(latest.current);
@@ -205,8 +234,9 @@ export function useAnnotationSaver({
     if (timer.current) {
       window.clearTimeout(timer.current);
       timer.current = null;
-      if (latest.current) void send(latest.current);
     }
+    // Covers a held edit as well as a pending timer: both are unsaved work.
+    if (dirty.current && latest.current) void send(latest.current);
     while (inFlight.current || queued.current) {
       await new Promise((resolve) => window.setTimeout(resolve, 40));
     }
@@ -243,5 +273,14 @@ export function useAnnotationSaver({
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
 
-  return { status, schedule, saveNow, flush, reset, hasUnsaved: () => dirty.current };
+  return {
+    status,
+    schedule,
+    hold,
+    commit,
+    saveNow,
+    flush,
+    reset,
+    hasUnsaved: () => dirty.current,
+  };
 }

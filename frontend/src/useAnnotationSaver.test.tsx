@@ -42,8 +42,11 @@ function response(body: unknown, status = 200): Response {
 
 type Harness = {
   schedule: (value: Annotation) => void;
+  hold: (value: Annotation) => void;
+  commit: () => void;
   saveNow: () => void;
   flush: () => Promise<boolean>;
+  hasUnsaved: () => boolean;
   status: string;
 };
 
@@ -194,6 +197,96 @@ describe("recoverable local drafts", () => {
 
     clearDraftsForUser("user_a");
     expect(readDraft("user_a", "source_1", 3)).toBeNull();
+  });
+});
+
+describe("typing is held until it is finished", () => {
+  function puts(fetchMock: ReturnType<typeof vi.fn>) {
+    return fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT");
+  }
+
+  it("sends nothing while the reviewer is still typing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "x")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    // Regression: every keystroke armed the autosave, so writing a sentence
+    // produced a revision per letter.
+    for (const text of ["a", "ab", "abc", "abcd"]) {
+      await act(async () => harness.hold(annotation(3, text)));
+    }
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, AUTOSAVE_DEBOUNCE_MS + 200));
+    });
+    await settle();
+
+    expect(puts(fetchMock)).toHaveLength(0);
+    // The work is not lost: it counts as unsaved and is in the local draft.
+    expect(harness.hasUnsaved()).toBe(true);
+    expect(readDraft("user_a", "source_1", 3)?.note).toBe("abcd");
+  });
+
+  it("sends once when the edit is committed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "abc")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.hold(annotation(3, "a")));
+    await act(async () => harness.hold(annotation(3, "ab")));
+    await act(async () => harness.hold(annotation(3, "abc")));
+    await act(async () => harness.commit());
+    await settle();
+
+    const calls = puts(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0][1]!.body)).annotation.note).toBe("abc");
+    expect(saved).toHaveLength(1);
+  });
+
+  it("commits nothing when there is nothing held", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "x")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.commit());
+    await settle();
+    expect(puts(fetchMock)).toHaveLength(0);
+  });
+
+  it("flushes a held edit when navigating away", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "typed")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.hold(annotation(3, "typed")));
+    let result: boolean | undefined;
+    await act(async () => {
+      result = await harness.flush();
+    });
+
+    // Leaving the screen must not drop what was typed.
+    expect(result).toBe(true);
+    expect(puts(fetchMock)).toHaveLength(1);
+    expect(JSON.parse(String(puts(fetchMock)[0][1]!.body)).annotation.note).toBe("typed");
+  });
+
+  it("a structural edit carries the held text with it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "both")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => harness.hold(annotation(3, "typed")));
+    // Splitting, joining or deleting still saves on its own, and must send the
+    // newest document rather than the one captured when its timer was armed.
+    await act(async () => harness.schedule(annotation(3, "typed then split")));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, AUTOSAVE_DEBOUNCE_MS + 200));
+    });
+    await settle();
+
+    const calls = puts(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0][1]!.body)).annotation.note).toBe("typed then split");
   });
 });
 
