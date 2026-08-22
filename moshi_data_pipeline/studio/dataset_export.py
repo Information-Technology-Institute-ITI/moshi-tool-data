@@ -418,21 +418,37 @@ def readme(
     sources: list[ExportSource],
     rows: list[dict[str, Any]],
     without_audio: list[str] | None = None,
+    *,
+    include_media: bool = True,
 ) -> bytes:
     lines = [
         f"Dataset: {project_name}",
         "",
-        f"Audio files : {len(sources)}",
+        f"Sources     : {len(sources)}",
         f"Segments    : {len(rows)}",
         f"Sample rate : {SAMPLE_RATE} Hz, mono",
         "",
         "transcriptions.csv describes every segment. The text column is the",
         "reviewer's final wording, taken from the newest saved revision.",
         "",
-        "The audio here is the canonical 24 kHz mono conversion the timestamps",
-        "were made against, not the uploaded original. Cut from these files or",
-        "the ranges will not line up.",
-        "",
+    ]
+    if include_media:
+        lines += [
+            "The audio here is the canonical 24 kHz mono conversion the timestamps",
+            "were made against, not the uploaded original. Cut from these files or",
+            "the ranges will not line up.",
+            "",
+        ]
+    else:
+        lines += [
+            "This archive was downloaded without the audio, so there is no audio/",
+            "folder. Every row and every document still names the file it belongs",
+            "to under audio_file, so it matches up with a later download that has",
+            "it. The ranges are against the canonical 24 kHz mono conversion, never",
+            "the uploaded original.",
+            "",
+        ]
+    lines += [
         "Each row carries the same range three ways: samples at 24 kHz for exact",
         "work, and milliseconds and seconds for tools that want them. Rows are",
         "ordered by audio file and then by start time, and sequential_id counts",
@@ -584,8 +600,20 @@ def plan_export(catalog: Any, paths: Any, project_id: str) -> ExportPlan:
     return ExportPlan(collected, without_audio)
 
 
-def build_dataset_archive(catalog: Any, paths: Any, project_id: str, destination: Path) -> Path:
+def build_dataset_archive(
+    catalog: Any,
+    paths: Any,
+    project_id: str,
+    destination: Path,
+    *,
+    include_media: bool = True,
+) -> Path:
     """Writes the dataset's audio, transcript CSV and per-source JSON to a zip.
+
+    `include_media` leaves the audio out. The transcripts still name the file
+    each range belongs to, so a text-only archive can be matched up with the
+    audio downloaded separately, and a dataset of a few hours does not have to
+    travel again to read what the reviewer wrote.
 
     Raises NothingToExportError when no source in the dataset is finished, so
     the caller can say why instead of handing over an empty archive.
@@ -615,10 +643,18 @@ def build_dataset_archive(catalog: Any, paths: Any, project_id: str, destination
     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("transcriptions.csv", write_csv(rows))
         archive.writestr(
-            "README.txt", readme(project_name, sources, rows, plan.without_audio)
+            "README.txt",
+            readme(
+                project_name,
+                sources,
+                rows,
+                plan.without_audio,
+                include_media=include_media,
+            ),
         )
         for source, audio_file, folder in zip(sources, audio_names, folders, strict=True):
-            archive.write(source.audio_path, audio_file)
+            if include_media:
+                archive.write(source.audio_path, audio_file)
             archive.writestr(
                 f"{folder}/final_user_edited_transcript.json",
                 write_json(

@@ -393,14 +393,19 @@ function ProjectLibrary({
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [transferFor, setTransferFor] = useState<Project | null>(null);
   const [deleteFor, setDeleteFor] = useState<Project | null>(null);
+  const [exportFor, setExportFor] = useState<Project | null>(null);
   const [exporting, setExporting] = useState<string | null>(null);
 
   /** Builds and downloads the dataset archive. Administrators only. */
-  async function exportOne(project: Project) {
+  async function exportOne(project: Project, includeMedia: boolean) {
+    setExportFor(null);
     setExporting(project.id);
     try {
-      await exportDataset(project.id);
-      setNotice(`"${project.name}" was exported. Check your downloads.`);
+      await exportDataset(project.id, { includeMedia });
+      setNotice(
+        `"${project.name}" was exported${includeMedia ? " with its audio" : " without audio"}.`
+          + " Check your downloads.",
+      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -598,12 +603,11 @@ function ProjectLibrary({
                   disabled={!item.ready_sources || exporting === item.id}
                   title={
                     item.ready_sources
-                      ? "Download this dataset's audio, a CSV of every transcript"
-                        + " segment, and the final transcript, word alignment and"
-                        + " diarization as JSON"
+                      ? "Download this dataset's transcripts, word alignment and"
+                        + " diarization, with the audio if you ask for it"
                       : "No source in this dataset has been prepared yet"
                   }
-                  onClick={() => void exportOne(item)}
+                  onClick={() => setExportFor(item)}
                 >
                   {exporting === item.id ? "Preparing…" : "Export"}
                 </button>
@@ -645,6 +649,13 @@ function ProjectLibrary({
           project={deleteFor}
           onCancel={() => setDeleteFor(null)}
           onConfirm={() => confirmDelete(deleteFor)}
+        />
+      )}
+      {exportFor && (
+        <ExportDatasetDialog
+          project={exportFor}
+          onCancel={() => setExportFor(null)}
+          onConfirm={(includeMedia) => exportOne(exportFor, includeMedia)}
         />
       )}
     </section>
@@ -771,6 +782,57 @@ function DeleteDatasetDialog({
             onClick={() => void onConfirm()}
           >
             Delete forever
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Asks what to put in the download before building it.
+ *
+ * The audio is by far the largest part of an archive and is usually already to
+ * hand, so it is left out unless it is asked for. The transcripts name the file
+ * every range belongs to either way.
+ */
+function ExportDatasetDialog({
+  project,
+  onCancel,
+  onConfirm,
+}: {
+  project: Project;
+  onCancel: () => void;
+  onConfirm: (includeMedia: boolean) => void | Promise<void>;
+}) {
+  const [includeMedia, setIncludeMedia] = useState(false);
+  useEscapeToClose(onCancel);
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div
+        className="modal card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-title"
+      >
+        <h2 id="export-title">Export “{project.name}”</h2>
+        <p>
+          Downloads one archive holding a CSV of every transcript segment, and the final
+          transcript, word alignment and diarization of each source as JSON.
+        </p>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={includeMedia}
+            onChange={(event) => setIncludeMedia(event.target.checked)}
+          />
+          Include the audio files
+        </label>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button type="button" onClick={() => void onConfirm(includeMedia)}>
+            Export
           </button>
         </div>
       </div>

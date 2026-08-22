@@ -172,6 +172,8 @@ label { display: grid; gap: .42rem; color: var(--muted); font-size: .85rem; }
 .modal { width: min(100%, 460px); display: grid; gap: 1rem; background: #0d181d; box-shadow: 0 24px 60px rgba(0,0,0,.55); }
 .modal h2 { font-size: 1.3rem; }
 .modal label { display: flex; flex-direction: column; gap: .35rem; font-size: .85rem; color: var(--muted); }
+/* A checkbox reads as one line, not as a stacked field like the other labels. */
+.modal label.checkbox { flex-direction: row; align-items: center; gap: .6rem; font-size: .95rem; color: var(--ink); }
 .modal-actions { display: flex; justify-content: flex-end; gap: .6rem; }
 .danger-text { color: #ff9eac; font-size: .9rem; }
 button.danger { color: #0b1519; background: #ff7d92; border-color: #ff7d92; font-weight: 700; }

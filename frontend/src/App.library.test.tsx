@@ -499,6 +499,87 @@ describe("exporting a dataset", () => {
     expect(findByText(".project-card-actions button", "Export")).toBeUndefined();
   });
 
+  /** Opens the export dialog and returns the URLs the export route was asked for. */
+  function exportCalls(fetchMock: ReturnType<typeof routedFetch>): string[] {
+    return fetchMock.mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes("/export"));
+  }
+
+  it("asks before exporting, and does not ask for the audio unless told to", async () => {
+    const download = captureDownload();
+    try {
+      const fetchMock = routedFetch({
+        user: administrator,
+        projects: [ownDataset],
+        onCall: (url) =>
+          url.startsWith("/api/admin/projects/proj_owned/export") ? zipResponse() : undefined,
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await openLibrary();
+      await click(findByText(".project-card-actions button", "Export"));
+
+      // Nothing is downloaded on the button alone; the dialog asks first.
+      expect(container.querySelector("[role=dialog]")?.textContent)
+        .toContain("Include the audio files");
+      expect(exportCalls(fetchMock)).toHaveLength(0);
+      const audio = container.querySelector<HTMLInputElement>(
+        ".modal label.checkbox input",
+      );
+      expect(audio?.checked).toBe(false);
+
+      await click(findByText(".modal-actions button", "Export"));
+      expect(exportCalls(fetchMock)).toEqual([
+        "/api/admin/projects/proj_owned/export?include_media=false",
+      ]);
+      expect(download.started).toHaveLength(1);
+      expect(container.querySelector(".banner.success")?.textContent)
+        .toContain("without audio");
+    } finally {
+      download.restore();
+    }
+  });
+
+  it("asks for the audio once the box is ticked", async () => {
+    const download = captureDownload();
+    try {
+      const fetchMock = routedFetch({
+        user: administrator,
+        projects: [ownDataset],
+        onCall: (url) =>
+          url.startsWith("/api/admin/projects/proj_owned/export") ? zipResponse() : undefined,
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await openLibrary();
+      await click(findByText(".project-card-actions button", "Export"));
+      await click(container.querySelector(".modal label.checkbox input"));
+      await click(findByText(".modal-actions button", "Export"));
+
+      expect(exportCalls(fetchMock)).toEqual(["/api/admin/projects/proj_owned/export"]);
+      expect(container.querySelector(".banner.success")?.textContent)
+        .toContain("with its audio");
+    } finally {
+      download.restore();
+    }
+  });
+
+  it("cancelling the dialog builds nothing", async () => {
+    const download = captureDownload();
+    try {
+      const fetchMock = routedFetch({ user: administrator, projects: [ownDataset] });
+      vi.stubGlobal("fetch", fetchMock);
+      await openLibrary();
+      await click(findByText(".project-card-actions button", "Export"));
+      await click(findByText(".modal-actions button", "Cancel"));
+
+      expect(container.querySelector("[role=dialog]")).toBeNull();
+      expect(exportCalls(fetchMock)).toHaveLength(0);
+      expect(download.started).toHaveLength(0);
+    } finally {
+      download.restore();
+    }
+  });
+
   it("downloads the archive the server names", async () => {
     const download = captureDownload();
     try {
@@ -506,10 +587,11 @@ describe("exporting a dataset", () => {
         user: administrator,
         projects: [ownDataset],
         onCall: (url) =>
-          url === "/api/admin/projects/proj_owned/export" ? zipResponse() : undefined,
+          url.startsWith("/api/admin/projects/proj_owned/export") ? zipResponse() : undefined,
       }));
       await openLibrary();
       await click(findByText(".project-card-actions button", "Export"));
+      await click(findByText(".modal-actions button", "Export"));
 
       expect(download.started).toHaveLength(1);
       expect(download.started[0].name).toBe("Cairo_conversations.zip");
@@ -527,12 +609,13 @@ describe("exporting a dataset", () => {
         user: administrator,
         projects: [ownDataset],
         onCall: (url) =>
-          url === "/api/admin/projects/proj_owned/export"
+          url.startsWith("/api/admin/projects/proj_owned/export")
             ? response({ detail: "This dataset has no prepared source to export yet." }, 409)
             : undefined,
       }));
       await openLibrary();
       await click(findByText(".project-card-actions button", "Export"));
+      await click(findByText(".modal-actions button", "Export"));
 
       expect(download.started).toHaveLength(0);
       expect(container.querySelector(".banner.error")?.textContent)

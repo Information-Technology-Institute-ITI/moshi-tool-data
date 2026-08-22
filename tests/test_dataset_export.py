@@ -692,6 +692,47 @@ def test_export_route_serves_a_zip_to_an_administrator(tmp_path) -> None:
         assert "audio/episode_one.wav" in archive.namelist()
 
 
+def test_an_export_can_leave_the_audio_out(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(
+        service.catalog, service.paths, project_id, destination, include_media=False
+    )
+
+    with zipfile.ZipFile(destination) as archive:
+        names = archive.namelist()
+        rows = _rows(archive)
+        document = _json_member(
+            archive, "sources/episode_one/final_user_edited_transcript.json"
+        )
+        notes = archive.read("README.txt").decode("utf-8")
+
+    assert not [name for name in names if name.startswith("audio/")]
+    # Everything else is still here, and still says which audio it describes,
+    # so a text-only archive matches up with a later one that has the media.
+    assert "transcriptions.csv" in names
+    assert "sources/episode_one/final_aligned_transcript.json" in names
+    assert {row["audio_file"] for row in rows} == {"audio/episode_one.wav"}
+    assert document["audio_file"] == "audio/episode_one.wav"
+    assert "without the audio" in notes
+
+
+def test_export_route_leaves_the_audio_out_when_asked(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path, require_sign_in=True)
+    _make_user(service, "admin@example.test", "admin")
+    with TestClient(app) as client:
+        assert _sign_in(client, "admin@example.test").status_code == 200
+        response = client.get(
+            f"/api/admin/projects/{project_id}/export", params={"include_media": "false"}
+        )
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = archive.namelist()
+    assert "audio/episode_one.wav" not in names
+    assert "transcriptions.csv" in names
+
+
 def test_export_route_refuses_a_regular_user(tmp_path) -> None:
     app, service, project_id, _ = _fixture(tmp_path, require_sign_in=True)
     _make_user(service, "editor@example.test", "user")

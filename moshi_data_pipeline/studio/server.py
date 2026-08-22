@@ -807,11 +807,13 @@ def create_studio_app(
         )
 
     @app.get("/api/admin/projects/{project_id}/export")
-    def export_dataset(project_id: str, request: Request):
+    def export_dataset(project_id: str, request: Request, include_media: bool = True):
         """Downloads a finished dataset: its audio, and one CSV of every segment.
 
         Administrators only. The CSV carries the reviewer's final text from the
         newest saved revision, so nothing here needs the GPU or starts a job.
+        `include_media=false` leaves the audio out, which is how the review
+        screen asks for it: hours of audio need not travel to read a transcript.
         """
         principal = require_admin(require_principal(request))
         authorization.authorize_project(principal, project_id)
@@ -822,7 +824,11 @@ def create_studio_app(
         )
         try:
             build_dataset_archive(
-                service.catalog, service.paths, project_id, destination
+                service.catalog,
+                service.paths,
+                project_id,
+                destination,
+                include_media=include_media,
             )
         except NothingToExportError as exc:
             destination.unlink(missing_ok=True)

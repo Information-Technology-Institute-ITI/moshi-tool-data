@@ -168,8 +168,12 @@ export function triggerGpuCheck(signal?: AbortSignal): Promise<GpuCheckTriggerRe
  * Fetched rather than linked so a refusal arrives as a readable message instead
  * of the browser saving an error page as a .zip.
  */
-export async function exportDataset(projectId: string): Promise<void> {
-  const response = await fetch(`/api/admin/projects/${projectId}/export`, {
+export async function exportDataset(
+  projectId: string,
+  { includeMedia = false }: { includeMedia?: boolean } = {},
+): Promise<void> {
+  const query = includeMedia ? "" : "?include_media=false";
+  const response = await fetch(`/api/admin/projects/${projectId}/export${query}`, {
     credentials: "same-origin",
   });
   if (!response.ok) {
