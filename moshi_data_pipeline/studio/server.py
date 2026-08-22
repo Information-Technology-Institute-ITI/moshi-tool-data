@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from moshi_data_pipeline.audio.ffmpeg import SUPPORTED_EXTENSIONS
 from moshi_data_pipeline.config import PipelineConfig, load_config
@@ -36,6 +37,11 @@ from moshi_data_pipeline.studio.catalog import (
     ProjectDeletionConflictError,
     ProtocolMismatchError,
     VersionConflictError,
+)
+from moshi_data_pipeline.studio.dataset_export import (
+    NothingToExportError,
+    archive_filename,
+    build_dataset_archive,
 )
 from moshi_data_pipeline.studio.domain import (
     AnnotationSave,
@@ -89,6 +95,7 @@ def create_studio_app(
             StreamingResponse,
         )
         from fastapi.staticfiles import StaticFiles
+        from starlette.background import BackgroundTask
     except ImportError as exc:
         raise RuntimeError('The studio requires: pip install -e ".[review]"') from exc
 
@@ -797,6 +804,35 @@ def create_studio_app(
                 "created": created,
                 "cost_notice": "Starting a stopped GPU incurs cost.",
             },
+        )
+
+    @app.get("/api/admin/projects/{project_id}/export")
+    def export_dataset(project_id: str, request: Request):
+        """Downloads a finished dataset: its audio, and one CSV of every segment.
+
+        Administrators only. The CSV carries the reviewer's final text from the
+        newest saved revision, so nothing here needs the GPU or starts a job.
+        """
+        principal = require_admin(require_principal(request))
+        authorization.authorize_project(principal, project_id)
+        project = service.catalog.get_project(project_id)
+        destination = (
+            service.paths.exports
+            / f"{project_id}_{uuid4().hex}.zip"
+        )
+        try:
+            build_dataset_archive(
+                service.catalog, service.paths, project_id, destination
+            )
+        except NothingToExportError as exc:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return FileResponse(
+            destination,
+            media_type="application/zip",
+            filename=archive_filename(str(project["name"])),
+            # The archive is a one-off download, so it is not kept afterwards.
+            background=BackgroundTask(destination.unlink, missing_ok=True),
         )
 
     @app.get("/api/admin/users")

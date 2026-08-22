@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  api,
   ApiError,
+  api,
   deleteProject,
+  exportDataset,
   getCurrentUser,
   jsonRequest,
   listAdminUsers,
@@ -392,6 +393,20 @@ function ProjectLibrary({
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [transferFor, setTransferFor] = useState<Project | null>(null);
   const [deleteFor, setDeleteFor] = useState<Project | null>(null);
+  const [exporting, setExporting] = useState<string | null>(null);
+
+  /** Builds and downloads the dataset archive. Administrators only. */
+  async function exportOne(project: Project) {
+    setExporting(project.id);
+    try {
+      await exportDataset(project.id);
+      setNotice(`"${project.name}" was exported. Check your downloads.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setExporting(null);
+    }
+  }
 
   // Only administrators may list users, so never request it as a regular user.
   useEffect(() => {
@@ -577,6 +592,21 @@ function ProjectLibrary({
               </div>
             </button>
             <div className="project-card-actions">
+              {isAdmin && (
+                <button
+                  type="button"
+                  disabled={!item.ready_sources || exporting === item.id}
+                  title={
+                    item.ready_sources
+                      ? "Download this dataset's audio and a CSV of every transcript"
+                        + " segment"
+                      : "No source in this dataset has been prepared yet"
+                  }
+                  onClick={() => void exportOne(item)}
+                >
+                  {exporting === item.id ? "Preparing…" : "Export"}
+                </button>
+              )}
               {isAdmin && (
                 <button type="button" onClick={() => setTransferFor(item)}>
                   Transfer owner

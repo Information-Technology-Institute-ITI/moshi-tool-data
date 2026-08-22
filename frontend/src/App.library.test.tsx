@@ -424,3 +424,121 @@ describe("sign out", () => {
     expect(findByText("button.system-nav", "GPU status")).toBeUndefined();
   });
 });
+
+describe("exporting a dataset", () => {
+  // Both owned by the administrator, so both show under the default scope.
+  const unprepared: Project = {
+    ...ownDataset,
+    id: "proj_raw",
+    name: "Nothing prepared",
+    source_count: 2,
+    ready_sources: 0,
+  };
+
+  /** Records the download the browser would have started. */
+  function captureDownload() {
+    const started: { name: string; blob: Blob | null }[] = [];
+    const created: string[] = [];
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: (blob: Blob) => {
+        created.push("blob:fake");
+        started.push({ name: "", blob });
+        return "blob:fake";
+      },
+      revokeObjectURL: () => undefined,
+    });
+    const realClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function click(this: HTMLAnchorElement) {
+      if (started.length) started[started.length - 1].name = this.download;
+    };
+    return {
+      started,
+      restore: () => {
+        HTMLAnchorElement.prototype.click = realClick;
+      },
+    };
+  }
+
+  function zipResponse(): Response {
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "content-disposition"
+            ? 'attachment; filename="Cairo_conversations.zip"'
+            : null,
+      },
+      blob: async () => new Blob(["zip"], { type: "application/zip" }),
+      json: async () => ({}),
+    } as unknown as Response;
+  }
+
+  it("offers Export on every dataset for an administrator", async () => {
+    vi.stubGlobal("fetch", routedFetch({
+      user: administrator,
+      projects: [ownDataset, unprepared],
+    }));
+    await openLibrary();
+
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>(
+      ".project-card-actions button",
+    )).filter((node) => node.textContent?.trim() === "Export");
+    expect(buttons).toHaveLength(2);
+    // Ready dataset is offered; the one with nothing prepared is not.
+    expect(buttons[0].disabled).toBe(false);
+    expect(buttons[1].disabled).toBe(true);
+    expect(buttons[1].title).toContain("No source in this dataset has been prepared");
+  });
+
+  it("hides Export from a regular user", async () => {
+    vi.stubGlobal("fetch", routedFetch({ user: regular, projects: [otherDataset] }));
+    await openLibrary();
+    expect(findByText(".project-card-actions button", "Export")).toBeUndefined();
+  });
+
+  it("downloads the archive the server names", async () => {
+    const download = captureDownload();
+    try {
+      vi.stubGlobal("fetch", routedFetch({
+        user: administrator,
+        projects: [ownDataset],
+        onCall: (url) =>
+          url === "/api/admin/projects/proj_owned/export" ? zipResponse() : undefined,
+      }));
+      await openLibrary();
+      await click(findByText(".project-card-actions button", "Export"));
+
+      expect(download.started).toHaveLength(1);
+      expect(download.started[0].name).toBe("Cairo_conversations.zip");
+      expect(container.querySelector(".banner.success")?.textContent)
+        .toContain("was exported");
+    } finally {
+      download.restore();
+    }
+  });
+
+  it("shows why an export was refused instead of saving an error page", async () => {
+    const download = captureDownload();
+    try {
+      vi.stubGlobal("fetch", routedFetch({
+        user: administrator,
+        projects: [ownDataset],
+        onCall: (url) =>
+          url === "/api/admin/projects/proj_owned/export"
+            ? response({ detail: "This dataset has no prepared source to export yet." }, 409)
+            : undefined,
+      }));
+      await openLibrary();
+      await click(findByText(".project-card-actions button", "Export"));
+
+      expect(download.started).toHaveLength(0);
+      expect(container.querySelector(".banner.error")?.textContent)
+        .toContain("no prepared source");
+    } finally {
+      download.restore();
+    }
+  });
+});

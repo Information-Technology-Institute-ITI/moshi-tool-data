@@ -162,6 +162,45 @@ export function triggerGpuCheck(signal?: AbortSignal): Promise<GpuCheckTriggerRe
   });
 }
 
+/**
+ * Downloads a dataset's audio and transcript CSV as one archive.
+ *
+ * Fetched rather than linked so a refusal arrives as a readable message instead
+ * of the browser saving an error page as a .zip.
+ */
+export async function exportDataset(projectId: string): Promise<void> {
+  const response = await fetch(`/api/admin/projects/${projectId}/export`, {
+    credentials: "same-origin",
+  });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      detail = String((await response.json()).detail || "");
+    } catch {
+      detail = "";
+    }
+    throw new ApiError(
+      response.status,
+      detail || "The dataset could not be exported.",
+    );
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filenameFrom(response.headers.get("content-disposition"))
+    || "dataset.zip";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function filenameFrom(disposition: string | null): string {
+  const match = disposition?.match(/filename="?([^"]+)"?/);
+  return match ? match[1] : "";
+}
+
 export function seconds(samples: number): string {
   return (samples / 24_000).toFixed(2);
 }
