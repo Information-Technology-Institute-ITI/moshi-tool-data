@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import wave
 import zipfile
 from pathlib import Path
@@ -16,10 +17,13 @@ from moshi_data_pipeline.studio.dataset_export import (
     NothingToExportError,
     archive_audio_names,
     build_dataset_archive,
+    final_alignment_document,
+    source_folders,
     transcript_rows,
 )
 from moshi_data_pipeline.studio.domain import (
     SAMPLE_RATE,
+    ActivityRegion,
     AnnotationDocument,
     TranscriptUtterance,
 )
@@ -36,6 +40,11 @@ def _write_wav(path: Path, seconds: float) -> None:
         handle.setsampwidth(2)
         handle.setframerate(SAMPLE_RATE)
         handle.writeframes(b"\x00\x00" * int(seconds * SAMPLE_RATE))
+
+
+def _word(word: str, start: float, end: float, **extra) -> dict:
+    """One aligned word. Alignment timings are seconds, not samples."""
+    return {"word": word, "start": start, "end": end, "score": 0.9, **extra}
 
 
 def _utterance(start: float, end: float, speaker: str, text: str, **extra):
@@ -95,12 +104,101 @@ def _fixture(tmp_path: Path, *, require_sign_in: bool = False):
         AnnotationDocument(
             source_id=source_id,
             transcript=[
-                _utterance(4.0, 6.5, "B", "الحمد لله", quality_flags=["repeated_ngram"]),
+                # Left exactly as the model transcribed it.
+                _utterance(
+                    4.0,
+                    6.5,
+                    "B",
+                    "الحمد لله",
+                    model_text="الحمد لله",
+                    quality_flags=["repeated_ngram"],
+                ),
                 _utterance(0.0, 2.5, "A", "أهلا بيك", model_text="اهلا بيك"),
+            ],
+            activities=[
+                ActivityRegion(
+                    speaker="A",
+                    start_sample=0,
+                    end_sample=int(2.5 * SAMPLE_RATE),
+                    origin="model",
+                ),
+                ActivityRegion(
+                    speaker="B",
+                    start_sample=int(4.0 * SAMPLE_RATE),
+                    end_sample=int(6.5 * SAMPLE_RATE),
+                    origin="model",
+                ),
+            ],
+            aligned_words=[
+                _word("أهلا", 0.5, 1.0),
+                _word("بيك", 1.2, 2.0),
+                # Between the two segments: no final segment holds it.
+                _word("خارج", 3.0, 3.4),
+                _word("الحمد", 4.2, 4.8),
+                _word("لله", 6.0, 6.4),
+                # The aligner could not place this one.
+                {"word": "مجهول", "start": None, "end": None, "speaker": None},
             ],
         ),
     )
     return app, service, str(project["id"]), source_id
+
+
+def _gpu_prepared_source(service, project_id: str, name: str, *, audio: bool = True):
+    """A source prepared on the GPU host, as production actually stores one.
+
+    Its canonical audio is committed under worker_artifacts/ and registered in
+    the catalog; nothing ever writes it to the workspace's default name.
+    """
+    original = service.paths.originals / name
+    _write_wav(original, 8)
+    source = service.catalog.create_source(
+        project_id,
+        name,
+        service.paths.relative(original),
+        "audio/wav",
+        "c" * 64,
+        original.stat().st_size,
+    )
+    source_id = str(source["id"])
+    if audio:
+        committed = (
+            service.paths.worker_artifacts / f"job_{source_id}" / "attempt_1" / "canonical.wav"
+        )
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        _write_wav(committed, 8)
+        service.catalog.register_artifact(
+            role="source.canonical",
+            relative_path=service.paths.relative(committed),
+            sha256="d" * 64,
+            size_bytes=committed.stat().st_size,
+            media_type="audio/wav",
+            source_id=source_id,
+        )
+    service.catalog.update_source(
+        source_id, duration_samples=8 * SAMPLE_RATE, status="ready"
+    )
+    service.catalog.save_annotation(
+        source_id,
+        0,
+        AnnotationDocument(
+            source_id=source_id,
+            transcript=[_utterance(0.0, 3.0, "A", "من الجهاز")],
+        ),
+    )
+    return source_id
+
+
+def _analysis(service, source_id: str, **documents) -> None:
+    """Write pipeline artifacts for a source, as a finished GPU run would."""
+    for name, document in documents.items():
+        path = service.paths.artifact(source_id, f"{name}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+def _json_member(archive: zipfile.ZipFile, name: str) -> dict:
+    return json.loads(archive.read(name).decode("utf-8"))
 
 
 def _rows(archive: zipfile.ZipFile) -> list[dict[str, str]]:
@@ -267,6 +365,99 @@ def test_unprepared_sources_are_left_out(tmp_path) -> None:
     assert audio == ["audio/episode_one.wav"]
 
 
+def test_a_source_prepared_on_the_gpu_host_can_be_exported(tmp_path) -> None:
+    """The audio of a GPU-prepared source never reaches the default path.
+
+    It is committed under worker_artifacts/ and registered instead. Reading only
+    the default name made every such dataset report that nothing was prepared.
+    """
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    service = app.state.studio
+    admin = service.catalog.ensure_local_admin()
+    project = service.catalog.create_project("Remote", owner_user_id=str(admin["id"]))
+    project_id = str(project["id"])
+    source_id = _gpu_prepared_source(service, project_id, "remote-episode.wav")
+    # The premise of the fault: nothing is at the name the export used to read.
+    assert not service.paths.canonical_audio(source_id).exists()
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        names = set(archive.namelist())
+        rows = _rows(archive)
+
+    assert "audio/remote-episode.wav" in names
+    assert "sources/remote-episode/final_user_edited_transcript.json" in names
+    assert [row["text"] for row in rows] == ["من الجهاز"]
+
+
+def test_a_dataset_whose_audio_is_missing_does_not_claim_nothing_is_prepared(
+    tmp_path,
+) -> None:
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    service = app.state.studio
+    admin = service.catalog.ensure_local_admin()
+    project = service.catalog.create_project("Lost", owner_user_id=str(admin["id"]))
+    project_id = str(project["id"])
+    _gpu_prepared_source(service, project_id, "gone.wav", audio=False)
+
+    try:
+        build_dataset_archive(
+            service.catalog, service.paths, project_id, tmp_path / "out.zip"
+        )
+    except NothingToExportError as exc:
+        # The old message sent the search for this fault the wrong way entirely.
+        assert "1 prepared source" in str(exc)
+        assert "audio could be found" in str(exc)
+    else:  # pragma: no cover - the call must raise
+        raise AssertionError("expected NothingToExportError")
+
+
+def test_a_dataset_exports_every_source_it_has(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    _gpu_prepared_source(service, project_id, "second-episode.wav")
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        names = set(archive.namelist())
+        rows = _rows(archive)
+
+    # Both audio files, and a JSON folder each, whichever way they were prepared.
+    assert {"audio/episode_one.wav", "audio/second-episode.wav"} <= names
+    assert "sources/episode_one/final_aligned_transcript.json" in names
+    assert "sources/second-episode/final_aligned_transcript.json" in names
+    # One running number across the export, restarting the index per source.
+    assert [row["sequential_id"] for row in rows] == ["1", "2", "3"]
+    assert [row["segment_index"] for row in rows] == ["1", "2", "1"]
+    assert [row["audio_file"] for row in rows] == [
+        "audio/episode_one.wav",
+        "audio/episode_one.wav",
+        "audio/second-episode.wav",
+    ]
+    with zipfile.ZipFile(destination) as archive:
+        second = _json_member(
+            archive, "sources/second-episode/final_user_edited_transcript.json"
+        )
+    # Each folder names the audio it belongs to, so nothing has to be guessed.
+    assert second["audio_file"] == "audio/second-episode.wav"
+
+
+def test_one_source_without_audio_does_not_cost_the_others(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    _gpu_prepared_source(service, project_id, "missing-episode.wav", audio=False)
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        audio = [name for name in archive.namelist() if name.startswith("audio/")]
+        notes = archive.read("README.txt").decode("utf-8")
+
+    assert audio == ["audio/episode_one.wav"]
+    # Named rather than silently dropped.
+    assert "missing-episode.wav" in notes
+
+
 def test_a_dataset_with_nothing_prepared_says_so(tmp_path) -> None:
     app = create_studio_app(tmp_path / "workspace", start_worker=False)
     service = app.state.studio
@@ -280,6 +471,189 @@ def test_a_dataset_with_nothing_prepared_says_so(tmp_path) -> None:
         assert "no prepared source" in str(exc)
     else:  # pragma: no cover - the call must raise
         raise AssertionError("expected NothingToExportError")
+
+
+def test_archive_carries_a_json_folder_for_every_source(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+
+    with zipfile.ZipFile(destination) as archive:
+        names = set(archive.namelist())
+
+    # The folder is named after the audio file it describes.
+    assert "sources/episode_one/final_user_edited_transcript.json" in names
+    assert "sources/episode_one/final_aligned_transcript.json" in names
+    # This source was never processed, so there is no diarization to copy.
+    assert "sources/episode_one/diarization.json" not in names
+
+
+def test_diarization_is_copied_out_untouched(tmp_path) -> None:
+    app, service, project_id, source_id = _fixture(tmp_path)
+    diarization = {"model": "pyannote/x", "segments": [{"start": 0.0, "end": 1.0}]}
+    _analysis(service, source_id, diarization=diarization)
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        copied = _json_member(archive, "sources/episode_one/diarization.json")
+
+    # Nothing in the studio edits diarization, so it travels as the model left it.
+    assert copied == diarization
+
+
+def test_final_transcript_holds_the_reviewers_text_and_what_changed(tmp_path) -> None:
+    app, service, project_id, source_id = _fixture(tmp_path)
+    latest = service.catalog.latest_annotation(source_id)
+    edited = latest.model_copy(deep=True)
+    edited.transcript[1].text = "نص بعد التعديل"
+    service.catalog.save_annotation(source_id, latest.version, edited)
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_user_edited_transcript.json"
+        )
+
+    assert document["annotation_version"] == latest.version + 1
+    assert document["audio_file"] == "audio/episode_one.wav"
+    utterances = document["utterances"]
+    # Chronological, whatever order the segments were stored in.
+    assert [item["start_seconds"] for item in utterances] == [0.0, 4.0]
+    assert utterances[0]["text"] == "نص بعد التعديل"
+    assert utterances[0]["model_text"] == "اهلا بيك"
+    assert utterances[0]["text_changed_from_model"] is True
+    assert utterances[1]["text_changed_from_model"] is False
+    assert utterances[1]["quality_flags"] == ["repeated_ngram"]
+
+
+def test_final_transcript_carries_the_speaker_lanes(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_user_edited_transcript.json"
+        )
+
+    # The lanes as the reviewer left them, alongside the transcript.
+    assert [region["speaker"] for region in document["speaker_activity"]] == ["A", "B"]
+    assert document["speaker_activity"][1]["start_seconds"] == 4.0
+
+
+def test_final_alignment_puts_the_words_under_the_final_segments(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_aligned_transcript.json"
+        )
+
+    segments = document["segments"]
+    assert [segment["speaker"] for segment in segments] == ["A", "B"]
+    assert [word["word"] for word in segments[0]["words"]] == ["أهلا", "بيك"]
+    assert [word["word"] for word in segments[1]["words"]] == ["الحمد", "لله"]
+    # Seconds in, samples out as well, so the words share the transcript's units.
+    assert segments[0]["words"][0]["start_sample"] == int(0.5 * SAMPLE_RATE)
+
+
+def test_every_aligned_word_is_listed_once_with_the_segments_holding_it(tmp_path) -> None:
+    app, service, project_id, _ = _fixture(tmp_path)
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_aligned_transcript.json"
+        )
+
+    words = document["word_segments"]
+    assert [word["word"] for word in words] == [
+        "أهلا",
+        "بيك",
+        "خارج",
+        "الحمد",
+        "لله",
+        # A word the aligner could not place sorts last rather than vanishing.
+        "مجهول",
+    ]
+    held = {word["word"]: word["segment_ids"] for word in words}
+    assert len(held["أهلا"]) == 1
+    # No final segment covers these, so nothing claims them.
+    assert held["خارج"] == []
+    assert held["مجهول"] == []
+
+
+def test_a_word_spoken_over_belongs_to_both_segments() -> None:
+    """Overlapped speech is one segment per speaker, and both really said it."""
+    annotation = AnnotationDocument(
+        source_id="source_1",
+        transcript=[
+            _utterance(0.0, 4.0, "A", "الأول"),
+            _utterance(3.0, 6.0, "B", "الثاني"),
+        ],
+        aligned_words=[_word("مشترك", 3.2, 3.6)],
+    )
+    document = final_alignment_document(
+        ExportSource("source_1", "one.wav", Path("a"), annotation),
+        audio_file="audio/one.wav",
+    )
+
+    assert [len(segment["words"]) for segment in document["segments"]] == [1, 1]
+    assert len(document["word_segments"][0]["segment_ids"]) == 2
+    assert document["word_segments"][0]["speakers"] == ["A", "B"]
+
+
+def test_alignment_metadata_comes_from_the_pipeline_artifact(tmp_path) -> None:
+    app, service, project_id, source_id = _fixture(tmp_path)
+    _analysis(
+        service,
+        source_id,
+        aligned_transcript={
+            "alignment_model": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic",
+            "alignment_model_revision": "af46c2d",
+            "language": "ar",
+            "segments": [],
+        },
+    )
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_aligned_transcript.json"
+        )
+
+    assert document["alignment_model"] == "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+    assert document["language"] == "ar"
+
+
+def test_a_damaged_artifact_does_not_cost_the_download(tmp_path) -> None:
+    app, service, project_id, source_id = _fixture(tmp_path)
+    path = service.paths.artifact(source_id, "aligned_transcript.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ this is not json", encoding="utf-8")
+
+    destination = tmp_path / "out.zip"
+    build_dataset_archive(service.catalog, service.paths, project_id, destination)
+    with zipfile.ZipFile(destination) as archive:
+        document = _json_member(
+            archive, "sources/episode_one/final_aligned_transcript.json"
+        )
+
+    # The alignment we build ourselves survives; only the model's name is lost.
+    assert document["alignment_model"] is None
+    assert len(document["segments"]) == 2
+
+
+def test_two_sources_named_alike_get_distinct_folders() -> None:
+    sources = [
+        ExportSource("source_1", "episode.wav", Path("a"), AnnotationDocument(source_id="s1")),
+        ExportSource("source_2", "episode.wav", Path("b"), AnnotationDocument(source_id="s2")),
+    ]
+    # A folder always matches the audio file it sits beside.
+    assert source_folders(sources) == ["sources/episode", "sources/episode_2"]
 
 
 def _make_user(service, email: str, role: str) -> dict:

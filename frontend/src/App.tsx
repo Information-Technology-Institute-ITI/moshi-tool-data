@@ -598,8 +598,9 @@ function ProjectLibrary({
                   disabled={!item.ready_sources || exporting === item.id}
                   title={
                     item.ready_sources
-                      ? "Download this dataset's audio and a CSV of every transcript"
-                        + " segment"
+                      ? "Download this dataset's audio, a CSV of every transcript"
+                        + " segment, and the final transcript, word alignment and"
+                        + " diarization as JSON"
                       : "No source in this dataset has been prepared yet"
                   }
                   onClick={() => void exportOne(item)}
