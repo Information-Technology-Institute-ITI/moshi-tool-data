@@ -16,3 +16,4 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 local_data/
+test2_*/
