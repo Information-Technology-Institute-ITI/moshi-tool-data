@@ -518,8 +518,11 @@ function SegmentInspector({
       )}
       <p className="inspector-note">
         {words.length
-          ? `${words.length} aligned words decide how the text divides when you split.`
+          ? `${words.length} aligned words decide where the split time lands.`
           : "This segment has no word timings, so a split divides the text at your cursor."}
+        {words.length
+          ? " If you edited the transcript, its current text divides at your cursor."
+          : ""}
         {" "}Splitting and joining change timestamps and text only. The original media is
         never cut or re-encoded. Duration {seconds(segment.end_sample - segment.start_sample)}s.
       </p>

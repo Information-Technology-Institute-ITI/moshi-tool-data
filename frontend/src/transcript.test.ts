@@ -237,6 +237,52 @@ describe("split follows word alignments", () => {
     expect(combined).toBe("word1 word2 word3");
   });
 
+  it("splits the reviewer's current text after it was edited and saved", () => {
+    const currentText = "corrected first corrected second";
+    const edited = {
+      ...withWords,
+      transcript: [{
+        ...withWords.transcript[0],
+        text: currentText,
+        model_text: "word1 word2 word3",
+      }],
+    };
+
+    const result = splitSegment(
+      edited,
+      "u1",
+      Math.round(19 * S),
+      "corrected first".length,
+    );
+    if (!result.ok) throw new Error("expected split");
+    const parts = result.annotation.transcript.filter((item) =>
+      result.ids.includes(item.id),
+    );
+
+    expect(parts.map((item) => item.text)).toEqual([
+      "corrected first",
+      "corrected second",
+    ]);
+    expect(parts.map((item) => item.text).join(" ")).toBe(currentText);
+  });
+
+  it("never restores stale aligned text when no caret was supplied", () => {
+    const currentText = "corrected one corrected two corrected three";
+    const edited = {
+      ...withWords,
+      transcript: [{ ...withWords.transcript[0], text: currentText }],
+    };
+
+    const result = splitSegment(edited, "u1", Math.round(19 * S));
+    if (!result.ok) throw new Error("expected split");
+    const parts = result.annotation.transcript.filter((item) =>
+      result.ids.includes(item.id),
+    );
+
+    expect(parts.map((item) => item.text).join(" ")).toBe(currentText);
+    expect(parts.some((item) => item.text.includes("word1"))).toBe(false);
+  });
+
   it("only considers words inside the segment being split", () => {
     const neighbours = {
       ...withWords,

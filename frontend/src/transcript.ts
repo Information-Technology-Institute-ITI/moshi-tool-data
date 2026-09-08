@@ -287,6 +287,21 @@ function joinWords(words: AlignedWord[]): string {
   return words.map((word) => word.word.trim()).filter(Boolean).join(" ");
 }
 
+function proportionalTextOffset(
+  text: string,
+  firstAlignedWords: number,
+  totalAlignedWords: number,
+): number {
+  const currentWords = [...text.matchAll(/\S+/gu)];
+  if (!currentWords.length || !totalAlignedWords) return text.length;
+  const firstCurrentWords = Math.round(
+    currentWords.length * firstAlignedWords / totalAlignedWords,
+  );
+  if (firstCurrentWords <= 0) return 0;
+  if (firstCurrentWords >= currentWords.length) return text.length;
+  return currentWords[firstCurrentWords].index;
+}
+
 export type SplitResult =
   | {
       ok: true;
@@ -338,23 +353,34 @@ export function splitSegment(
     };
   }
 
+  const wordParts = words.length
+    ? partitionWords(
+        annotation.aligned_words,
+        segment.start_sample,
+        segment.end_sample,
+        atSample,
+      )
+    : null;
+  const alignedText = wordParts
+    ? joinWords([...wordParts.first, ...wordParts.second])
+    : "";
+  const textStillMatchesAlignment = segment.text.trim() === alignedText;
+
   let firstText: string;
   let secondText: string;
-  if (words.length) {
-    // Word timings decide the text on each side, so each half carries exactly
-    // the words spoken inside its own range.
-    const parts = partitionWords(
-      annotation.aligned_words,
-      segment.start_sample,
-      segment.end_sample,
-      atSample,
-    );
-    firstText = joinWords(parts.first);
-    secondText = joinWords(parts.second);
+  if (wordParts && textStillMatchesAlignment) {
+    // The untouched model text can follow its word timings exactly.
+    firstText = joinWords(wordParts.first);
+    secondText = joinWords(wordParts.second);
   } else {
-    // No alignment for this segment: fall back to the caret position.
+    // A reviewer's correction is authoritative. Aligned words can still snap
+    // the timestamp, but must never restore their stale text over the edit.
+    // The UI supplies the caret; callers without one get a word-proportional
+    // boundary so both halves still preserve the complete current text.
     const cut = textOffset === undefined
-      ? segment.text.length
+      ? wordParts
+        ? proportionalTextOffset(segment.text, wordParts.first.length, words.length)
+        : segment.text.length
       : Math.max(0, Math.min(segment.text.length, textOffset));
     firstText = segment.text.slice(0, cut).trim();
     secondText = segment.text.slice(cut).trim();
