@@ -13,6 +13,7 @@ import {
   overlapsForAnnotation,
   segmentsForActivity,
   overlapsForSegment,
+  prepareSplit,
   resolveSplitSample,
   splitAllByTurns,
   splitSegment,
@@ -147,7 +148,8 @@ describe("split", () => {
       result.ids.includes(item.id),
     );
     expect(parts[0].text).toBe("hello");
-    expect(parts[1].text).toBe("there");
+    expect(parts[1].text).toBe(" there");
+    expect(parts.map((part) => part.text).join("")).toBe("hello there");
   });
 
   it("refuses a split point outside the segment", () => {
@@ -192,7 +194,7 @@ describe("split follows word alignments", () => {
     expect(parts[0].text).toBe("word1");
     expect(parts[1].start_sample).toBe(Math.round(19 * S));
     expect(parts[1].end_sample).toBe(Math.round(26.12 * S));
-    expect(parts[1].text).toBe("word2 word3");
+    expect(parts[1].text).toBe(" word2 word3");
   });
 
   it("moves a mid-word split to the end of that word", () => {
@@ -209,7 +211,7 @@ describe("split follows word alignments", () => {
     expect(parts[0].text).toBe("word1 word2");
     expect(parts[1].start_sample).toBe(Math.round(24 * S));
     expect(parts[1].end_sample).toBe(Math.round(26.12 * S));
-    expect(parts[1].text).toBe("word3");
+    expect(parts[1].text).toBe(" word3");
   });
 
   it("never leaves a word straddling the boundary", () => {
@@ -233,7 +235,7 @@ describe("split follows word alignments", () => {
   it("keeps every word across a split", () => {
     const result = splitSegment(withWords, "u1", Math.round(22 * S));
     if (!result.ok) throw new Error("expected split");
-    const combined = result.annotation.transcript.map((item) => item.text).join(" ");
+    const combined = result.annotation.transcript.map((item) => item.text).join("");
     expect(combined).toBe("word1 word2 word3");
   });
 
@@ -260,8 +262,48 @@ describe("split follows word alignments", () => {
       result.ids.includes(item.id),
     );
     expect(parts[0].text).toBe("hello");
-    expect(parts[1].text).toBe("there");
+    expect(parts[1].text).toBe(" there");
     expect(result.snappedFrom).toBeNull();
+  });
+
+  it("keeps corrected text when aligned words are stale", () => {
+    const corrected = {
+      ...withWords,
+      transcript: [
+        utterance(
+          "u1",
+          Math.round(15.36 * S),
+          Math.round(26.12 * S),
+          "A",
+          "نص مصحح [QA TEST]",
+        ),
+      ],
+    };
+    const proposal = prepareSplit(corrected, "u1", Math.round(22 * S));
+    if ("reason" in proposal) throw new Error(proposal.reason);
+    expect(proposal.firstText + proposal.secondText).toBe("نص مصحح [QA TEST]");
+
+    const result = splitSegment(
+      corrected,
+      "u1",
+      proposal.atSample,
+      undefined,
+      [proposal.firstText, proposal.secondText],
+    );
+    if (!result.ok) throw new Error(result.reason);
+    const parts = result.annotation.transcript.filter((item) => result.ids.includes(item.id));
+    expect(parts.map((part) => part.text).join("")).toBe("نص مصحح [QA TEST]");
+  });
+
+  it("preserves emoji and combining marks around a suggested boundary", () => {
+    const text = "أَهْلًا 👨‍👩‍👧‍👦 بالعالم";
+    const value = {
+      ...base,
+      transcript: [utterance("u1", 0, 24_000, "A", text)],
+    };
+    const proposal = prepareSplit(value, "u1", 12_000);
+    if ("reason" in proposal) throw new Error(proposal.reason);
+    expect(proposal.firstText + proposal.secondText).toBe(text);
   });
 
   it("resolves the split point without mutating anything", () => {
@@ -443,6 +485,68 @@ describe("speaker lanes follow the transcript", () => {
     const next = updateSegment(laned, "u1", { speaker: "B" });
     expect(ranges(next)).toContain("B:0-24000");
     expect(ranges(next)).not.toContain("A:0-24000");
+  });
+
+  it("reuses existing target-speaker coverage without creating an overlap", () => {
+    const partiallyCovered: Annotation = {
+      ...laned,
+      activities: [
+        ...laned.activities,
+        {
+          id: "existing_b",
+          speaker: "B",
+          start_sample: 10_000,
+          end_sample: 20_000,
+          origin: "model",
+        },
+      ],
+    };
+    const next = updateSegment(partiallyCovered, "u1", { speaker: "B" });
+    const speakerB = next.activities
+      .filter((item) => item.speaker === "B")
+      .sort((left, right) => left.start_sample - right.start_sample);
+
+    expect(ranges(next)).toContain("B:0-10000");
+    expect(ranges(next)).toContain("B:10000-20000");
+    expect(ranges(next)).toContain("B:20000-24000");
+    expect(
+      speakerB.some(
+        (item, index) => index > 0 && item.start_sample < speakerB[index - 1].end_sample,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not replace unrelated diarisation rectangles after a spanning split", () => {
+    const spanning: Annotation = {
+      ...annotationWith([
+        utterance("spanning", 744, 336_888, "A", "first second"),
+      ]),
+      activities: [
+        { id: "first_a", speaker: "A", start_sample: 743, end_sample: 171_248, origin: "model" },
+        { id: "middle_b", speaker: "B", start_sample: 170_438, end_sample: 336_083, origin: "model" },
+        { id: "next_a", speaker: "A", start_sample: 336_083, end_sample: 544_253, origin: "model" },
+      ],
+      aligned_words: [],
+    };
+    const split = splitSegment(spanning, "spanning", 170_438, 5);
+    if (!split.ok) throw new Error("expected split");
+    expect(split.annotation.activities).toEqual(spanning.activities);
+
+    const relabelled = updateSegment(split.annotation, split.ids[1], { speaker: "B" });
+    expect(relabelled.activities).toContainEqual(spanning.activities[0]);
+    expect(relabelled.activities).toContainEqual(spanning.activities[1]);
+    expect(relabelled.activities).toContainEqual(spanning.activities[2]);
+    expect(ranges(relabelled)).toContain("B:336083-336888");
+    for (const speaker of ["A", "B"] as const) {
+      const lane = relabelled.activities
+        .filter((item) => item.speaker === speaker)
+        .sort((left, right) => left.start_sample - right.start_sample);
+      expect(
+        lane.some(
+          (item, index) => index > 0 && item.start_sample < lane[index - 1].end_sample,
+        ),
+      ).toBe(false);
+    }
   });
 
   it("leaves the lanes alone when only text changes", () => {

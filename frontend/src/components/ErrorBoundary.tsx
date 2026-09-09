@@ -13,8 +13,7 @@ type State = { error: Error | null };
  * Catches render errors so a mistake in one screen cannot blank the whole page.
  *
  * React unmounts the entire tree when a render throws, which showed up as a
- * white page that only a browser reload recovered from. Unsaved edits live in
- * the autosave draft, so recovering in place keeps them.
+ * white page that only a browser reload recovered from.
  */
 export default class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
@@ -35,8 +34,8 @@ export default class ErrorBoundary extends Component<Props, State> {
       <div className="error-boundary" role="alert">
         <h2>Something on this screen stopped working</h2>
         <p>
-          The page recovered instead of going blank. Your unsaved edits are kept in
-          this browser and are offered again when you reopen the source.
+          The page recovered instead of going blank. Reopening the source loads its
+          last successful save; edits made since then may need to be repeated.
         </p>
         <pre className="error-boundary-detail">{error.message}</pre>
         <div className="error-boundary-actions">

@@ -54,32 +54,24 @@ function overlap(
 }
 
 /**
- * The activity region that best corresponds to a transcript segment: same
- * speaker, and the largest time overlap. Exact bounds win outright.
+ * Finds the activity rectangle owned by a transcript segment.
+ *
+ * A model transcript entry can span several diarisation rectangles, including
+ * rectangles for both speakers. Treating the largest overlap as ownership can
+ * therefore delete unrelated model timing and create a duplicate rectangle
+ * when the reviewer corrects the entry's speaker. Only identical bounds are a
+ * safe one-to-one relationship.
  */
-function matchingActivityIndex(
+function exactActivityIndex(
   activities: ActivityRegion[],
   segment: TranscriptUtterance,
 ): number {
-  let best = -1;
-  let bestOverlap = 0;
-  activities.forEach((region, index) => {
-    if (region.speaker !== segment.speaker) return;
-    if (
-      region.start_sample === segment.start_sample
-      && region.end_sample === segment.end_sample
-    ) {
-      best = index;
-      bestOverlap = Number.POSITIVE_INFINITY;
-      return;
-    }
-    const shared = overlap(region, segment);
-    if (shared > bestOverlap) {
-      best = index;
-      bestOverlap = shared;
-    }
-  });
-  return bestOverlap > 0 ? best : -1;
+  return activities.findIndex(
+    (region) =>
+      region.speaker === segment.speaker
+      && region.start_sample === segment.start_sample
+      && region.end_sample === segment.end_sample,
+  );
 }
 
 function activityFor(segment: TranscriptUtterance): ActivityRegion {
@@ -98,6 +90,41 @@ function new_activity_id(): string {
 }
 
 /**
+ * Adds only the portions of a segment not already represented on its speaker
+ * lane. Same-speaker rectangles may touch, but must never overlap because the
+ * backend rejects that ambiguous timeline.
+ */
+function addUncoveredActivity(
+  activities: ActivityRegion[],
+  segment: TranscriptUtterance,
+): void {
+  const speaker = (segment.speaker || "A") as Speaker;
+  const occupied = activities
+    .filter(
+      (region) =>
+        region.speaker === speaker
+        && region.start_sample < segment.end_sample
+        && region.end_sample > segment.start_sample,
+    )
+    .sort((left, right) => left.start_sample - right.start_sample);
+  let cursor = segment.start_sample;
+  for (const region of occupied) {
+    if (region.start_sample > cursor) {
+      activities.push(activityFor({
+        ...segment,
+        start_sample: cursor,
+        end_sample: Math.min(region.start_sample, segment.end_sample),
+      }));
+    }
+    cursor = Math.max(cursor, region.end_sample);
+    if (cursor >= segment.end_sample) return;
+  }
+  if (cursor < segment.end_sample) {
+    activities.push(activityFor({ ...segment, start_sample: cursor }));
+  }
+}
+
+/**
  * Mirrors a transcript change onto the speaker A/B lanes.
  *
  * The lanes show who spoke when, so adding, deleting, splitting or joining a
@@ -110,12 +137,24 @@ export function syncActivities(
   added: TranscriptUtterance[],
 ): ActivityRegion[] {
   const next = [...activities];
+  let exactMatches = 0;
   for (const segment of removed) {
-    const index = matchingActivityIndex(next, segment);
-    if (index >= 0) next.splice(index, 1);
+    const index = exactActivityIndex(next, segment);
+    if (index >= 0) {
+      next.splice(index, 1);
+      exactMatches += 1;
+    }
   }
-  for (const segment of added) {
-    next.push(activityFor(segment));
+
+  const isDirectUpdate =
+    removed.length === 1 && added.length === 1 && removed[0].id === added[0].id;
+  const speakerChanged = isDirectUpdate && removed[0].speaker !== added[0].speaker;
+  const shouldAdd =
+    removed.length === 0
+    || exactMatches === removed.length
+    || speakerChanged;
+  if (shouldAdd) {
+    for (const segment of added) addUncoveredActivity(next, segment);
   }
   return next.sort(
     (left, right) =>
@@ -260,29 +299,7 @@ export function resolveSplitSample(
   return { sample: wordEndSample(straddling)!, snappedFrom: requestedSample };
 }
 
-/**
- * Divides a segment's words at a sample point, keeping spoken order. Words
- * without timing follow the side their neighbours landed on, so text is never
- * dropped or reordered.
- */
-function partitionWords(
-  alignedWords: AlignedWord[],
-  startSample: number,
-  endSample: number,
-  atSample: number,
-): { first: AlignedWord[]; second: AlignedWord[] } {
-  const words = wordsForSegment(alignedWords, startSample, endSample);
-  const first: AlignedWord[] = [];
-  const second: AlignedWord[] = [];
-  let crossed = false;
-  for (const word of words) {
-    const end = wordEndSample(word);
-    if (end !== null && end > atSample) crossed = true;
-    (crossed ? second : first).push(word);
-  }
-  return { first, second };
-}
-
+/** Renders aligned model words when a model-derived operation needs text. */
 function joinWords(words: AlignedWord[]): string {
   return words.map((word) => word.word.trim()).filter(Boolean).join(" ");
 }
@@ -299,6 +316,128 @@ export type SplitResult =
     }
   | { ok: false; reason: string };
 
+export type SplitPreview = {
+  id: string;
+  atSample: number;
+  snappedFrom: number | null;
+  originalText: string;
+  firstText: string;
+  secondText: string;
+};
+
+function tokenSpans(text: string): { text: string; start: number; end: number }[] {
+  return Array.from(text.matchAll(/\S+/gu), (match) => ({
+    text: match[0],
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
+}
+
+/** Finds a stable JS string offset without cutting a surrogate pair or combining mark. */
+function safeTextBoundaries(text: string): number[] {
+  const offsets = [0];
+  let offset = 0;
+  for (const value of Array.from(text)) {
+    offset += value.length;
+    const next = Array.from(text.slice(offset))[0] || "";
+    if (next && (/^\p{Mark}$/u.test(next) || next === "\uFE0F")) continue;
+    if (value === "\u200D" || next === "\u200D") continue;
+    offsets.push(offset);
+  }
+  if (offsets.at(-1) !== text.length) offsets.push(text.length);
+  return offsets;
+}
+
+function nearestTextBoundary(text: string, target: number): number {
+  const spans = tokenSpans(text);
+  const wordBoundaries = spans.flatMap((span) => [span.start, span.end]);
+  const interiorWords = wordBoundaries.filter((value) => value > 0 && value < text.length);
+  const candidates = interiorWords.length
+    ? interiorWords
+    : safeTextBoundaries(text).filter((value) => value > 0 && value < text.length);
+  if (!candidates.length) return Math.max(0, Math.min(text.length, target));
+  return candidates.reduce((best, value) =>
+    Math.abs(value - target) < Math.abs(best - target) ? value : best,
+  );
+}
+
+function nearestSafeOffset(text: string, target: number): number {
+  const candidates = safeTextBoundaries(text).filter(
+    (value) => value > 0 && value < text.length,
+  );
+  if (!candidates.length) return Math.max(0, Math.min(text.length, target));
+  return candidates.reduce((best, value) =>
+    Math.abs(value - target) < Math.abs(best - target) ? value : best,
+  );
+}
+
+function suggestedTextOffset(
+  segment: TranscriptUtterance,
+  words: AlignedWord[],
+  atSample: number,
+  explicitOffset?: number,
+): number {
+  const current = tokenSpans(segment.text);
+  const aligned = words.map((word) => word.word.trim()).filter(Boolean);
+  const matches =
+    current.length === aligned.length
+    && current.every((token, index) => token.text === aligned[index]);
+  if (matches) {
+    const firstCount = words.filter((word) => {
+      const end = wordEndSample(word);
+      return end !== null && end <= atSample;
+    }).length;
+    if (firstCount > 0 && firstCount < current.length) return current[firstCount - 1].end;
+  }
+  if (explicitOffset !== undefined && explicitOffset > 0 && explicitOffset < segment.text.length) {
+    return nearestSafeOffset(segment.text, explicitOffset);
+  }
+  const duration = segment.end_sample - segment.start_sample;
+  const ratio = duration > 0 ? (atSample - segment.start_sample) / duration : 0.5;
+  return nearestTextBoundary(segment.text, Math.round(segment.text.length * ratio));
+}
+
+/** Builds the exact local text proposal shown before a split is applied. */
+export function prepareSplit(
+  annotation: Annotation,
+  id: string,
+  requestedSample: number,
+  textOffset?: number,
+): SplitPreview | { reason: string } {
+  const segment = annotation.transcript.find((item) => item.id === id);
+  if (!segment) return { reason: "That segment no longer exists." };
+  if (requestedSample <= segment.start_sample || requestedSample >= segment.end_sample) {
+    return { reason: "The split point must fall inside the segment." };
+  }
+  const { sample: atSample, snappedFrom } = resolveSplitSample(
+    annotation.aligned_words,
+    segment.start_sample,
+    segment.end_sample,
+    requestedSample,
+  );
+  if (atSample <= segment.start_sample || atSample >= segment.end_sample) {
+    return {
+      reason:
+        "That word runs to the end of this segment, so splitting there would leave"
+        + " nothing after it. Choose an earlier point.",
+    };
+  }
+  const words = wordsForSegment(
+    annotation.aligned_words,
+    segment.start_sample,
+    segment.end_sample,
+  );
+  const cut = suggestedTextOffset(segment, words, atSample, textOffset);
+  return {
+    id,
+    atSample,
+    snappedFrom,
+    originalText: segment.text,
+    firstText: segment.text.slice(0, cut),
+    secondText: segment.text.slice(cut),
+  };
+}
+
 /**
  * Splits one segment into two adjacent timestamp ranges against the original
  * media. Both halves receive new ids. This changes annotation only: no audio
@@ -309,56 +448,14 @@ export function splitSegment(
   id: string,
   requestedSample: number,
   textOffset?: number,
+  previewText?: [string, string],
 ): SplitResult {
   const segment = annotation.transcript.find((item) => item.id === id);
   if (!segment) return { ok: false, reason: "That segment no longer exists." };
-  if (requestedSample <= segment.start_sample || requestedSample >= segment.end_sample) {
-    return { ok: false, reason: "The split point must fall inside the segment." };
-  }
-
-  const words = wordsForSegment(
-    annotation.aligned_words,
-    segment.start_sample,
-    segment.end_sample,
-  );
-  const { sample: atSample, snappedFrom } = resolveSplitSample(
-    annotation.aligned_words,
-    segment.start_sample,
-    segment.end_sample,
-    requestedSample,
-  );
-
-  // Snapping past the final word would leave an empty second half.
-  if (atSample <= segment.start_sample || atSample >= segment.end_sample) {
-    return {
-      ok: false,
-      reason:
-        "That word runs to the end of this segment, so splitting there would leave"
-        + " nothing after it. Choose an earlier point.",
-    };
-  }
-
-  let firstText: string;
-  let secondText: string;
-  if (words.length) {
-    // Word timings decide the text on each side, so each half carries exactly
-    // the words spoken inside its own range.
-    const parts = partitionWords(
-      annotation.aligned_words,
-      segment.start_sample,
-      segment.end_sample,
-      atSample,
-    );
-    firstText = joinWords(parts.first);
-    secondText = joinWords(parts.second);
-  } else {
-    // No alignment for this segment: fall back to the caret position.
-    const cut = textOffset === undefined
-      ? segment.text.length
-      : Math.max(0, Math.min(segment.text.length, textOffset));
-    firstText = segment.text.slice(0, cut).trim();
-    secondText = segment.text.slice(cut).trim();
-  }
+  const proposal = prepareSplit(annotation, id, requestedSample, textOffset);
+  if ("reason" in proposal) return { ok: false, reason: proposal.reason };
+  const { atSample, snappedFrom } = proposal;
+  const [firstText, secondText] = previewText || [proposal.firstText, proposal.secondText];
 
   const first = newSegment(
     segment.start_sample,

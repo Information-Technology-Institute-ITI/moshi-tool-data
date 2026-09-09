@@ -297,9 +297,49 @@ describe("unified review screen", () => {
     expect(split.disabled).toBe(false);
     await click(split);
 
+    expect(container.querySelector(".split-preview")?.textContent).toContain(
+      "Every character from the current transcript is preserved",
+    );
+    await click(byText(".split-preview .modal-actions button", "Confirm split"));
+
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(4);
     expect(container.textContent).toContain("0.00–0.50s");
     expect(container.textContent).toContain("0.50–1.00s");
+  });
+
+  it("previews and preserves corrected text until explicit Save", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    const area = container.querySelector(".segment-inspector textarea")!;
+    const corrected = "أهلا بك [QA TEST]";
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(area, corrected);
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+
+    await click(byText(".inspector-actions button", "Split here"));
+    const fields = container.querySelectorAll<HTMLTextAreaElement>(
+      ".split-preview-fields textarea",
+    );
+    expect(fields[0].value + fields[1].value).toBe(corrected);
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT"))
+      .toHaveLength(0);
+
+    await click(byText(".split-preview .modal-actions button", "Confirm split"));
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT"))
+      .toHaveLength(0);
+    await click(byText(".rail-actions button", "Save"));
+    const put = fetchMock.mock.calls.find((call) => call[1]?.method === "PUT");
+    const body = JSON.parse(String(put![1]!.body));
+    expect(body.annotation.transcript.slice(0, 2).map(
+      (part: TranscriptUtterance) => part.text,
+    ).join("")).toBe(corrected);
   });
 
   it("refuses a split point outside the selected segment", async () => {
@@ -396,6 +436,10 @@ describe("unified review screen", () => {
 
     await click(byText(".rail-actions button", "Undo"));
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(3);
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v2");
+    expect((byText(".rail-actions button", "Save") as HTMLButtonElement).disabled)
+      .toBe(true);
+
   });
 
   it("adds a segment", async () => {
@@ -410,7 +454,7 @@ describe("unified review screen", () => {
 
     await click(container.querySelectorAll(".transcript-entry")[0]);
     await click(byText(".inspector-actions button", "Delete segment"));
-    await click(byText(".rail-actions button", "Save now"));
+    await click(byText(".rail-actions button", "Save"));
     await flush();
 
     const put = fetchMock.mock.calls.find((call) => call[1]?.method === "PUT");
@@ -425,6 +469,131 @@ describe("unified review screen", () => {
         /transcribe|rediarize|realign|overlap|generate|clip|export|initialize/.test(url),
       ),
     ).toEqual([]);
+  });
+
+  it("includes a focused timing edit in the explicit Save snapshot", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    const start = container.querySelectorAll<HTMLInputElement>(
+      ".inspector-grid input[type=number]",
+    )[0];
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(start, "0.10");
+      start.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+    await click(byText(".rail-actions button", "Save"));
+
+    const put = fetchMock.mock.calls.find((call) => call[1]?.method === "PUT");
+    const body = JSON.parse(String(put![1]!.body));
+    expect(body.annotation.transcript[0].start_sample).toBe(2_400);
+  });
+
+  it("blocks Save while a visible timing value is invalid", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+
+    const end = container.querySelectorAll<HTMLInputElement>(
+      ".inspector-grid input[type=number]",
+    )[1];
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(end, "0");
+      end.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+    await click(byText(".rail-actions button", "Save"));
+
+    expect(container.querySelector(".segment-inspector [role=alert]")?.textContent)
+      .toContain("End must be after start");
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT"))
+      .toHaveLength(0);
+  });
+
+  it("installs the complete canonical response as the saved editor state", async () => {
+    const canonical = {
+      ...annotation,
+      version: 3,
+      transcript: [
+        { ...annotation.transcript[0], text: "server-normalized" },
+        ...annotation.transcript.slice(1),
+      ],
+    };
+    const fetchMock = routedFetch((url, init) =>
+      url === "/api/sources/source_1/annotations" && init?.method === "PUT"
+        ? response(canonical)
+        : undefined,
+    );
+    await openReview(fetchMock);
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    const area = container.querySelector("textarea")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(area, "local edit");
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+    await click(byText(".rail-actions button", "Save"));
+
+    expect(container.querySelector("textarea")!.value).toBe("server-normalized");
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v3");
+    expect((byText(".rail-actions button", "Save") as HTMLButtonElement).disabled)
+      .toBe(true);
+
+    await click(byText(".rail-actions button", "Undo"));
+    expect(container.querySelector("textarea")!.value).toBe("أهلا بك");
+    expect(container.querySelector(".save-state")?.textContent).toContain("Unsaved changes");
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT"))
+      .toHaveLength(1);
+  });
+
+  it("warns before leaving and discards only after confirmation", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    await click(byText(".inspector-actions button", "Delete segment"));
+
+    await click(byText("button.back", "← Cairo"));
+    expect(container.querySelector("[role=dialog]")?.textContent)
+      .toContain("Discard unsaved changes?");
+    await click(byText(".modal-actions button", "Stay"));
+    expect(container.querySelector(".transcript-panel")).toBeTruthy();
+
+    await click(byText("button.back", "← Cairo"));
+    await click(byText(".modal-actions button", "Discard changes"));
+    expect(container.querySelector(".transcript-panel")).toBeNull();
+  });
+
+  it("keeps the old model text collapsed as a reference", async () => {
+    const withSuggestion = {
+      ...sourceDetail,
+      annotation: {
+        ...annotation,
+        transcript: [
+          { ...annotation.transcript[0], text: "corrected", model_text: "old model text" },
+          ...annotation.transcript.slice(1),
+        ],
+      },
+    };
+    await openReview(routedFetch((url) =>
+      url === "/api/sources/source_1" ? response(withSuggestion) : undefined,
+    ));
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    const details = container.querySelector<HTMLDetailsElement>("details.model-text")!;
+    expect(details.open).toBe(false);
+    expect(details.querySelector("summary")?.textContent).toBe("Original model suggestion");
   });
 });
 
@@ -601,7 +770,7 @@ describe("save conflicts", () => {
 
     await click(container.querySelectorAll(".transcript-entry")[0]);
     await click(byText(".inspector-actions button", "Delete segment"));
-    await click(byText(".rail-actions button", "Save now"));
+    await click(byText(".rail-actions button", "Save"));
     await flush();
     await flush();
 
@@ -611,6 +780,13 @@ describe("save conflicts", () => {
     // Both sides report a real segment count, which is what used to throw.
     expect(dialog!.textContent).toContain("2 segments");
     expect(dialog!.textContent).toContain("revision 9");
+
+    await click(byText(".modal-actions button", "Keep my edits"));
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT"))
+      .toHaveLength(1);
+    expect(container.querySelector(".save-state")?.textContent).toContain("Unsaved changes");
+    expect((byText(".rail-actions button", "Save") as HTMLButtonElement).disabled)
+      .toBe(false);
   });
 });
 
@@ -729,7 +905,7 @@ describe("removing a speaker rectangle from the timeline", () => {
   });
 });
 
-describe("speaker turns are divided automatically on open", () => {
+describe("opening a source keeps the saved annotation unchanged", () => {
   const S = 24_000;
   // u1 runs 0-3s but the A lane draws it as two rectangles with a gap.
   const spanning = {
@@ -756,26 +932,14 @@ describe("speaker turns are divided automatically on open", () => {
     );
   }
 
-  it("divides the segment without the user pressing anything", async () => {
-    await openReview(open());
+  it("shows exactly the saved segment without creating local edits", async () => {
+    const fetchMock = open();
+    await openReview(fetchMock);
 
-    expect(container.querySelectorAll(".transcript-entry")).toHaveLength(2);
-    expect(container.textContent).toContain("0.00–1.00s");
-    expect(container.textContent).toContain("2.00–3.00s");
-    // Words land on the rectangle they were spoken in.
-    const entries = container.querySelectorAll(".transcript-entry");
-    expect(entries[0].textContent).toContain("hello");
-    expect(entries[1].textContent).toContain("there friend");
-  });
-
-  it("says what it did, and undo puts it back", async () => {
-    await openReview(open());
-    expect(container.querySelector(".banner.success")?.textContent)
-      .toContain("divided to match the speaker turns");
-
-    await click(byText(".rail-actions button", "Undo"));
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(1);
     expect(container.textContent).toContain("hello there friend");
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v2");
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(0);
   });
 
   it("offers no Split by speaker turns button anywhere", async () => {
@@ -784,17 +948,12 @@ describe("speaker turns are divided automatically on open", () => {
     expect(container.textContent).not.toContain("Split by speaker turns");
   });
 
-  it("saves the divided transcript", async () => {
+  it("does not enable Save merely because speaker turns span the saved segment", async () => {
     const fetchMock = open();
     await openReview(fetchMock);
-    await click(byText(".rail-actions button", "Save now"));
-    await flush();
-
-    const put = fetchMock.mock.calls.find((call) => call[1]?.method === "PUT");
-    const body = JSON.parse(String(put![1]!.body));
-    expect(body.annotation.transcript).toHaveLength(2);
-    // The lanes are the input, so they are unchanged.
-    expect(body.annotation.activities).toHaveLength(2);
+    const save = byText(".rail-actions button", "Save") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(0);
   });
 
   it("leaves a source alone while it is still processing", async () => {
@@ -810,7 +969,7 @@ describe("speaker turns are divided automatically on open", () => {
   });
 });
 
-describe("typing does not save on every keystroke", () => {
+describe("typing is saved only by the Save button", () => {
   function type(area: HTMLTextAreaElement, value: string) {
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLTextAreaElement.prototype,
@@ -847,7 +1006,7 @@ describe("typing does not save on every keystroke", () => {
     expect(container.querySelector("textarea")!.value).toBe("كيف ");
   });
 
-  it("saves once when the box loses focus", async () => {
+  it("does not save when the box loses focus", async () => {
     const fetchMock = routedFetch();
     await openReview(fetchMock);
     await click(container.querySelectorAll(".transcript-entry")[0]);
@@ -859,12 +1018,11 @@ describe("typing does not save on every keystroke", () => {
     await flush();
 
     const calls = puts(fetchMock);
-    expect(calls).toHaveLength(1);
-    const body = JSON.parse(String(calls[0][1]!.body));
-    expect(body.annotation.transcript[0].text).toBe("مرحبا");
+    expect(calls).toHaveLength(0);
+    expect(container.querySelector(".save-state")?.textContent).toContain("Unsaved changes");
   });
 
-  it("saves when moving to another segment", async () => {
+  it("keeps text local when moving segments and saves it on explicit Save", async () => {
     const fetchMock = routedFetch();
     await openReview(fetchMock);
     await click(container.querySelectorAll(".transcript-entry")[0]);
@@ -873,6 +1031,8 @@ describe("typing does not save on every keystroke", () => {
     await click(container.querySelectorAll(".transcript-entry")[1]);
     await flush();
 
+    expect(puts(fetchMock)).toHaveLength(0);
+    await click(byText(".rail-actions button", "Save"));
     const calls = puts(fetchMock);
     expect(calls).toHaveLength(1);
     expect(JSON.parse(String(calls[0][1]!.body)).annotation.transcript[0].text)

@@ -147,11 +147,11 @@ Deployment is `git pull` plus a service restart on the web host. No build step
 - Processing routes were removed from the web service so no website request can
   reach SpeechBrain. `POST /api/sources/{id}/initialize` is the only remaining
   entry point.
-- Segments are divided to match speaker-lane rectangles **once when a source
-  opens**, not continuously — otherwise it would undo a join the reviewer just
-  made. It converges, so reopening changes nothing.
-- Typing in a segment's text box is **held**, not autosaved. It is sent on blur,
-  on moving to another segment, on explicit save, and on navigation. Every other
-  edit is one deliberate act and still autosaves on a 1.2 s debounce.
+- Opening a source displays its latest saved annotation exactly. It never
+  divides transcript segments or creates a revision as a side effect.
+- Annotation edits remain in the current editor until the reviewer clicks Save.
+  Blur, selection, Undo/Redo, structural edits and navigation never save. A
+  successful Save creates one complete revision; leaving dirty work requires an
+  explicit discard.
 - Quality flags are read-only readouts of what the pipeline produced. The
   reviewer cannot edit them.

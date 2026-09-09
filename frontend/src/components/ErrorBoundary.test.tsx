@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ErrorBoundary from "./ErrorBoundary";
@@ -8,7 +8,7 @@ import ErrorBoundary from "./ErrorBoundary";
 let container: HTMLDivElement;
 let root: Root;
 
-function Boom({ fail }: { fail: boolean }): JSX.Element {
+function Boom({ fail }: { fail: boolean }): ReactElement {
   if (fail) throw new Error("Cannot read properties of null");
   return <p className="fine">Working</p>;
 }

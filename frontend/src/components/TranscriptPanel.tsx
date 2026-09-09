@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { seconds } from "../api";
 import {
   boundsError,
@@ -23,6 +30,15 @@ function fromSeconds(value: string): number {
   return Math.round(Number(value) * SAMPLE_RATE);
 }
 
+function editableSeconds(sample: number): string {
+  return String(sample / SAMPLE_RATE);
+}
+
+export type TranscriptPanelHandle = {
+  /** Returns the visible document after applying valid focused timing inputs. */
+  prepareForSave: () => Annotation | null;
+};
+
 type Props = {
   annotation: Annotation;
   durationSamples: number;
@@ -45,9 +61,10 @@ type Props = {
   onDelete: (id: string) => void;
   onAdd: () => void;
   onClearFilter: () => void;
+  onPendingBoundsChange: (pending: boolean) => void;
 };
 
-export default function TranscriptPanel({
+const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function TranscriptPanel({
   annotation,
   durationSamples,
   selectedId,
@@ -66,7 +83,12 @@ export default function TranscriptPanel({
   onDelete,
   onAdd,
   onClearFilter,
-}: Props) {
+  onPendingBoundsChange,
+}, ref) {
+  const prepareSelected = useRef<null | (() => Annotation | null)>(null);
+  useImperativeHandle(ref, () => ({
+    prepareForSave: () => prepareSelected.current?.() ?? annotation,
+  }), [annotation]);
   const ordered = useMemo(() => chronological(annotation.transcript), [annotation.transcript]);
   const visible = useMemo(
     () => (filteredIds ? ordered.filter((item) => filteredIds.includes(item.id)) : ordered),
@@ -193,11 +215,17 @@ export default function TranscriptPanel({
           onAddOverlap={onAddOverlap}
           onJoin={onJoin}
           onDelete={onDelete}
+          onRegisterPrepare={(prepare) => {
+            prepareSelected.current = prepare;
+          }}
+          onPendingBoundsChange={onPendingBoundsChange}
         />
       )}
     </section>
   );
-}
+});
+
+export default TranscriptPanel;
 
 function SegmentInspector({
   segment,
@@ -218,6 +246,8 @@ function SegmentInspector({
   onAddOverlap,
   onJoin,
   onDelete,
+  onRegisterPrepare,
+  onPendingBoundsChange,
 }: {
   segment: TranscriptUtterance;
   /** Zero-based place in the visible list, for the "3 of 12" readout. */
@@ -238,9 +268,13 @@ function SegmentInspector({
   onAddOverlap: (id: string) => void;
   onJoin: (firstId: string, secondId: string) => void;
   onDelete: (id: string) => void;
+  onRegisterPrepare: (prepare: null | (() => Annotation | null)) => void;
+  onPendingBoundsChange: (pending: boolean) => void;
 }) {
-  const [start, setStart] = useState(toSeconds(segment.start_sample));
-  const [end, setEnd] = useState(toSeconds(segment.end_sample));
+  const [start, setStart] = useState(editableSeconds(segment.start_sample));
+  const [end, setEnd] = useState(editableSeconds(segment.end_sample));
+  const [boundsProblem, setBoundsProblem] = useState<string | null>(null);
+  const prepareBoundsRef = useRef<() => Annotation | null>(() => annotation);
   const [caret, setCaret] = useState(segment.text.length);
   const next = neighbourAfter(annotation.transcript, segment.id);
   const canJoin = !!next;
@@ -298,23 +332,59 @@ function SegmentInspector({
     onChange(updateSegment(annotation, segment.id, update));
   }
 
-  // Typing is held rather than saved. Every other change in this panel is a
-  // single deliberate act, so those still save on their own.
   function patchText(text: string) {
     onChangeText(updateSegment(annotation, segment.id, { text }));
   }
 
-  function commitBounds() {
-    const nextStart = fromSeconds(start);
-    const nextEnd = fromSeconds(end);
+  const startSaved = editableSeconds(segment.start_sample);
+  const endSaved = editableSeconds(segment.end_sample);
+  const pendingBounds = start !== startSaved || end !== endSaved;
+
+  function prepareBounds(): Annotation | null {
+    // Preserve the exact stored sample for either field the reviewer did not
+    // touch; its decimal display may not round-trip cleanly at 24 kHz.
+    const nextStart = start === startSaved ? segment.start_sample : fromSeconds(start);
+    const nextEnd = end === endSaved ? segment.end_sample : fromSeconds(end);
     const problem = boundsError(nextStart, nextEnd, durationSamples);
     if (problem) {
-      setStart(toSeconds(segment.start_sample));
-      setEnd(toSeconds(segment.end_sample));
-      return;
+      setBoundsProblem(problem);
+      return null;
     }
-    patch({ start_sample: nextStart, end_sample: nextEnd });
+    setBoundsProblem(null);
+    if (nextStart === segment.start_sample && nextEnd === segment.end_sample) {
+      setStart(startSaved);
+      setEnd(endSaved);
+      return annotation;
+    }
+    return updateSegment(annotation, segment.id, {
+      start_sample: nextStart,
+      end_sample: nextEnd,
+    });
   }
+
+  function commitBounds() {
+    const prepared = prepareBounds();
+    if (prepared && prepared !== annotation) onChange(prepared);
+  }
+  prepareBoundsRef.current = prepareBounds;
+
+  useEffect(() => {
+    setStart(editableSeconds(segment.start_sample));
+    setEnd(editableSeconds(segment.end_sample));
+    setBoundsProblem(null);
+  }, [segment.id, segment.start_sample, segment.end_sample]);
+
+  useEffect(() => {
+    onPendingBoundsChange(pendingBounds);
+  }, [onPendingBoundsChange, pendingBounds]);
+
+  useEffect(() => {
+    onRegisterPrepare(() => prepareBoundsRef.current());
+    return () => {
+      onRegisterPrepare(null);
+      onPendingBoundsChange(false);
+    };
+  }, []);
 
   return (
     <div className="segment-inspector card">
@@ -377,9 +447,10 @@ function SegmentInspector({
         </p>
       )}
       {segment.model_text && segment.model_text !== segment.text && (
-        <p className="model-text" dir="auto">
-          <strong>Model suggested:</strong> {segment.model_text}
-        </p>
+        <details className="model-text">
+          <summary>Original model suggestion</summary>
+          <p dir="auto">{segment.model_text}</p>
+        </details>
       )}
 
       <div className="inspector-grid">
@@ -402,7 +473,11 @@ function SegmentInspector({
             min="0"
             value={start}
             readOnly={readOnly}
-            onChange={(event) => setStart(event.target.value)}
+            aria-invalid={boundsProblem ? "true" : undefined}
+            onChange={(event) => {
+              setStart(event.target.value);
+              setBoundsProblem(null);
+            }}
             onBlur={commitBounds}
           />
         </label>
@@ -414,7 +489,11 @@ function SegmentInspector({
             min="0"
             value={end}
             readOnly={readOnly}
-            onChange={(event) => setEnd(event.target.value)}
+            aria-invalid={boundsProblem ? "true" : undefined}
+            onChange={(event) => {
+              setEnd(event.target.value);
+              setBoundsProblem(null);
+            }}
             onBlur={commitBounds}
           />
         </label>
@@ -435,6 +514,8 @@ function SegmentInspector({
           </label>
         )}
       </div>
+
+      {boundsProblem && <p className="inspector-warning" role="alert">{boundsProblem}</p>}
 
       {!readOnly && (
         <div className="inspector-actions">

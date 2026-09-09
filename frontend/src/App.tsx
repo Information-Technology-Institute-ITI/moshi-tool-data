@@ -18,7 +18,7 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
-import TranscriptPanel from "./components/TranscriptPanel";
+import TranscriptPanel, { type TranscriptPanelHandle } from "./components/TranscriptPanel";
 import WaveformEditor, { type FocusRange } from "./components/WaveformEditor";
 import {
   addAllOverlapSegments,
@@ -29,13 +29,12 @@ import {
   intersecting,
   joinSegments,
   segmentsForActivity,
-  splitAllByTurns,
+  prepareSplit,
   splitSegment,
+  type SplitPreview,
 } from "./transcript";
 import {
-  clearDraft,
   clearDraftsForUser,
-  readDraft,
   useAnnotationSaver,
   type Conflict,
 } from "./useAnnotationSaver";
@@ -73,12 +72,24 @@ function App() {
   const [error, setError] = useState("");
   const [page, setPage] = useState<"workspace" | "gpu">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
+  const studioNavigationGuard = useRef<null | ((action: () => void) => void)>(null);
+  const studioDirty = useRef(false);
   // The job watcher is a server-sent-event stream that outlives the render that
   // started it. Reading the open screen from refs keeps it from acting on a
   // dataset the user has already navigated away from.
   const openSourceId = useRef<string | null>(null);
   const openProjectId = useRef<string | null>(null);
   const isAdmin = authUser?.role === "admin";
+
+  function navigate(action: () => void) {
+    const guard = studioNavigationGuard.current;
+    if (guard) guard(action);
+    else action();
+  }
+
+  useEffect(() => {
+    clearDraftsForUser(authUser?.id || "local");
+  }, [authUser?.id]);
 
   useEffect(() => {
     let active = true;
@@ -195,6 +206,10 @@ function App() {
       const sourceId = openSourceId.current;
       const projectId = openProjectId.current;
       if (sourceId) {
+        if (studioDirty.current) {
+          setNotice("New server data is available. Save or discard your changes before reloading.");
+          return;
+        }
         await openSource(sourceId);
         if (projectId) {
           const refreshed = await run(() =>
@@ -271,13 +286,17 @@ function App() {
     <Studio
       detail={source}
       project={project}
-      user={authUser}
       onBack={() => setSource(null)}
       onDeleted={() => openProject(project.project.id)}
-      onReload={() => openSource(source.id)}
       onJob={monitor}
       setNotice={setNotice}
       setError={setError}
+      onDirtyChange={(dirty) => {
+        studioDirty.current = dirty;
+      }}
+      registerNavigationGuard={(guard) => {
+        studioNavigationGuard.current = guard;
+      }}
     />
   ) : project ? (
     <ProjectWorkspace
@@ -305,9 +324,11 @@ function App() {
         <button
           className="brand"
           onClick={() => {
-            setPage("workspace");
-            setProject(null);
-            setSource(null);
+            navigate(() => {
+              setPage("workspace");
+              setProject(null);
+              setSource(null);
+            });
           }}
         >
           <span className="brand-mark">M</span>
@@ -322,7 +343,7 @@ function App() {
               className={`system-nav ${page === "gpu" ? "active" : ""}`}
               type="button"
               aria-current={page === "gpu" ? "page" : undefined}
-              onClick={() => setPage("gpu")}
+              onClick={() => navigate(() => setPage("gpu"))}
             >
               GPU status
             </button>
@@ -339,7 +360,11 @@ function App() {
             )}
           </div>
           {authUser && (
-            <button className="system-nav" type="button" onClick={handleSignout}>
+            <button
+              className="system-nav"
+              type="button"
+              onClick={() => navigate(() => void handleSignout())}
+            >
               Sign out
             </button>
           )}
@@ -1064,28 +1089,37 @@ function ProjectWorkspace({
  * no action here creates, cuts, or re-encodes audio, and no action enqueues GPU
  * work. A successful source can never be reprocessed from this screen.
  */
+function annotationContent(annotation: Annotation): string {
+  const { version: _version, ...content } = annotation;
+  return JSON.stringify(content);
+}
+
+type PendingSplit = SplitPreview;
+
 function Studio({
   detail,
   project,
-  user,
   onBack,
   onDeleted,
-  onReload,
   onJob,
   setNotice,
   setError,
+  onDirtyChange,
+  registerNavigationGuard,
 }: {
   detail: SourceDetail;
   project: ProjectDetail;
-  user: AuthUser | null;
   onBack: () => void;
   onDeleted: () => void;
-  onReload: () => void;
   onJob: (job: Job) => void;
   setNotice: (message: string) => void;
   setError: (message: string) => void;
+  onDirtyChange: (dirty: boolean) => void;
+  registerNavigationGuard: (guard: null | ((action: () => void) => void)) => void;
 }) {
   const [annotation, setAnnotation] = useState<Annotation>(detail.annotation);
+  const [savedAnnotation, setSavedAnnotation] = useState<Annotation>(detail.annotation);
+  const [revisions, setRevisions] = useState(detail.annotation_revisions);
   const [history, setHistory] = useState<Annotation[]>([]);
   const [future, setFuture] = useState<Annotation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1093,95 +1127,107 @@ function Studio({
   const [focusRange, setFocusRange] = useState<FocusRange | null>(null);
   const [playhead, setPlayhead] = useState(0);
   const [conflict, setConflict] = useState<Conflict | null>(null);
-  const [draftOffer, setDraftOffer] = useState<Annotation | null>(null);
   const [regionToDelete, setRegionToDelete] = useState<string | null>(null);
+  const [splitPreview, setSplitPreview] = useState<PendingSplit | null>(null);
+  const [pendingBounds, setPendingBounds] = useState(false);
+  const [pendingNavigation, setPendingNavigation] = useState<null | (() => void)>(null);
+  const transcriptPanel = useRef<TranscriptPanelHandle | null>(null);
   const focusNonce = useRef(0);
   // True between the first keystroke of a run of typing and the moment it is
   // committed, so a whole edit undoes at once instead of one letter at a time.
   const typing = useRef(false);
-  const userId = user?.id || "local";
 
   const processing = detail.status === "processing";
   const readOnly = processing;
+  const dirty =
+    pendingBounds || annotationContent(annotation) !== annotationContent(savedAnnotation);
 
   const saver = useAnnotationSaver({
     sourceId: detail.id,
-    userId,
-    onSaved: (saved) => {
-      setAnnotation((current) => ({ ...current, version: saved.version }));
-      setNotice(`Annotation revision ${saved.version} saved`);
-    },
     onConflict: (value) => setConflict(value),
     onError: setError,
   });
+  const saving = saver.status === "saving";
+  const locked = readOnly || saving || !!splitPreview;
 
   useEffect(() => {
-    // Each speaker rectangle on the timeline gets its own transcription. This
-    // runs when the source opens rather than on every edit, so a join the
-    // reviewer makes afterwards is not undone; it converges, because the result
-    // has nothing left spanning two rectangles.
-    const turned = readOnly
-      ? { annotation: detail.annotation, dividedSegments: 0, addedSegments: 0 }
-      : splitAllByTurns(detail.annotation);
-    setAnnotation(turned.annotation);
+    setAnnotation(detail.annotation);
+    setSavedAnnotation(detail.annotation);
+    setRevisions(detail.annotation_revisions);
     setHistory([]);
     setFuture([]);
     setSelectedId(null);
     setFilteredIds(null);
     setConflict(null);
+    setSplitPreview(null);
+    setPendingBounds(false);
     typing.current = false;
-    saver.reset(detail.annotation);
-    if (turned.dividedSegments) {
-      saver.schedule(turned.annotation);
-      setNotice(
-        `${turned.dividedSegments} segment${turned.dividedSegments === 1 ? "" : "s"}`
-        + ` divided to match the speaker turns on the timeline, adding`
-        + ` ${turned.addedSegments} segment${turned.addedSegments === 1 ? "" : "s"}.`
-        + " Undo reverses it.",
-      );
-      setHistory([detail.annotation]);
-    }
-    const draft = readDraft(userId, detail.id, detail.annotation.version);
-    setDraftOffer(
-      draft && JSON.stringify(draft) !== JSON.stringify(turned.annotation) ? draft : null,
-    );
+    saver.reset();
   }, [detail.id, detail.annotation.version]);
 
-  /** Records an undoable edit and schedules an autosave. */
-  function edit(next: Annotation) {
+  useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    function beforeUnload(event: BeforeUnloadEvent) {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, [dirty]);
+
+  function leave(action: () => void) {
+    if (saving) return;
+    if (!dirty) {
+      action();
+      return;
+    }
+    setPendingNavigation(() => action);
+  }
+
+  useEffect(() => {
+    registerNavigationGuard(leave);
+    return () => {
+      registerNavigationGuard(null);
+      onDirtyChange(false);
+    };
+  });
+
+  function applyLocalEdit(next: Annotation) {
     typing.current = false;
     setHistory((values) => [...values.slice(-49), annotation]);
     setFuture([]);
     setAnnotation(next);
-    saver.schedule(next);
+  }
+
+  /** Records one local, undoable edit. */
+  function edit(next: Annotation) {
+    if (locked || saver.isSaving()) return;
+    applyLocalEdit(next);
   }
 
   /**
-   * Records typing without starting a save.
-   *
-   * Every keystroke used to arm the autosave, so writing a sentence produced a
-   * revision per letter on the server. The text is kept in state and in the
-   * local draft, and {@link commitEdit} sends it once the reviewer is finished
-   * with the box. Only the first keystroke of a run adds to undo history, so
+   * Records typing as local work. Only the first keystroke of a run adds to undo history, so
    * one undo takes back the whole edit rather than one letter.
    */
   function editText(next: Annotation) {
+    if (locked || saver.isSaving()) return;
     if (!typing.current) {
       typing.current = true;
       setHistory((values) => [...values.slice(-49), annotation]);
     }
     setFuture([]);
     setAnnotation(next);
-    saver.hold(next);
   }
 
-  /** Ends a run of typing and sends what was written. */
+  /** Ends a run of typing without saving it. */
   function commitEdit() {
     typing.current = false;
-    saver.commit();
   }
 
   function undo() {
+    if (locked || saver.isSaving()) return;
     const previous = history.at(-1);
     if (!previous) return;
     typing.current = false;
@@ -1189,10 +1235,10 @@ function Studio({
     setHistory((values) => values.slice(0, -1));
     const restored = { ...previous, version: annotation.version };
     setAnnotation(restored);
-    saver.schedule(restored);
   }
 
   function redo() {
+    if (locked || saver.isSaving()) return;
     const next = future[0];
     if (!next) return;
     typing.current = false;
@@ -1200,7 +1246,6 @@ function Studio({
     setFuture((values) => values.slice(1));
     const restored = { ...next, version: annotation.version };
     setAnnotation(restored);
-    saver.schedule(restored);
   }
 
   /** Moves the playhead to a segment and optionally loops its original audio. */
@@ -1276,12 +1321,30 @@ function Studio({
   }
 
   function splitAt(id: string, atSample: number, textOffset: number) {
-    const result = splitSegment(annotation, id, atSample, textOffset);
+    if (locked) return;
+    const proposal = prepareSplit(annotation, id, atSample, textOffset);
+    if ("reason" in proposal) {
+      setError(proposal.reason);
+      return;
+    }
+    setSplitPreview(proposal);
+  }
+
+  function confirmSplit() {
+    if (!splitPreview || saving) return;
+    const result = splitSegment(
+      annotation,
+      splitPreview.id,
+      splitPreview.atSample,
+      undefined,
+      [splitPreview.firstText, splitPreview.secondText],
+    );
     if (!result.ok) {
       setError(result.reason);
       return;
     }
-    edit(result.annotation);
+    setSplitPreview(null);
+    applyLocalEdit(result.annotation);
     setSelectedId(result.ids[0]);
     const at = (result.atSample / 24_000).toFixed(2);
     setNotice(
@@ -1346,20 +1409,33 @@ function Studio({
     setNotice("Segment deleted. Undo restores it.");
   }
 
-  /** Flushes pending edits before leaving, and stays put if the save failed. */
-  async function leave(action: () => void) {
-    if (readOnly || !saver.hasUnsaved()) {
-      action();
+  async function saveNow() {
+    if (readOnly || saving || splitPreview || saver.isSaving()) return;
+    const prepared = transcriptPanel.current?.prepareForSave() ?? annotation;
+    if (!prepared) {
+      setError("Fix the highlighted timing fields before saving.");
       return;
     }
-    if (await saver.flush()) {
-      action();
-    } else {
-      setError("Your latest edit could not be saved, so this source stayed open.");
+    let snapshot = prepared;
+    if (prepared !== annotation) {
+      applyLocalEdit(prepared);
+      snapshot = prepared;
     }
+    if (annotationContent(snapshot) === annotationContent(savedAnnotation)) return;
+    const saved = await saver.save(snapshot);
+    if (!saved) return;
+    setAnnotation(saved);
+    setSavedAnnotation(saved);
+    setPendingBounds(false);
+    setRevisions((values) => [
+      { version: saved.version, created_at: new Date().toISOString() },
+      ...values.filter((value) => value.version !== saved.version),
+    ]);
+    setNotice(`Annotation revision ${saved.version} saved`);
   }
 
   async function deleteSource() {
+    if (locked || saver.isSaving()) return;
     if (!window.confirm(`Permanently delete ${detail.original_name} from this workspace?`)) {
       return;
     }
@@ -1375,12 +1451,13 @@ function Studio({
   }
 
   async function restoreRevision(version: number) {
+    if (locked || saver.isSaving()) return;
     try {
       const previous = await api<Annotation>(
         `/api/sources/${detail.id}/annotations/${version}`,
       );
       edit({ ...previous, version: annotation.version });
-      setNotice(`Revision ${version} restored locally and queued as a new revision`);
+      setNotice(`Revision ${version} loaded as unsaved changes. Click Save to keep it.`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -1456,13 +1533,14 @@ function Studio({
   }
 
   const saveLabel =
-    saver.status === "saving"
+    saving
       ? "Saving…"
       : saver.status === "failed"
-        ? "Save failed"
-        : saver.status === "saved"
-          ? "Saved"
-          : "No unsaved changes";
+        ? "Save failed — changes unsaved"
+        : dirty
+          ? "Unsaved changes"
+          : `Saved · v${savedAnnotation.version}`;
+  const saveTone = saving ? "saving" : saver.status === "failed" ? "failed" : dirty ? "dirty" : "saved";
 
   return (
     <section className="studio-page">
@@ -1474,31 +1552,37 @@ function Studio({
         <h2>{detail.original_name}</h2>
         <div className="source-facts">
           <span><strong>{seconds(detail.duration_samples || 0)}s</strong> duration</span>
-          <span><strong>v{annotation.version}</strong> annotation</span>
+          <span><strong>v{savedAnnotation.version}</strong> saved revision</span>
           <span><strong>{annotation.transcript.length}</strong> segments</span>
         </div>
-        <div className={`save-state ${saver.status}`} role="status" aria-live="polite">
+        <div className={`save-state ${saveTone}`} role="status" aria-live="polite">
           {saveLabel}
         </div>
         <div className="rail-actions">
-          <button onClick={undo} disabled={readOnly || !history.length}>Undo</button>
-          <button onClick={redo} disabled={readOnly || !future.length}>Redo</button>
+          <button onClick={undo} disabled={locked || !history.length}>Undo</button>
+          <button onClick={redo} disabled={locked || !future.length}>Redo</button>
           <button
             className="primary"
-            onClick={saver.saveNow}
-            disabled={readOnly || saver.status === "saving"}
+            onClick={() => void saveNow()}
+            disabled={locked || !dirty}
           >
-            {saver.status === "saving" ? "Saving…" : "Save now"}
+            {saving ? "Saving…" : "Save"}
           </button>
           <details className="revision-history">
-            <summary>{detail.annotation_revisions.length} saved revisions</summary>
-            {detail.annotation_revisions.map((revision) => (
-              <button key={revision.version} onClick={() => restoreRevision(revision.version)}>
+            <summary>{revisions.length} saved revisions</summary>
+            {revisions.map((revision) => (
+              <button
+                key={revision.version}
+                disabled={locked}
+                onClick={() => restoreRevision(revision.version)}
+              >
                 v{revision.version} · {new Date(revision.created_at).toLocaleString()}
               </button>
             ))}
           </details>
-          <button className="danger-soft" onClick={deleteSource}>Delete source</button>
+          <button className="danger-soft" disabled={locked} onClick={deleteSource}>
+            Delete source
+          </button>
         </div>
       </aside>
 
@@ -1520,45 +1604,13 @@ function Studio({
           </div>
         )}
 
-        {draftOffer && !readOnly && (
-          <div className="draft-recovery card" role="alert">
-            <div>
-              <strong>Unsaved edits were recovered</strong>
-              <p>
-                A local draft for this source differs from revision {annotation.version}.
-                Restore it, or discard it and keep the saved revision.
-              </p>
-            </div>
-            <div className="draft-actions">
-              <button
-                className="primary"
-                onClick={() => {
-                  edit({ ...draftOffer, version: annotation.version });
-                  setDraftOffer(null);
-                  setNotice("Local draft restored. It will save as the next revision.");
-                }}
-              >
-                Restore draft
-              </button>
-              <button
-                onClick={() => {
-                  clearDraft(userId, detail.id, annotation.version);
-                  setDraftOffer(null);
-                }}
-              >
-                Discard draft
-              </button>
-            </div>
-          </div>
-        )}
-
         <WaveformEditor
           audioUrl={detail.urls.canonical_audio}
           videoUrl={detail.urls.video_proxy}
           annotation={annotation}
           durationSamples={detail.duration_samples || 0}
           frameRate={detail.inspection?.video_frame_rate || 25}
-          readOnly={readOnly}
+          readOnly={locked}
           focusRange={focusRange}
           onTimeChange={setPlayhead}
           onRegionClick={focusRegion}
@@ -1567,12 +1619,13 @@ function Studio({
         />
 
         <TranscriptPanel
+          ref={transcriptPanel}
           annotation={annotation}
           durationSamples={detail.duration_samples || 0}
           selectedId={selectedId}
           filteredIds={filteredIds}
           playheadSample={playhead}
-          readOnly={readOnly}
+          readOnly={locked}
           onSelect={(id) => {
             // Moving to another segment finishes the edit in the box.
             commitEdit();
@@ -1589,6 +1642,7 @@ function Studio({
           onDelete={removeSegment}
           onAdd={addSegmentAtPlayhead}
           onClearFilter={() => setFilteredIds(null)}
+          onPendingBoundsChange={setPendingBounds}
         />
       </div>
 
@@ -1608,17 +1662,43 @@ function Studio({
             // save is accepted without discarding either side.
             const rebased = { ...conflict.local, version: conflict.server.version };
             setConflict(null);
+            setSavedAnnotation(conflict.server);
             setAnnotation(rebased);
-            saver.schedule(rebased);
-            setNotice("Your edits were kept and will save onto the newer revision.");
+            saver.reset();
+            setNotice("Your edits are still unsaved. Click Save to replace the latest revision.");
           }}
           onTakeServer={() => {
-            clearDraft(userId, detail.id, conflict.local.version);
             setConflict(null);
             setAnnotation(conflict.server);
-            saver.reset(conflict.server);
-            onReload();
+            setSavedAnnotation(conflict.server);
+            setHistory([]);
+            setFuture([]);
+            setPendingBounds(false);
+            setRevisions((values) => [
+              { version: conflict.server.version, created_at: new Date().toISOString() },
+              ...values.filter((value) => value.version !== conflict.server.version),
+            ]);
+            saver.reset();
             setNotice("The server revision was loaded.");
+          }}
+        />
+      )}
+      {splitPreview && (
+        <SplitPreviewDialog
+          preview={splitPreview}
+          segment={annotation.transcript.find((item) => item.id === splitPreview.id) || null}
+          onChange={(next) => setSplitPreview(next)}
+          onCancel={() => setSplitPreview(null)}
+          onConfirm={confirmSplit}
+        />
+      )}
+      {pendingNavigation && (
+        <UnsavedChangesDialog
+          onStay={() => setPendingNavigation(null)}
+          onDiscard={() => {
+            const action = pendingNavigation;
+            setPendingNavigation(null);
+            action();
           }}
         />
       )}
@@ -1626,10 +1706,92 @@ function Studio({
   );
 }
 
-/**
- * A stale save creates no revision. Both copies are preserved until the user
- * chooses; nothing is merged automatically and nothing is discarded silently.
- */
+function SplitPreviewDialog({
+  preview,
+  segment,
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  preview: PendingSplit;
+  segment: TranscriptUtterance | null;
+  onChange: (preview: PendingSplit) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEscapeToClose(onCancel);
+  if (!segment) return null;
+  const textChanged = preview.firstText + preview.secondText !== preview.originalText;
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="modal card split-preview" role="dialog" aria-modal="true" aria-labelledby="split-preview-title">
+        <h2 id="split-preview-title">Preview transcript split</h2>
+        <p>
+          Speaker {segment.speaker || "A"} will be divided at {seconds(preview.atSample)}s.
+          {preview.snappedFrom !== null && (
+            <> The requested point was moved from {seconds(preview.snappedFrom)}s to keep a spoken word whole.</>
+          )}
+        </p>
+        <div className="split-original">
+          <strong>Current transcript text</strong>
+          <p dir="auto">{preview.originalText || <em>(empty)</em>}</p>
+        </div>
+        <div className="split-preview-fields">
+          <label>
+            {seconds(segment.start_sample)}–{seconds(preview.atSample)}s
+            <textarea
+              dir="auto"
+              rows={4}
+              value={preview.firstText}
+              onChange={(event) => onChange({ ...preview, firstText: event.target.value })}
+            />
+          </label>
+          <label>
+            {seconds(preview.atSample)}–{seconds(segment.end_sample)}s
+            <textarea
+              dir="auto"
+              rows={4}
+              value={preview.secondText}
+              onChange={(event) => onChange({ ...preview, secondText: event.target.value })}
+            />
+          </label>
+        </div>
+        <p className={textChanged ? "split-text-warning" : "inspector-note"} role="status">
+          {textChanged
+            ? "The two fields no longer reproduce the original text. Confirm only if this edit is intentional."
+            : "Every character from the current transcript is preserved across the two fields."}
+        </p>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel}>Cancel</button>
+          <button type="button" className="primary" onClick={onConfirm}>Confirm split</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UnsavedChangesDialog({
+  onStay,
+  onDiscard,
+}: {
+  onStay: () => void;
+  onDiscard: () => void;
+}) {
+  useEscapeToClose(onStay);
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="modal card" role="dialog" aria-modal="true" aria-labelledby="unsaved-title">
+        <h2 id="unsaved-title">Discard unsaved changes?</h2>
+        <p>The server still has the last saved revision. Leaving now discards the changes on this screen.</p>
+        <div className="modal-actions">
+          <button type="button" className="primary" onClick={onStay}>Stay</button>
+          <button type="button" className="danger" onClick={onDiscard}>Discard changes</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Confirms removing a speaker rectangle, naming the transcript segments that go
  * with it. A double-click used to delete silently, which was easy to do by
