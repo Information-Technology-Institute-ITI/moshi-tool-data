@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Studio browser media smoke</title>
+  </head>
+  <body>
+    <output id="result" data-status="pending">pending</output>
+    <video id="fixture" muted playsinline preload="auto"></video>
+    <script>
+      const result = document.querySelector("#result");
+      const video = document.querySelector("#fixture");
+      const media = new URLSearchParams(location.search).get("media")
+        || "../../.runtime/p0-baseline/fixtures/review.mp4";
+
+      function finish(status, message) {
+        result.dataset.status = status;
+        result.textContent = message;
+      }
+
+      video.addEventListener("error", () => finish("failed", "media-error"));
+      let metadataReady = false;
+
+      video.addEventListener("loadedmetadata", () => {
+        if (
+          !Number.isFinite(video.duration)
+          || video.duration <= 0
+          || video.videoWidth < 1
+          || video.videoHeight < 1
+        ) {
+          finish("failed", "invalid-decoded-metadata");
+          return;
+        }
+        metadataReady = true;
+        void video.play().catch(() => {
+          // P0 verifies browser decoding. Playback-range behavior belongs to P1.
+        });
+      });
+      video.addEventListener("canplay", () => {
+        if (metadataReady) finish("passed", "decoded");
+      });
+      video.src = media;
+      setTimeout(() => {
+        if (result.dataset.status === "pending") finish("failed", "timeout");
+      }, 2500);
+    </script>
+  </body>
+</html>

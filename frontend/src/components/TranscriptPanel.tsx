@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { seconds } from "../api";
 import {
   boundsError,
@@ -62,6 +63,8 @@ type Props = {
   onAdd: () => void;
   onClearFilter: () => void;
   onPendingBoundsChange: (pending: boolean) => void;
+  /** Optional left-rail target for the selected-segment inspector. */
+  inspectorTarget?: HTMLElement | null;
 };
 
 const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function TranscriptPanel({
@@ -84,6 +87,7 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
   onAdd,
   onClearFilter,
   onPendingBoundsChange,
+  inspectorTarget,
 }, ref) {
   const prepareSelected = useRef<null | (() => Annotation | null)>(null);
   useImperativeHandle(ref, () => ({
@@ -111,6 +115,36 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
     (total, entry) => total + entry.windows.length,
     0,
   );
+  const selectedInspector = selected ? (
+    <SegmentInspector
+      key={selected.id}
+      segment={selected}
+      position={position}
+      total={visible.length}
+      previousEntry={previousEntry}
+      nextEntry={nextEntry}
+      onStep={(entry) => {
+        onSelect(entry.id);
+        onPlay(entry, false);
+      }}
+      annotation={annotation}
+      durationSamples={durationSamples}
+      playheadSample={playheadSample}
+      readOnly={readOnly}
+      onPlay={onPlay}
+      onChange={onChange}
+      onChangeText={onChangeText}
+      onCommitText={onCommitText}
+      onSplit={onSplit}
+      onAddOverlap={onAddOverlap}
+      onJoin={onJoin}
+      onDelete={onDelete}
+      onRegisterPrepare={(prepare) => {
+        prepareSelected.current = prepare;
+      }}
+      onPendingBoundsChange={onPendingBoundsChange}
+    />
+  ) : null;
 
   return (
     <section className="transcript-panel">
@@ -191,36 +225,7 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
         )}
       </ol>
 
-      {selected && (
-        <SegmentInspector
-          key={selected.id}
-          segment={selected}
-          position={position}
-          total={visible.length}
-          previousEntry={previousEntry}
-          nextEntry={nextEntry}
-          onStep={(entry) => {
-            onSelect(entry.id);
-            onPlay(entry, false);
-          }}
-          annotation={annotation}
-          durationSamples={durationSamples}
-          playheadSample={playheadSample}
-          readOnly={readOnly}
-          onPlay={onPlay}
-          onChange={onChange}
-          onChangeText={onChangeText}
-          onCommitText={onCommitText}
-          onSplit={onSplit}
-          onAddOverlap={onAddOverlap}
-          onJoin={onJoin}
-          onDelete={onDelete}
-          onRegisterPrepare={(prepare) => {
-            prepareSelected.current = prepare;
-          }}
-          onPendingBoundsChange={onPendingBoundsChange}
-        />
-      )}
+      {inspectorTarget ? createPortal(selectedInspector, inspectorTarget) : selectedInspector}
     </section>
   );
 });

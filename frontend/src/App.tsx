@@ -18,8 +18,19 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
+import CommandPalette from "./components/CommandPalette";
+import ReviewPlayerCard from "./components/ReviewPlayerCard";
+import ReviewToolRail from "./components/ReviewToolRail";
 import TranscriptPanel, { type TranscriptPanelHandle } from "./components/TranscriptPanel";
-import WaveformEditor, { type FocusRange } from "./components/WaveformEditor";
+import WaveformEditor, {
+  type FocusRange,
+  type WaveformEditorHandle,
+} from "./components/WaveformEditor";
+import {
+  commandIdForKeyboardEvent,
+  REVIEW_COMMANDS,
+  type ReviewCommand,
+} from "./reviewCommands";
 import {
   addAllOverlapSegments,
   addOverlapSegments,
@@ -32,6 +43,7 @@ import {
   prepareSplit,
   splitSegment,
   type SplitPreview,
+  chronological,
 } from "./transcript";
 import {
   clearDraftsForUser,
@@ -1131,7 +1143,12 @@ function Studio({
   const [splitPreview, setSplitPreview] = useState<PendingSplit | null>(null);
   const [pendingBounds, setPendingBounds] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<null | (() => void)>(null);
+  const [railOpen, setRailOpen] = useState(false);
+  const [commandDialog, setCommandDialog] = useState<"palette" | "help" | null>(null);
+  const [inspectorTarget, setInspectorTarget] = useState<HTMLDivElement | null>(null);
+  const [timelineToolsTarget, setTimelineToolsTarget] = useState<HTMLDivElement | null>(null);
   const transcriptPanel = useRef<TranscriptPanelHandle | null>(null);
+  const waveformEditor = useRef<WaveformEditorHandle | null>(null);
   const focusNonce = useRef(0);
   // True between the first keystroke of a run of typing and the moment it is
   // committed, so a whole edit undoes at once instead of one letter at a time.
@@ -1158,9 +1175,13 @@ function Studio({
     setFuture([]);
     setSelectedId(null);
     setFilteredIds(null);
+    setFocusRange(null);
+    focusNonce.current = 0;
     setConflict(null);
     setSplitPreview(null);
     setPendingBounds(false);
+    setRailOpen(false);
+    setCommandDialog(null);
     typing.current = false;
     saver.reset();
   }, [detail.id, detail.annotation.version]);
@@ -1248,13 +1269,13 @@ function Studio({
     setAnnotation(restored);
   }
 
-  /** Moves the playhead to a segment and optionally loops its original audio. */
+  /** Plays the exact segment range once or continuously through the shared controller. */
   function playSegment(segment: TranscriptUtterance, loop: boolean) {
     focusNonce.current += 1;
     setFocusRange({
-      startSample: segment.start_sample,
-      endSample: segment.end_sample,
-      loop,
+      start_sample: segment.start_sample,
+      end_sample: segment.end_sample,
+      behavior: loop ? "loop" : "once",
       nonce: focusNonce.current,
     });
   }
@@ -1484,6 +1505,89 @@ function Studio({
       job.kind === "initialize" && job.source_id === detail.id && job.status === "failed",
   );
 
+  const visibleSegments = chronological(annotation.transcript).filter(
+    (segment) => !filteredIds || filteredIds.includes(segment.id),
+  );
+  const selectedPosition = visibleSegments.findIndex((segment) => segment.id === selectedId);
+  const selectedSegment = selectedPosition >= 0 ? visibleSegments[selectedPosition] : null;
+  const previousSegment = selectedPosition > 0
+    ? visibleSegments[selectedPosition - 1]
+    : selectedPosition < 0
+      ? visibleSegments.at(-1) || null
+      : null;
+  const nextSegment =
+    selectedPosition >= 0 && selectedPosition + 1 < visibleSegments.length
+      ? visibleSegments[selectedPosition + 1]
+      : selectedPosition < 0
+        ? visibleSegments[0] || null
+        : null;
+
+  function selectAndPlay(segment: TranscriptUtterance | null) {
+    if (!segment) return;
+    commitEdit();
+    setSelectedId(segment.id);
+    playSegment(segment, false);
+  }
+
+  const commandRuns: Record<(typeof REVIEW_COMMANDS)[number]["id"], () => void> = {
+    save: () => void saveNow(),
+    undo,
+    redo,
+    toggle_playback: () => waveformEditor.current?.togglePlayback(),
+    seek_back: () => waveformEditor.current?.seekBySeconds(-1),
+    seek_forward: () => waveformEditor.current?.seekBySeconds(1),
+    frame_back: () => waveformEditor.current?.seekBySeconds(-1 / (detail.inspection?.video_frame_rate || 25)),
+    frame_forward: () => waveformEditor.current?.seekBySeconds(1 / (detail.inspection?.video_frame_rate || 25)),
+    previous_segment: () => selectAndPlay(previousSegment),
+    next_segment: () => selectAndPlay(nextSegment),
+    play_segment: () => selectedSegment && playSegment(selectedSegment, false),
+    loop_segment: () => selectedSegment && playSegment(selectedSegment, true),
+    add_segment: addSegmentAtPlayhead,
+    selection_start: () => waveformEditor.current?.beginSelection(),
+    selection_speaker_a: () => waveformEditor.current?.finishActivity("A"),
+    selection_speaker_b: () => waveformEditor.current?.finishActivity("B"),
+    open_palette: () => setCommandDialog("palette"),
+    open_shortcuts: () => setCommandDialog("help"),
+  };
+  const commandEnabled: Record<(typeof REVIEW_COMMANDS)[number]["id"], boolean> = {
+    save: dirty && !locked,
+    undo: !!history.length && !locked,
+    redo: !!future.length && !locked,
+    toggle_playback: true,
+    seek_back: true,
+    seek_forward: true,
+    frame_back: true,
+    frame_forward: true,
+    previous_segment: !!previousSegment,
+    next_segment: !!nextSegment,
+    play_segment: !!selectedSegment,
+    loop_segment: !!selectedSegment,
+    add_segment: !locked,
+    selection_start: !locked,
+    selection_speaker_a: !locked,
+    selection_speaker_b: !locked,
+    open_palette: true,
+    open_shortcuts: true,
+  };
+  const commands: ReviewCommand[] = REVIEW_COMMANDS.map((definition) => ({
+    ...definition,
+    enabled: commandEnabled[definition.id],
+    run: commandRuns[definition.id],
+  }));
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const id = commandIdForKeyboardEvent(event);
+      if (!id) return;
+      const command = commands.find((candidate) => candidate.id === id);
+      if (!command) return;
+      event.preventDefault();
+      if (command.enabled) command.run();
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [commands]);
+
   if (detail.status === "uploaded" || detail.status === "failed") {
     return (
       <section className="page">
@@ -1544,107 +1648,99 @@ function Studio({
 
   return (
     <section className="studio-page">
-      <aside className="studio-rail">
-        <button className="back" onClick={() => void leave(onBack)}>
-          ← {project.project.name}
-        </button>
-        <span className="eyebrow">Source review</span>
-        <h2>{detail.original_name}</h2>
-        <div className="source-facts">
-          <span><strong>{seconds(detail.duration_samples || 0)}s</strong> duration</span>
-          <span><strong>v{savedAnnotation.version}</strong> saved revision</span>
-          <span><strong>{annotation.transcript.length}</strong> segments</span>
-        </div>
-        <div className={`save-state ${saveTone}`} role="status" aria-live="polite">
-          {saveLabel}
-        </div>
-        <div className="rail-actions">
-          <button onClick={undo} disabled={locked || !history.length}>Undo</button>
-          <button onClick={redo} disabled={locked || !future.length}>Redo</button>
-          <button
-            className="primary"
-            onClick={() => void saveNow()}
-            disabled={locked || !dirty}
-          >
-            {saving ? "Saving…" : "Save"}
-          </button>
-          <details className="revision-history">
-            <summary>{revisions.length} saved revisions</summary>
-            {revisions.map((revision) => (
-              <button
-                key={revision.version}
-                disabled={locked}
-                onClick={() => restoreRevision(revision.version)}
-              >
-                v{revision.version} · {new Date(revision.created_at).toLocaleString()}
-              </button>
-            ))}
-          </details>
-          <button className="danger-soft" disabled={locked} onClick={deleteSource}>
-            Delete source
-          </button>
-        </div>
-      </aside>
-
+      <ReviewToolRail
+        open={railOpen}
+        projectName={project.project.name}
+        sourceName={detail.original_name}
+        durationSamples={detail.duration_samples || 0}
+        savedVersion={savedAnnotation.version}
+        segmentCount={annotation.transcript.length}
+        saveLabel={saveLabel}
+        saveTone={saveTone}
+        locked={locked}
+        dirty={dirty}
+        saving={saving}
+        canUndo={!!history.length}
+        canRedo={!!future.length}
+        revisions={revisions}
+        onClose={() => setRailOpen(false)}
+        onBack={() => void leave(onBack)}
+        onUndo={undo}
+        onRedo={redo}
+        onSave={() => void saveNow()}
+        onRestore={(version) => void restoreRevision(version)}
+        onDelete={() => void deleteSource()}
+        onOpenPalette={() => setCommandDialog("palette")}
+        onOpenHelp={() => setCommandDialog("help")}
+        onPause={() => waveformEditor.current?.pausePlayback()}
+        inspectorRef={setInspectorTarget}
+        timelineToolsRef={setTimelineToolsTarget}
+      />
       <div className="studio-main">
-        <section className="studio-heading">
-          <div>
-            <span className="eyebrow">Review audio and transcript</span>
-            <h1>Check what was said, and when.</h1>
-            <p>
-              Select a speaker region to focus its transcript entries, or select an entry to
-              play its range from the original recording.
-            </p>
-          </div>
-        </section>
-
+        <button type="button" className="review-tools-toggle" onClick={() => setRailOpen(true)}>
+          Tools &amp; selected segment
+        </button>
         {processing && (
           <div className="inline-banner" role="status">
             Preparing this source. Editing unlocks when the result is committed.
           </div>
         )}
 
-        <WaveformEditor
-          audioUrl={detail.urls.canonical_audio}
-          videoUrl={detail.urls.video_proxy}
-          annotation={annotation}
-          durationSamples={detail.duration_samples || 0}
-          frameRate={detail.inspection?.video_frame_rate || 25}
-          readOnly={locked}
-          focusRange={focusRange}
-          onTimeChange={setPlayhead}
-          onRegionClick={focusRegion}
-          onRegionDelete={setRegionToDelete}
-          onChange={edit}
-        />
+        <ReviewPlayerCard processing={processing}>
+          <WaveformEditor
+            ref={waveformEditor}
+            audioUrl={detail.urls.canonical_audio}
+            videoUrl={detail.urls.video_proxy}
+            annotation={annotation}
+            durationSamples={detail.duration_samples || 0}
+            frameRate={detail.inspection?.video_frame_rate || 25}
+            readOnly={locked}
+            focusRange={focusRange}
+            toolTarget={timelineToolsTarget}
+            onTimeChange={setPlayhead}
+            onRegionClick={focusRegion}
+            onRegionDelete={setRegionToDelete}
+            onChange={edit}
+          />
+        </ReviewPlayerCard>
 
-        <TranscriptPanel
-          ref={transcriptPanel}
-          annotation={annotation}
-          durationSamples={detail.duration_samples || 0}
-          selectedId={selectedId}
-          filteredIds={filteredIds}
-          playheadSample={playhead}
-          readOnly={locked}
-          onSelect={(id) => {
-            // Moving to another segment finishes the edit in the box.
-            commitEdit();
-            setSelectedId(id);
-          }}
-          onPlay={playSegment}
-          onChange={edit}
-          onChangeText={editText}
-          onCommitText={commitEdit}
-          onSplit={splitAt}
-          onAddOverlap={addOverlap}
-          onAddAllOverlaps={addAllOverlaps}
-          onJoin={joinWith}
-          onDelete={removeSegment}
-          onAdd={addSegmentAtPlayhead}
-          onClearFilter={() => setFilteredIds(null)}
-          onPendingBoundsChange={setPendingBounds}
-        />
+        <section className="review-segments-card card" aria-label="Transcript segments">
+          <TranscriptPanel
+            ref={transcriptPanel}
+            annotation={annotation}
+            durationSamples={detail.duration_samples || 0}
+            selectedId={selectedId}
+            filteredIds={filteredIds}
+            playheadSample={playhead}
+            readOnly={locked}
+            onSelect={(id) => {
+              // Moving to another segment finishes the edit in the box.
+              commitEdit();
+              setSelectedId(id);
+            }}
+            onPlay={playSegment}
+            onChange={edit}
+            onChangeText={editText}
+            onCommitText={commitEdit}
+            onSplit={splitAt}
+            onAddOverlap={addOverlap}
+            onAddAllOverlaps={addAllOverlaps}
+            onJoin={joinWith}
+            onDelete={removeSegment}
+            onAdd={addSegmentAtPlayhead}
+            onClearFilter={() => setFilteredIds(null)}
+            onPendingBoundsChange={setPendingBounds}
+            inspectorTarget={inspectorTarget}
+          />
+        </section>
       </div>
+
+      <CommandPalette
+        open={commandDialog !== null}
+        mode={commandDialog || "palette"}
+        commands={commands}
+        onClose={() => setCommandDialog(null)}
+      />
 
       {regionToDelete && (
         <DeleteRegionDialog

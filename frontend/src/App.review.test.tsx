@@ -13,6 +13,12 @@ type WaveProps = {
   onRegionClick?: (regionId: string, atSample: number) => void;
   onRegionDelete?: (regionId: string) => void;
   onTimeChange?: (sample: number) => void;
+  focusRange?: {
+    start_sample: number;
+    end_sample: number;
+    behavior: "once" | "loop";
+    nonce: number;
+  } | null;
 };
 const waveProps: { current: WaveProps } = { current: {} };
 vi.mock("./components/WaveformEditor", () => ({
@@ -244,6 +250,33 @@ describe("unified review screen", () => {
     expect(inspector!.querySelector("textarea")!.value).toBe("كيف حالك");
     // Text direction is automatic so Arabic renders right to left.
     expect(inspector!.querySelector("textarea")!.getAttribute("dir")).toBe("auto");
+  });
+
+  it("sends exact once and loop ranges to the shared player", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[1]);
+    expect(waveProps.current.focusRange).toEqual({
+      start_sample: 24_000,
+      end_sample: 48_000,
+      behavior: "once",
+      nonce: 1,
+    });
+
+    await click(byText(".inspector-play button", "Play"));
+    expect(waveProps.current.focusRange).toEqual({
+      start_sample: 24_000,
+      end_sample: 48_000,
+      behavior: "once",
+      nonce: 2,
+    });
+
+    await click(byText(".inspector-play button", "Loop"));
+    expect(waveProps.current.focusRange).toEqual({
+      start_sample: 24_000,
+      end_sample: 48_000,
+      behavior: "loop",
+      nonce: 3,
+    });
   });
 
   it("joins same-speaker neighbours and runs their texts together", async () => {
@@ -1052,5 +1085,92 @@ describe("typing is saved only by the Save button", () => {
     await click(byText(".rail-actions button", "Undo"));
     // One undo, not three.
     expect(container.querySelector("textarea")!.value).toBe("أهلا بك");
+  });
+});
+
+describe("P2 review workspace commands", () => {
+  it("starts keyboard-only review from the first segment", async () => {
+    await openReview(routedFetch());
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+    });
+    expect(container.querySelectorAll(".transcript-entry")[0].getAttribute("aria-current"))
+      .toBe("true");
+    expect(waveProps.current.focusRange).toMatchObject({
+      start_sample: annotation.transcript[0].start_sample,
+      end_sample: annotation.transcript[0].end_sample,
+      behavior: "once",
+    });
+  });
+
+  it("steps through visible segments with J and ignores the shortcut while typing", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    const firstNonce = waveProps.current.focusRange?.nonce;
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+    });
+    expect(container.querySelectorAll(".transcript-entry")[1].getAttribute("aria-current"))
+      .toBe("true");
+    expect(waveProps.current.focusRange?.nonce).toBeGreaterThan(firstNonce || 0);
+
+    const area = container.querySelector("textarea")!;
+    const nonceBeforeTyping = waveProps.current.focusRange?.nonce;
+    await act(async () => {
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+    });
+    expect(waveProps.current.focusRange?.nonce).toBe(nonceBeforeTyping);
+  });
+
+  it("opens the searchable palette and shortcut reference", async () => {
+    await openReview(routedFetch());
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "k",
+        ctrlKey: true,
+        bubbles: true,
+      }));
+    });
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain("Command palette");
+    expect(container.querySelector('[role="dialog"] input[type="search"]')).toBeNull();
+    expect(container.querySelector(".command-list")?.getAttribute("tabindex")).toBe("0");
+    await click(container.querySelector('[aria-label="Close command palette"]'));
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
+    });
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain("Keyboard shortcuts");
+  });
+
+  it("saves dirty work with the explicit Ctrl+S command", async () => {
+    const fetchMock = routedFetch();
+    await openReview(fetchMock);
+    await click(byText("button", "Add segment"));
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "s",
+        ctrlKey: true,
+        bubbles: true,
+      }));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(1);
+  });
+
+  it("uses the left rail as a responsive drawer shell", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    expect(container.querySelector(".studio-rail .segment-inspector textarea")).not.toBeNull();
+    expect(container.querySelector(".review-player-card + .review-segments-card .transcript-list"))
+      .not.toBeNull();
+    expect(byText(".studio-rail button", "Pause audio")).not.toBeNull();
+    const rail = container.querySelector(".studio-rail")!;
+    expect(rail.classList.contains("open")).toBe(false);
+    await click(container.querySelector(".review-tools-toggle"));
+    expect(rail.classList.contains("open")).toBe(true);
+    await click(container.querySelector(".review-drawer-backdrop"));
+    expect(rail.classList.contains("open")).toBe(false);
   });
 });

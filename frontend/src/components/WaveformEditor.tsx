@@ -1,10 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
 import type { ActivityRegion, Annotation, ExclusionRegion, Speaker } from "../types";
 import { sampleId, seconds } from "../api";
+import type { PlaybackRange } from "../productContracts";
+import {
+  PLAYBACK_SAMPLE_RATE,
+  PlaybackController,
+  type PlaybackSnapshot,
+} from "../playbackController";
 
-const SAMPLE_RATE = 24_000;
+const SAMPLE_RATE = PLAYBACK_SAMPLE_RATE;
 const COLORS = {
   A: "rgba(88, 214, 190, .30)",
   B: "rgba(255, 184, 108, .30)",
@@ -15,10 +22,7 @@ const COLORS = {
  * A range the parent asks the player to move to. `nonce` lets the same range be
  * requested twice in a row (clicking the same transcript entry again).
  */
-export type FocusRange = {
-  startSample: number;
-  endSample: number;
-  loop: boolean;
+export type FocusRange = PlaybackRange & {
   nonce: number;
 };
 
@@ -44,10 +48,21 @@ type Props = {
    * transcript segment with it, so the parent confirms first.
    */
   onRegionDelete?: (regionId: string) => void;
+  /** Optional rail target for annotation and exclusion tools. */
+  toolTarget?: HTMLElement | null;
   readOnly?: boolean;
 };
 
-export default function WaveformEditor({
+export type WaveformEditorHandle = {
+  playPlayback: () => void;
+  pausePlayback: () => void;
+  togglePlayback: () => void;
+  seekBySeconds: (seconds: number) => void;
+  beginSelection: () => void;
+  finishActivity: (speaker: Speaker) => void;
+};
+
+const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function WaveformEditor({
   audioUrl,
   videoUrl,
   annotation,
@@ -58,11 +73,13 @@ export default function WaveformEditor({
   onTimeChange,
   onRegionClick,
   onRegionDelete,
+  toolTarget,
   readOnly = false,
-}: Props) {
+}: Props, ref) {
   const container = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const wave = useRef<WaveSurfer | null>(null);
+  const playbackController = useRef<PlaybackController | null>(null);
   const waveReady = useRef(false);
   const regions = useRef<RegionsPlugin | null>(null);
   const annotationRef = useRef(annotation);
@@ -72,20 +89,22 @@ export default function WaveformEditor({
   const onRegionClickRef = useRef(onRegionClick);
   const readOnlyRef = useRef(readOnly);
   const lastFocusNonce = useRef<number | null>(null);
-  const syncing = useRef(false);
   const selectionStart = useRef<number | null>(null);
-  const loopRangeRef = useRef<[number, number] | null>(null);
   // State, not just the ref, because the regions are drawn from an effect that
   // has to re-run the moment the audio is decoded.
   const [ready, setReady] = useState(false);
-  const [current, setCurrent] = useState(0);
   const [zoom, setZoom] = useState(35);
-  const [rate, setRate] = useState(1);
   const [anchor, setAnchor] = useState<number | null>(null);
-  const [loopRange, setLoopRange] = useState<[number, number] | null>(null);
+  const [playback, setPlayback] = useState<PlaybackSnapshot>({
+    status: "loading",
+    current_sample: 0,
+    active_range: null,
+    rate: 1,
+    audition_mode: "mixed",
+    error: null,
+  });
 
   annotationRef.current = annotation;
-  loopRangeRef.current = loopRange;
   onTimeRef.current = onTimeChange;
   onRegionClickRef.current = onRegionClick;
   readOnlyRef.current = readOnly;
@@ -96,13 +115,30 @@ export default function WaveformEditor({
     const instance = WaveSurfer.create({
       container: container.current,
       url: audioUrl,
-      height: 126,
+      height: 72,
       waveColor: "#324052",
       progressColor: "#e7f6f2",
       cursorColor: "#f4d35e",
       normalize: true,
       minPxPerSec: zoom,
       plugins: [regionPlugin],
+    });
+    const controller = new PlaybackController(
+      {
+        play: (stopAt) => instance.play(undefined, stopAt),
+        pause: () => instance.pause(),
+        setTime: (time) => instance.setTime(time),
+        getCurrentTime: () => instance.getCurrentTime(),
+        getDuration: () => instance.getDuration(),
+        setPlaybackRate: (value) => instance.setPlaybackRate(value),
+      },
+      durationSamples,
+    );
+    playbackController.current = controller;
+    controller.setVideo(video.current);
+    const unsubscribe = controller.subscribe((state) => {
+      setPlayback(state);
+      onTimeRef.current?.(state.current_sample);
     });
     wave.current = instance;
     waveReady.current = false;
@@ -112,22 +148,23 @@ export default function WaveformEditor({
       waveReady.current = true;
       instance.zoom(zoom);
       setReady(true);
+      void controller.markReady();
     });
-    instance.on("timeupdate", (time) => {
-      setCurrent(time);
-      onTimeRef.current?.(Math.round(time * SAMPLE_RATE));
-      const loop = loopRangeRef.current;
-      if (loop && time >= loop[1]) {
-        instance.setTime(loop[0]);
-        if (video.current) video.current.currentTime = loop[0];
-        return;
-      }
-      if (video.current && !syncing.current && Math.abs(video.current.currentTime - time) > 0.18) {
-        video.current.currentTime = time;
-      }
-    });
-    instance.on("play", () => video.current?.play().catch(() => undefined));
-    instance.on("pause", () => video.current?.pause());
+    instance.on("timeupdate", (time) => controller.handleTimeUpdate(time));
+    instance.on("interaction", (time) => controller.handleInteraction(time));
+    instance.on("play", () => controller.handleAudioPlay());
+    instance.on("pause", () => controller.handleAudioPause());
+    instance.on("finish", () => controller.handleAudioEnded());
+    instance.on("error", (error) => controller.markError(error));
+    const wrapper = instance.getWrapper();
+    const prepareWaveformSeek = (event: MouseEvent) => {
+      const rect = wrapper.getBoundingClientRect();
+      const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+      controller.prepareExternalSeek(
+        Math.round(Math.max(0, Math.min(1, ratio)) * instance.getDuration() * SAMPLE_RATE),
+      );
+    };
+    wrapper.addEventListener("click", prepareWaveformSeek, { capture: true });
     regionPlugin.on("region-updated", (region) => updateRegion(region));
     regionPlugin.on("region-clicked", (region, event) => {
       // Read the pointer rather than the player: the click seeks by bubbling to
@@ -142,13 +179,17 @@ export default function WaveformEditor({
       );
     });
     return () => {
+      unsubscribe();
+      wrapper.removeEventListener("click", prepareWaveformSeek, { capture: true });
+      controller.destroy();
       instance.destroy();
       wave.current = null;
+      playbackController.current = null;
       waveReady.current = false;
       regions.current = null;
       setReady(false);
     };
-  }, [audioUrl]);
+  }, [audioUrl, durationSamples]);
 
   useEffect(() => {
     if (waveReady.current) wave.current?.zoom(zoom);
@@ -158,25 +199,11 @@ export default function WaveformEditor({
   // asked, loops its original-audio range. This never alters stored data.
   useEffect(() => {
     if (!focusRange || focusRange.nonce === lastFocusNonce.current) return;
-    const instance = wave.current;
-    if (!instance) return;
+    const controller = playbackController.current;
+    if (!controller) return;
     lastFocusNonce.current = focusRange.nonce;
-    const start = focusRange.startSample / SAMPLE_RATE;
-    const end = focusRange.endSample / SAMPLE_RATE;
-    const apply = () => {
-      instance.setTime(start);
-      if (video.current) video.current.currentTime = start;
-      setLoopRange(focusRange.loop && end > start ? [start, end] : null);
-      if (focusRange.loop) instance.play().catch(() => undefined);
-    };
-    if (waveReady.current) apply();
-    else instance.once("ready", apply);
+    void controller.playRange(focusRange);
   }, [focusRange]);
-
-  useEffect(() => {
-    wave.current?.setPlaybackRate(rate);
-    if (video.current) video.current.playbackRate = rate;
-  }, [rate]);
 
   // Waits for the decoded audio. Regions added before then have no duration to
   // position against, and the plugin only re-checks whether to draw them on the
@@ -217,36 +244,8 @@ export default function WaveformEditor({
     );
   }, [annotation.activities, annotation.exclusions, readOnly, ready]);
 
-  useEffect(() => {
-    const keys = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
-        return;
-      }
-      if (event.code === "Space") {
-        event.preventDefault();
-        wave.current?.playPause();
-      } else if (event.key === "[") {
-        if (!readOnly) beginSelection();
-      } else if (event.key.toLowerCase() === "a") {
-        if (!readOnly) finishActivity("A");
-      } else if (event.key.toLowerCase() === "b") {
-        if (!readOnly) finishActivity("B");
-      } else if (event.key === "ArrowLeft") {
-        seekRelative(-1);
-      } else if (event.key === "ArrowRight") {
-        seekRelative(1);
-      } else if (event.key === ",") {
-        seekRelative(-1 / frameRate);
-      } else if (event.key === ".") {
-        seekRelative(1 / frameRate);
-      }
-    };
-    window.addEventListener("keydown", keys);
-    return () => window.removeEventListener("keydown", keys);
-  });
-
   function updateRegion(region: Region) {
-    if (syncing.current || readOnlyRef.current) return;
+    if (readOnlyRef.current) return;
     const start = Math.max(0, Math.round(region.start * SAMPLE_RATE));
     const end = Math.min(durationSamples, Math.round(region.end * SAMPLE_RATE));
     const currentAnnotation = annotationRef.current;
@@ -274,14 +273,14 @@ export default function WaveformEditor({
   }
 
   function beginSelection() {
-    const time = wave.current?.getCurrentTime() ?? current;
+    const time = playback.current_sample / SAMPLE_RATE;
     selectionStart.current = time;
     setAnchor(time);
   }
 
   function selectionBounds(): [number, number] | null {
     if (selectionStart.current === null) return null;
-    const end = wave.current?.getCurrentTime() ?? current;
+    const end = playback.current_sample / SAMPLE_RATE;
     const first = Math.min(selectionStart.current, end);
     const last = Math.max(selectionStart.current, end);
     if (last - first < 0.05) return null;
@@ -322,15 +321,72 @@ export default function WaveformEditor({
   }
 
   function seekRelative(delta: number) {
-    const instance = wave.current;
-    if (!instance) return;
-    instance.setTime(Math.max(0, Math.min(instance.getDuration(), instance.getCurrentTime() + delta)));
+    playbackController.current?.seekBySeconds(delta);
   }
+
+  useImperativeHandle(ref, () => ({
+    playPlayback: () => void playbackController.current?.play(),
+    pausePlayback: () => playbackController.current?.pause(),
+    togglePlayback: () => void playbackController.current?.toggle(),
+    seekBySeconds: (delta) => seekRelative(delta),
+    beginSelection,
+    finishActivity,
+  }));
+
+  const current = playback.current_sample / SAMPLE_RATE;
+  const loopRange = playback.active_range?.behavior === "loop"
+    ? [
+        playback.active_range.start_sample / SAMPLE_RATE,
+        playback.active_range.end_sample / SAMPLE_RATE,
+      ]
+    : null;
 
   const playheadPosition = `${Math.max(
     0,
-    Math.min(100, ((current * SAMPLE_RATE) / durationSamples) * 100),
+    Math.min(100, durationSamples > 0 ? ((current * SAMPLE_RATE) / durationSamples) * 100 : 0),
   )}%`;
+
+  const railTools = !readOnly && (
+    <div className="timeline-tools">
+      <div className="annotation-actions">
+        <button type="button" onClick={beginSelection} title="Mark where this speaker starts talking">
+          1. Mark range start
+        </button>
+        <button type="button" className="speaker-a" onClick={() => finishActivity("A")} title="End the range here and assign it to speaker A">
+          2. End as Speaker A
+        </button>
+        <button type="button" className="speaker-b" onClick={() => finishActivity("B")} title="End the range here and assign it to speaker B">
+          2. End as Speaker B
+        </button>
+        <p className="timeline-tools-help">
+          Use this only when a speaker lane is missing or wrong: seek to where speech starts,
+          mark the start, seek to where it ends, then choose A or B. It changes the speaker
+          timeline—not the transcript text.
+        </p>
+        <span className="shortcut-note">Shortcut: [ then A or B</span>
+      </div>
+      {!!annotation.exclusions.length && (
+        <div className="exclusion-editor">
+          {annotation.exclusions.map((item) => (
+            <div key={item.id}>
+              <span>{seconds(item.start_sample)}–{seconds(item.end_sample)}s</span>
+              <select value={item.kind} onChange={(event) => updateExclusion(item.id, {
+                kind: event.target.value as ExclusionRegion["kind"],
+              })}>
+                <option value="music">Music</option>
+                <option value="advertisement">Advertisement</option>
+                <option value="noise">Noise</option>
+                <option value="third_speaker">Third speaker</option>
+                <option value="unusable">Unusable</option>
+              </select>
+              <input value={item.note} placeholder="Optional note" onChange={(event) => updateExclusion(item.id, { note: event.target.value })} />
+              <button type="button" className="danger-soft" onClick={() => removeSelected(item.id)}>Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="editor-stack">
@@ -339,35 +395,46 @@ export default function WaveformEditor({
           className="source-video"
           ref={video}
           src={videoUrl}
-          controls
-          onSeeked={() => {
-            if (!video.current || !wave.current) return;
-            syncing.current = true;
-            wave.current.setTime(video.current.currentTime);
-            syncing.current = false;
-          }}
+          muted
+          playsInline
+          aria-label="Muted synchronized source video"
+          onLoadedMetadata={() => playbackController.current?.setVideo(video.current)}
         />
       )}
       <div className="wave-shell">
         <div ref={container} aria-label="Editable source waveform" />
         {anchor !== null && (
           <div className="selection-hint">
-            Selection starts at {anchor.toFixed(2)}s — seek, then choose A or B
+            Range starts at {anchor.toFixed(2)}s — seek to its end, then choose Speaker A or B
           </div>
         )}
       </div>
       <div className="transport">
         <button onClick={() => seekRelative(-1)}>−1s</button>
         <button onClick={() => seekRelative(-1 / frameRate)}>− frame</button>
-        <button className="primary" onClick={() => wave.current?.playPause()}>
-          Play / pause
+        <button
+          className="primary"
+          disabled={playback.status === "loading" || playback.status === "playing"}
+          onClick={() => void playbackController.current?.play()}
+        >
+          Play
+        </button>
+        <button
+          className="pause-control"
+          disabled={playback.status !== "playing"}
+          onClick={() => playbackController.current?.pause()}
+        >
+          Pause
         </button>
         <button onClick={() => seekRelative(1 / frameRate)}>+ frame</button>
         <button onClick={() => seekRelative(1)}>+1s</button>
         <span className="time-readout">{current.toFixed(2)}s</span>
         <label>
           Speed
-          <select value={rate} onChange={(event) => setRate(Number(event.target.value))}>
+          <select
+            value={playback.rate}
+            onChange={(event) => playbackController.current?.setRate(Number(event.target.value))}
+          >
             <option value={0.75}>0.75×</option>
             <option value={1}>1×</option>
             <option value={1.25}>1.25×</option>
@@ -384,14 +451,18 @@ export default function WaveformEditor({
             onChange={(event) => setZoom(Number(event.target.value))}
           />
         </label>
-        {loopRange && <button onClick={() => setLoopRange(null)}>Clear loop</button>}
+        {loopRange && (
+          <button onClick={() => playbackController.current?.clearRange()}>Clear loop</button>
+        )}
       </div>
-      {!readOnly && (
+      {playback.error && <div className="inline-error" role="alert">{playback.error}</div>}
+      {toolTarget && createPortal(railTools, toolTarget)}
+      {!readOnly && !toolTarget && (
         <div className="annotation-actions">
-          <button onClick={beginSelection}>Set selection start [</button>
-          <button className="speaker-a" onClick={() => finishActivity("A")}>Finish as A</button>
-          <button className="speaker-b" onClick={() => finishActivity("B")}>Finish as B</button>
-          <span className="shortcut-note">Shortcuts: [ then A / B · arrows seek · ,/. frame-step · space plays</span>
+          <button onClick={beginSelection}>1. Mark range start</button>
+          <button className="speaker-a" onClick={() => finishActivity("A")}>2. End as Speaker A</button>
+          <button className="speaker-b" onClick={() => finishActivity("B")}>2. End as Speaker B</button>
+          <span className="shortcut-note">Shortcut: [ then A or B</span>
         </div>
       )}
       <div className="lane-grid">
@@ -420,7 +491,7 @@ export default function WaveformEditor({
                       const at = Math.round(
                         Math.max(0, Math.min(1, ratio)) * durationSamples,
                       );
-                      wave.current?.setTime(at / SAMPLE_RATE);
+                      playbackController.current?.seekToSample(at);
                       onRegionClick?.(item.id, at);
                     }}
                     onDoubleClick={() => !readOnly && onRegionDelete?.(item.id)}
@@ -465,7 +536,7 @@ export default function WaveformEditor({
           </div>
         </div>
       </div>
-      {!!annotation.exclusions.length && (
+      {!toolTarget && !!annotation.exclusions.length && (
         <div className="exclusion-editor">
           {annotation.exclusions.map((item) => (
             <div key={item.id}>
@@ -496,4 +567,6 @@ export default function WaveformEditor({
       )}
     </div>
   );
-}
+});
+
+export default WaveformEditor;

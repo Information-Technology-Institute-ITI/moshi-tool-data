@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>P1 playback smoke</title>
+    <style>
+      body { font: 16px system-ui; padding: 24px; }
+      video { display: block; width: 320px; margin-top: 12px; }
+    </style>
+  </head>
+  <body>
+    <output id="result" data-status="pending">pending</output>
+    <audio id="audio" preload="auto"></audio>
+    <video id="video" muted playsinline preload="auto"></video>
+    <script type="module" src="/src/playbackBrowserSmoke.ts"></script>
+  </body>
+</html>
