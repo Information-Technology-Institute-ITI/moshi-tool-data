@@ -20,6 +20,7 @@ import {
   wordsForSegment,
 } from "../transcript";
 import type { Annotation, Speaker, TranscriptUtterance } from "../types";
+import VirtualTranscriptList from "./VirtualTranscriptList";
 
 const SAMPLE_RATE = 24_000;
 
@@ -46,6 +47,9 @@ type Props = {
   selectedId: string | null;
   /** Entry ids intersecting the current timeline selection, if any. */
   filteredIds: string[] | null;
+  chapterSegmentCount?: number;
+  /** Chapter scoping is persistent; only an additional timeline filter is clearable. */
+  canClearFilter?: boolean;
   playheadSample: number;
   readOnly: boolean;
   onSelect: (id: string) => void;
@@ -60,6 +64,7 @@ type Props = {
   onAddAllOverlaps: () => void;
   onJoin: (firstId: string, secondId: string) => void;
   onDelete: (id: string) => void;
+  onVerify: (id: string, moveNext: boolean) => void;
   onAdd: () => void;
   onClearFilter: () => void;
   onPendingBoundsChange: (pending: boolean) => void;
@@ -72,6 +77,8 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
   durationSamples,
   selectedId,
   filteredIds,
+  chapterSegmentCount,
+  canClearFilter = true,
   playheadSample,
   readOnly,
   onSelect,
@@ -84,16 +91,22 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
   onAddAllOverlaps,
   onJoin,
   onDelete,
+  onVerify,
   onAdd,
   onClearFilter,
   onPendingBoundsChange,
   inspectorTarget,
 }, ref) {
+  const [autoFollow, setAutoFollow] = useState(true);
   const prepareSelected = useRef<null | (() => Annotation | null)>(null);
   useImperativeHandle(ref, () => ({
     prepareForSave: () => prepareSelected.current?.() ?? annotation,
   }), [annotation]);
   const ordered = useMemo(() => chronological(annotation.transcript), [annotation.transcript]);
+  const globalPositions = useMemo(
+    () => new Map(ordered.map((item, index) => [item.id, index + 1])),
+    [ordered],
+  );
   const visible = useMemo(
     () => (filteredIds ? ordered.filter((item) => filteredIds.includes(item.id)) : ordered),
     [ordered, filteredIds],
@@ -115,6 +128,9 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
     (total, entry) => total + entry.windows.length,
     0,
   );
+  const playing = visible.find((item) => (
+    playheadSample >= item.start_sample && playheadSample < item.end_sample
+  ));
   const selectedInspector = selected ? (
     <SegmentInspector
       key={selected.id}
@@ -139,6 +155,7 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
       onAddOverlap={onAddOverlap}
       onJoin={onJoin}
       onDelete={onDelete}
+      onVerify={onVerify}
       onRegisterPrepare={(prepare) => {
         prepareSelected.current = prepare;
       }}
@@ -151,12 +168,22 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
       <header className="transcript-header">
         <div>
           <span className="eyebrow">Draft transcript</span>
-          <h2>{ordered.length} segments</h2>
+          <h2>{visible.length} segments shown</h2>
+          {chapterSegmentCount !== undefined && (
+            <small className="transcript-count-detail">
+              {chapterSegmentCount} in this chapter | {ordered.length} in the recording
+            </small>
+          )}
         </div>
         <div className="transcript-header-actions">
-          {filteredIds && (
+          {!autoFollow && (
+            <button type="button" className="return-playhead" onClick={() => setAutoFollow(true)}>
+              Return to playhead
+            </button>
+          )}
+          {canClearFilter && (
             <button type="button" onClick={onClearFilter}>
-              Clear time filter ({visible.length})
+              Clear filters ({visible.length})
             </button>
           )}
           {!readOnly && missingOverlapCount > 0 && (
@@ -178,13 +205,23 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
         </div>
       </header>
 
-      <ol className="transcript-list">
-        {visible.map((item, index) => {
+      <VirtualTranscriptList
+        items={visible}
+        selectedId={selectedId}
+        focusId={autoFollow ? playing?.id : selectedId}
+        onManualScroll={() => setAutoFollow(false)}
+        empty={(
+          <li className="transcript-empty">
+            {ordered.length
+              ? "No segments fall inside the selected chapter and time range."
+              : "This source has no transcript segments yet."}
+          </li>
+        )}
+        renderItem={(item) => {
           const isPlaying =
             playheadSample >= item.start_sample && playheadSample < item.end_sample;
           return (
-            <li key={item.id}>
-              <button
+            <button
                 type="button"
                 className={[
                   "transcript-entry",
@@ -197,7 +234,7 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
                   onPlay(item, false);
                 }}
               >
-                <span className="transcript-index">{index + 1}</span>
+                <span className="transcript-index">{globalPositions.get(item.id)}</span>
                 <span className={`transcript-speaker speaker-${(item.speaker || "a").toLowerCase()}`}>
                   {item.speaker || "?"}
                 </span>
@@ -210,20 +247,13 @@ const TranscriptPanel = forwardRef<TranscriptPanelHandle, Props>(function Transc
                     {item.quality_flags.map((flag) => (
                       <span className="flag-chip" key={flag}>{flagLabel(flag)}</span>
                     ))}
+                    {item.human_verified && <span className="verified-chip">Verified</span>}
                   </span>
                 </span>
-              </button>
-            </li>
+            </button>
           );
-        })}
-        {!visible.length && (
-          <li className="transcript-empty">
-            {ordered.length
-              ? "No segments fall inside the selected time range."
-              : "This source has no transcript segments yet."}
-          </li>
-        )}
-      </ol>
+        }}
+      />
 
       {inspectorTarget ? createPortal(selectedInspector, inspectorTarget) : selectedInspector}
     </section>
@@ -251,6 +281,7 @@ function SegmentInspector({
   onAddOverlap,
   onJoin,
   onDelete,
+  onVerify,
   onRegisterPrepare,
   onPendingBoundsChange,
 }: {
@@ -273,6 +304,7 @@ function SegmentInspector({
   onAddOverlap: (id: string) => void;
   onJoin: (firstId: string, secondId: string) => void;
   onDelete: (id: string) => void;
+  onVerify: (id: string, moveNext: boolean) => void;
   onRegisterPrepare: (prepare: null | (() => Annotation | null)) => void;
   onPendingBoundsChange: (pending: boolean) => void;
 }) {
@@ -524,6 +556,21 @@ function SegmentInspector({
 
       {!readOnly && (
         <div className="inspector-actions">
+          <button
+            type="button"
+            className={segment.human_verified ? "verified-control" : "primary"}
+            disabled={!!boundsProblem || !segment.text.trim() || !segment.speaker}
+            onClick={() => onVerify(segment.id, false)}
+          >
+            {segment.human_verified ? "Unverify" : "Verify"}
+          </button>
+          <button
+            type="button"
+            disabled={!!boundsProblem || !segment.text.trim() || !segment.speaker || !nextEntry}
+            onClick={() => onVerify(segment.id, true)}
+          >
+            Verify then next
+          </button>
           <button
             type="button"
             disabled={!canSplit}

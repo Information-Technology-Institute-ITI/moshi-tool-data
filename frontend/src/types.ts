@@ -149,6 +149,84 @@ export interface Annotation {
   note: string;
 }
 
+export interface CorrectedVersion {
+  id: string;
+  source_id: string;
+  ordinal: number;
+  current_annotation_version: number;
+  generation: number;
+  content_fingerprint: string;
+  status: "unapproved" | "pending" | "approved" | "rejected";
+  created_at: string;
+  updated_at: string;
+  submitted_at?: string | null;
+  approved_at?: string | null;
+  decision_note: string;
+  retention_state: "keep" | "archive_pending" | "archived" | "payload_removed";
+  archive_eligible_at?: string | null;
+}
+
+export interface MachineTranscriptVersion {
+  id: string;
+  source_id: string;
+  ordinal: number;
+  producer: string;
+  model_name: string;
+  model_revision?: string | null;
+  language?: string | null;
+  config_fingerprint?: string | null;
+  provenance_status: "exact" | "historical_unknown";
+  artifact_manifest: Record<string, {
+    artifact_id: string;
+    role: string;
+    sha256: string;
+    size_bytes: number;
+    media_type: string;
+    snapshot_path?: string | null;
+  }>;
+  comparison_available: boolean | number;
+  created_at: string;
+}
+
+export interface RecoverableGeneration {
+  annotation_version: number;
+  generation: number;
+  content_fingerprint: string;
+  created_at: string;
+  recoverable_until: string;
+  change_summary: Record<string, number | string>;
+}
+
+export interface ApprovalEligibility {
+  eligible: boolean;
+  blockers: string[];
+  annotation_version: number;
+  content_fingerprint?: string | null;
+  corrected_version?: CorrectedVersion | null;
+  verified_segments: number;
+  total_segments: number;
+  completed_chapters: number;
+  total_chapters: number;
+}
+
+export interface AnnotationApprovalTask {
+  id: string;
+  source_id: string;
+  corrected_version_id: string;
+  corrected_version_ordinal: number;
+  annotation_version: number;
+  content_fingerprint: string;
+  status: "pending" | "approved" | "rejected" | "returned" | "superseded";
+  original_name: string;
+  project_id: string;
+  project_name: string;
+  submitted_by_name?: string | null;
+  reviewed_by_name?: string | null;
+  review_note: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Clip {
   id: string;
   start_sample: number;
@@ -198,6 +276,19 @@ export interface OverlapRecovery {
 
 export interface SourceDetail extends Source {
   annotation: Annotation;
+  corrected_versions: CorrectedVersion[];
+  current_corrected_version?: CorrectedVersion | null;
+  machine_transcripts: MachineTranscriptVersion[];
+  chapter_set?: import("./productContracts").ReviewChapterSet | null;
+  chapter_reviews?: {
+    chapter_id: string;
+    reviewer_user_id: string;
+    annotation_version: number | null;
+    status: "not_started" | "in_progress" | "complete";
+    updated_at: string | null;
+    stale: boolean;
+  }[];
+  local_drafts_enabled?: boolean;
   annotation_revisions: { version: number; created_at: string }[];
   overlaps: { start_sample: number; end_sample: number }[];
   silences: { start_sample: number; end_sample: number }[];

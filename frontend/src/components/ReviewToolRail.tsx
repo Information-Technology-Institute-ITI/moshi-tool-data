@@ -1,14 +1,19 @@
-import type { RefCallback } from "react";
+import { useRef, type ReactNode, type RefCallback } from "react";
 import { seconds } from "../api";
-
-type Revision = { version: number; created_at: string };
+import type {
+  ApprovalEligibility,
+  CorrectedVersion,
+  MachineTranscriptVersion,
+  RecoverableGeneration,
+} from "../types";
 
 export default function ReviewToolRail({
   open,
+  width,
   projectName,
   sourceName,
   durationSamples,
-  savedVersion,
+  currentVersion,
   segmentCount,
   saveLabel,
   saveTone,
@@ -17,7 +22,11 @@ export default function ReviewToolRail({
   saving,
   canUndo,
   canRedo,
-  revisions,
+  versions,
+  machineTranscripts,
+  approvalEligibility,
+  submittingApproval,
+  recoverableGenerations,
   onClose,
   onBack,
   onUndo,
@@ -28,14 +37,19 @@ export default function ReviewToolRail({
   onOpenPalette,
   onOpenHelp,
   onPause,
+  onSubmitApproval,
+  onRecoverGeneration,
+  onWidthChange,
   inspectorRef,
   timelineToolsRef,
+  workflowTools,
 }: {
   open: boolean;
+  width: number;
   projectName: string;
   sourceName: string;
   durationSamples: number;
-  savedVersion: number;
+  currentVersion: CorrectedVersion | null;
   segmentCount: number;
   saveLabel: string;
   saveTone: string;
@@ -44,20 +58,30 @@ export default function ReviewToolRail({
   saving: boolean;
   canUndo: boolean;
   canRedo: boolean;
-  revisions: Revision[];
+  versions: CorrectedVersion[];
+  machineTranscripts: MachineTranscriptVersion[];
+  approvalEligibility: ApprovalEligibility | null;
+  submittingApproval: boolean;
+  recoverableGenerations: RecoverableGeneration[];
   onClose: () => void;
   onBack: () => void;
   onUndo: () => void;
   onRedo: () => void;
-  onSave: () => void;
-  onRestore: (version: number) => void;
+  onSave: (mode: "update" | "new_version") => void;
+  onRestore: (ordinal: number) => void;
   onDelete: () => void;
   onOpenPalette: () => void;
   onOpenHelp: () => void;
   onPause: () => void;
+  onSubmitApproval: () => void;
+  onRecoverGeneration: (annotationVersion: number) => void;
+  onWidthChange: (width: number) => void;
   inspectorRef: RefCallback<HTMLDivElement>;
   timelineToolsRef: RefCallback<HTMLDivElement>;
+  workflowTools?: ReactNode;
 }) {
+  const resize = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+
   return (
     <>
       <button
@@ -68,6 +92,51 @@ export default function ReviewToolRail({
         onClick={onClose}
       />
       <aside className={`studio-rail ${open ? "open" : ""}`} aria-label="Review tools">
+        <div
+          className="rail-resize-handle"
+          role="separator"
+          aria-label="Resize review tools panel"
+          aria-orientation="vertical"
+          aria-valuemin={280}
+          aria-valuemax={560}
+          aria-valuenow={width}
+          tabIndex={0}
+          title="Drag to resize the tools panel"
+          onPointerDown={(event) => {
+            resize.current = {
+              pointerId: event.pointerId,
+              startX: event.clientX,
+              startWidth: width,
+            };
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerMove={(event) => {
+            if (resize.current?.pointerId !== event.pointerId) return;
+            onWidthChange(resize.current.startWidth + event.clientX - resize.current.startX);
+          }}
+          onPointerUp={(event) => {
+            if (resize.current?.pointerId !== event.pointerId) return;
+            resize.current = null;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          onLostPointerCapture={() => { resize.current = null; }}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              onWidthChange(width - 16);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              onWidthChange(width + 16);
+            } else if (event.key === "Home") {
+              event.preventDefault();
+              onWidthChange(280);
+            } else if (event.key === "End") {
+              event.preventDefault();
+              onWidthChange(560);
+            }
+          }}
+        />
+        <div className="studio-rail-scroll">
         <header className="rail-heading">
           <button type="button" className="back" onClick={onBack}>← {projectName}</button>
           <button type="button" className="rail-close" aria-label="Close review tools" onClick={onClose}>×</button>
@@ -76,8 +145,11 @@ export default function ReviewToolRail({
         <h2>{sourceName}</h2>
         <div className="source-facts">
           <span><strong>{seconds(durationSamples)}s</strong> duration</span>
-          <span><strong>v{savedVersion}</strong> saved revision</span>
-          <span><strong>{segmentCount}</strong> segments</span>
+          <span>
+            <strong>{currentVersion ? `V${currentVersion.ordinal}` : "No version"}</strong>
+            {currentVersion ? ` · generation ${currentVersion.generation}` : ""}
+          </span>
+          <span><strong>{segmentCount}</strong> total segments</span>
         </div>
 
         <section className="rail-section" aria-labelledby="review-state-heading">
@@ -86,19 +158,72 @@ export default function ReviewToolRail({
           <div className="rail-actions">
             <button type="button" onClick={onUndo} disabled={locked || !canUndo}>Undo</button>
             <button type="button" onClick={onRedo} disabled={locked || !canRedo}>Redo</button>
-            <button type="button" className="primary" onClick={onSave} disabled={locked || !dirty}>
-              {saving ? "Saving…" : "Save"}
-            </button>
+            <div className="split-save">
+              <button type="button" className="primary" onClick={() => onSave("update")} disabled={locked || !dirty}>
+                {saving ? "Saving…" : "Save"}
+              </button>
+              <details>
+                <summary aria-label="More save choices">▾</summary>
+                <button type="button" disabled={locked || !dirty} onClick={() => onSave("new_version")}>
+                  Save as new version
+                </button>
+              </details>
+            </div>
           </div>
           <details className="revision-history">
-            <summary>{revisions.length} saved revisions</summary>
-            {revisions.map((revision) => (
-              <button type="button" key={revision.version} disabled={locked} onClick={() => onRestore(revision.version)}>
-                v{revision.version} · {new Date(revision.created_at).toLocaleString()}
+            <summary>Version history · {versions.length}</summary>
+            {versions.map((version) => (
+              <button type="button" key={version.id} disabled={locked} onClick={() => onRestore(version.ordinal)}>
+                V{version.ordinal} · {version.status} · {new Date(version.updated_at).toLocaleString()}
               </button>
             ))}
           </details>
+          <details className="revision-history machine-history">
+            <summary>Machine transcripts · {machineTranscripts.length}</summary>
+            {machineTranscripts.map((version) => (
+              <span key={version.id}>
+                <strong>M{version.ordinal}</strong> · {version.model_name} · {version.producer}
+                {version.provenance_status === "historical_unknown" ? " · historical provenance" : ""}
+              </span>
+            ))}
+          </details>
+          {!!recoverableGenerations.length && (
+            <details className="revision-history">
+              <summary>Recover earlier saves · {recoverableGenerations.length}</summary>
+              {recoverableGenerations.map((generation) => (
+                <button
+                  type="button"
+                  key={generation.annotation_version}
+                  disabled={locked}
+                  onClick={() => onRecoverGeneration(generation.annotation_version)}
+                >
+                  Generation {generation.generation} · saved {new Date(generation.created_at).toLocaleString()}
+                </button>
+              ))}
+            </details>
+          )}
+          <div className="approval-state">
+            <strong>
+              {currentVersion?.status === "approved"
+                ? "Approved final version"
+                : currentVersion?.status === "pending"
+                  ? "Pending admin approval"
+                  : "Whole-source approval"}
+            </strong>
+            {approvalEligibility && !approvalEligibility.eligible && currentVersion?.status !== "pending" && currentVersion?.status !== "approved" && (
+              <small>{approvalEligibility.blockers[0]}</small>
+            )}
+            <button
+              type="button"
+              disabled={locked || dirty || submittingApproval || !approvalEligibility?.eligible}
+              onClick={onSubmitApproval}
+            >
+              {submittingApproval ? "Submitting…" : "Submit latest version for approval"}
+            </button>
+          </div>
         </section>
+
+        {workflowTools}
 
         <section className="rail-section" aria-labelledby="selected-tools-heading">
           <h3 id="selected-tools-heading">Selected segment</h3>
@@ -120,6 +245,7 @@ export default function ReviewToolRail({
         <section className="rail-section rail-danger">
           <button type="button" className="danger-soft" disabled={locked} onClick={onDelete}>Delete source</button>
         </section>
+        </div>
       </aside>
     </>
   );

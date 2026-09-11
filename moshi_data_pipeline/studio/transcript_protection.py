@@ -61,20 +61,40 @@ def _write_annotation_export(
     revision_count = 0
     source_ids: set[str] = set()
     with gzip.open(destination, "wt", encoding="utf-8", newline="\n", compresslevel=6) as stream:
+        has_shared_blobs = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='annotation_shared_blobs'
+            """
+        ).fetchone() is not None
         rows = connection.execute(
             """
-            SELECT source_id,version,created_at,annotation_json
+            SELECT r.source_id,r.version,r.created_at,r.annotation_json,
+                   b.payload_json AS shared_aligned_words_json
+            FROM annotation_revisions r
+            LEFT JOIN annotation_shared_blobs b ON b.id=r.shared_aligned_words_id
+            ORDER BY r.source_id,r.version
+            """
+            if has_shared_blobs
+            else """
+            SELECT source_id,version,created_at,annotation_json,
+                   NULL AS shared_aligned_words_json
             FROM annotation_revisions
             ORDER BY source_id,version
             """
         )
         for row in rows:
             source_id = str(row["source_id"])
+            annotation = json.loads(str(row["annotation_json"]))
+            if row["shared_aligned_words_json"]:
+                annotation["aligned_words"] = json.loads(
+                    str(row["shared_aligned_words_json"])
+                )
             payload = {
                 "source_id": source_id,
                 "version": int(row["version"]),
                 "created_at": str(row["created_at"]),
-                "annotation": json.loads(str(row["annotation_json"])),
+                "annotation": annotation,
             }
             stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             stream.write("\n")

@@ -469,7 +469,7 @@ describe("unified review screen", () => {
 
     await click(byText(".rail-actions button", "Undo"));
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(3);
-    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v2");
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · V2");
     expect((byText(".rail-actions button", "Save") as HTMLButtonElement).disabled)
       .toBe(true);
 
@@ -582,7 +582,9 @@ describe("unified review screen", () => {
     await click(byText(".rail-actions button", "Save"));
 
     expect(container.querySelector("textarea")!.value).toBe("server-normalized");
-    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v3");
+    // Internal generation 3 updates the current corrected version; it does not
+    // create a visible V3 unless Save as new version was chosen.
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · V2");
     expect((byText(".rail-actions button", "Save") as HTMLButtonElement).disabled)
       .toBe(true);
 
@@ -971,7 +973,7 @@ describe("opening a source keeps the saved annotation unchanged", () => {
 
     expect(container.querySelectorAll(".transcript-entry")).toHaveLength(1);
     expect(container.textContent).toContain("hello there friend");
-    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · v2");
+    expect(container.querySelector(".save-state")?.textContent).toContain("Saved · V2");
     expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "PUT")).toHaveLength(0);
   });
 
@@ -1172,5 +1174,66 @@ describe("P2 review workspace commands", () => {
     expect(rail.classList.contains("open")).toBe(true);
     await click(container.querySelector(".review-drawer-backdrop"));
     expect(rail.classList.contains("open")).toBe(false);
+  });
+
+  it("lets the reviewer resize the desktop tool rail within safe bounds", async () => {
+    await openReview(routedFetch());
+    const page = container.querySelector<HTMLElement>(".studio-page")!;
+    const separator = container.querySelector<HTMLElement>(
+      '[role="separator"][aria-label="Resize review tools panel"]',
+    )!;
+    expect(page.style.getPropertyValue("--review-rail-width")).toBe("350px");
+
+    await act(async () => {
+      separator.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    });
+    expect(page.style.getPropertyValue("--review-rail-width")).toBe("366px");
+    expect(window.localStorage.getItem("moshi-review-tool-rail-width")).toBe("366");
+
+    await act(async () => {
+      separator.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    });
+    expect(page.style.getPropertyValue("--review-rail-width")).toBe("280px");
+  });
+});
+
+describe("P4 review workflow", () => {
+  it("verifies a segment and Verify then next advances playback", async () => {
+    await openReview(routedFetch());
+    await click(container.querySelectorAll(".transcript-entry")[0]);
+    await click(byText(".inspector-actions button", "Verify then next"));
+
+    expect(container.querySelectorAll(".transcript-entry")[0].textContent).toContain("Verified");
+    expect(container.querySelectorAll(".transcript-entry")[1].getAttribute("aria-current"))
+      .toBe("true");
+    expect(waveProps.current.focusRange).toMatchObject({
+      start_sample: 24_000,
+      end_sample: 48_000,
+      behavior: "once",
+    });
+  });
+
+  it("searches the working transcript without changing the saved copy", async () => {
+    await openReview(routedFetch());
+    const input = container.querySelector<HTMLInputElement>('[aria-label="Search transcript text"]')!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, annotation.transcript[2].text);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelectorAll(".transcript-entry")).toHaveLength(1);
+    expect(container.textContent).toContain("1 working / 0 saved");
+  });
+
+  it("suspends automatic transcript following after manual scrolling", async () => {
+    await openReview(routedFetch());
+    const list = container.querySelector(".virtual-transcript-list")!;
+    await act(async () => list.dispatchEvent(new WheelEvent("wheel", { bubbles: true })));
+    expect(byText("button", "Return to playhead")).toBeTruthy();
+    await click(byText("button", "Return to playhead"));
+    expect(byText("button", "Return to playhead")).toBeUndefined();
   });
 });

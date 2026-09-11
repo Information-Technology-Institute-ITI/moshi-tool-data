@@ -228,6 +228,61 @@ def test_annotation_save_keeps_both_speakers_over_an_overlap(tmp_path) -> None:
     assert dominant["text"] == "واحد اتنين تلاتة"
 
 
+def test_adding_overlap_clears_prior_human_verification(tmp_path) -> None:
+    app = create_studio_app(tmp_path / "workspace", start_worker=False)
+    service = app.state.studio
+    owner = service.catalog.ensure_local_admin()["id"]
+    project = service.catalog.create_project("Overlap verification", owner_user_id=owner)
+    original = service.paths.originals / "overlap-verified.wav"
+    original.write_bytes(b"placeholder")
+    source = service.catalog.create_source(
+        project["id"],
+        original.name,
+        service.paths.relative(original),
+        "audio/wav",
+        "9" * 64,
+        original.stat().st_size,
+    )
+    service.catalog.update_source(source["id"], duration_samples=48_000, status="ready")
+    base = {
+        "source_id": source["id"],
+        "activities": [
+            {"speaker": "A", "start_sample": 0, "end_sample": 48_000, "origin": "model"},
+            {"speaker": "B", "start_sample": 12_000, "end_sample": 24_000, "origin": "model"},
+        ],
+        "transcript": [
+            {"speaker": "A", "start_sample": 0, "end_sample": 48_000, "text": "dominant"}
+        ],
+    }
+    with TestClient(app) as client:
+        first = client.put(
+            f"/api/sources/{source['id']}/annotations",
+            json={"expected_version": 0, "annotation": base},
+        ).json()
+        first["transcript"][0]["human_verified"] = True
+        verified = client.put(
+            f"/api/sources/{source['id']}/annotations",
+            json={"expected_version": 1, "annotation": first},
+        ).json()
+        assert verified["transcript"][0]["human_verified"] is True
+        verified["transcript"].append(
+            {
+                "speaker": "B",
+                "start_sample": 12_000,
+                "end_sample": 24_000,
+                "text": "overlap",
+                "quality_flags": ["overlapping_speech"],
+            }
+        )
+        changed = client.put(
+            f"/api/sources/{source['id']}/annotations",
+            json={"expected_version": 2, "annotation": verified},
+        )
+    assert changed.status_code == 200
+    dominant = next(item for item in changed.json()["transcript"] if item["speaker"] == "A")
+    assert dominant["human_verified"] is False
+
+
 def test_enqueue_fingerprints_the_state_the_job_will_run_against(tmp_path) -> None:
     """A job must not be superseded for a change enqueuing it made itself.
 

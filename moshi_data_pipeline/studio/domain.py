@@ -155,7 +155,19 @@ class AnnotationDocument(BaseModel):
 
 class AnnotationSave(BaseModel):
     expected_version: int = Field(ge=0)
+    expected_content_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    save_mode: Literal["update", "new_version"] = "update"
     annotation: AnnotationDocument
+
+
+class AnnotationApprovalDecision(BaseModel):
+    decision: Literal["approved", "rejected", "returned"]
+    note: str = Field(default="", max_length=4_000)
+
+
+class CorrectedVersionRetentionDecision(BaseModel):
+    mode: Literal["keep_all", "archive_older"]
+    backup_reference: str | None = Field(default=None, max_length=1_000)
 
 
 class ClipPlanRequest(BaseModel):

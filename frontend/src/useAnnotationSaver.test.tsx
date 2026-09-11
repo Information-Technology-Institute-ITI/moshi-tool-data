@@ -85,9 +85,24 @@ describe("explicit annotation saving", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
     expect(body.expected_version).toBe(3);
+    expect(body.save_mode).toBe("update");
     expect(body.annotation.note).toBe("manual edit");
     expect(saved!.version).toBe(4);
     expect(harness.status).toBe("saved");
+  });
+
+  it("sends the explicit new-version choice and current fingerprint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(annotation(4, "stored")));
+    vi.stubGlobal("fetch", fetchMock);
+    await mount();
+
+    await act(async () => {
+      await harness.save(annotation(3, "major edit"), "new_version", "a".repeat(64));
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+    expect(body.save_mode).toBe("new_version");
+    expect(body.expected_content_fingerprint).toBe("a".repeat(64));
   });
 
   it("ignores a duplicate Save while the first request is running", async () => {

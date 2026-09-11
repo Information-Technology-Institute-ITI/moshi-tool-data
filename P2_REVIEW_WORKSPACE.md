@@ -1,7 +1,7 @@
 # P2 Review Layout, Commands, and Keyboard Access
 
-Status: implementation complete; awaiting local UI acceptance  
-Implemented: 2026-09-09  
+Status: complete  
+Implemented: 2026-09-09; final layout refinements: 2026-09-11  
 Playback contract: `studio.review/v1`
 
 ## Outcome
@@ -22,6 +22,14 @@ The accepted layout refinement uses a non-overlapping viewport workspace on desk
 player occupies the top region and the segments card fills the remaining space with its own scroll.
 At wide desktop sizes, video and the waveform controls sit side by side. Explicit Pause controls are
 available in both the main transport and the left rail.
+
+The transcript card now keeps a visible minimum height and an always-available internal scrollbar at
+normal browser zoom. The main workspace also scrolls when the combined recovery notice, player, and
+transcript card exceed a short viewport, so the transcript cannot be trapped below the fold.
+
+The desktop tool rail can be dragged between 280 and 560 pixels, is further constrained so at least
+640 pixels remain for the review workspace, and remembers the chosen width in the browser. The same
+separator supports Left/Right and Home/End keys. Mobile continues to use the existing drawer width.
 
 Speaker timeline lanes span the complete player-card width beneath that media row. The video is
 slightly enlarged while the transcript segments card continues to own the remaining workspace height.
@@ -72,10 +80,10 @@ last. Segment navigation respects the active time filter.
 - The player is capped to less than half the desktop viewport. The transcript has its own bordered
   card directly below it, so media and segments remain visually distinct while reviewing.
 
-## Deferred decision
+## Save/version follow-up
 
-The server-save criteria, revision frequency, checkpoint grouping, and revision-history presentation
-will be discussed after the current interface updates are finished. P2 does not delete, merge, or
+The Save, corrected-version, recovery, and final-approval decisions are now approved in
+[P5_TRANSCRIPT_AND_SAVE_POLICY.md](P5_TRANSCRIPT_AND_SAVE_POLICY.md). P2 does not delete, merge, or
 otherwise change any stored annotation revision.
 
 The maximum number of segments displayed in one review chapter/list window is also deferred to P3,
@@ -86,12 +94,12 @@ limit and transcript virtualization.
 
 | Check | Result |
 | --- | --- |
-| Frontend tests | 198 passed across 12 files |
+| Frontend tests | 219 passed across 15 files |
 | Command registry tests | Bindings, shifted punctuation, uniqueness, and protected targets covered |
 | Review integration | Keyboard start/step, input safety, palette/help, Ctrl/Cmd+S, drawer, and inspector portal covered |
 | Player component | Rail portal and imperative command surface covered |
 | Production build | TypeScript and Vite passed |
-| Python regression suite | 235 passed |
+| Python regression suite | 243 passed |
 
 P2 changes only frontend composition and interaction behavior. It requires no database migration and
 does not change annotation persistence or transcript-protection formats.

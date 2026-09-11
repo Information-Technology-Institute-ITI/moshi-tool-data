@@ -21,7 +21,7 @@ The completed product will:
 - place editing tools in a persistent left rail and support context-aware keyboard commands;
 - let reviewers directly correct speaker activity and derived overlap;
 - track human verification and review completion;
-- let administrators compare original Whisper output with verified corrections using WER, CER,
+- let administrators compare any immutable M transcript with verified corrections using WER, CER,
   and related quality metrics;
 - let administrators validate, preview, and generate immutable, target-specific Whisper or
   Moshi training packages;
@@ -39,8 +39,10 @@ The UI and code must use these terms consistently:
 - **Overlap**: a range derived from the intersection of two speakers' activity regions.
 - **Training sample**: a short model-ready audio/text example generated after review. It is not a
   review chapter.
-- **Model transcript**: the immutable Whisper output from the one allowed preparation pass.
-- **Corrected transcript**: the latest or selected saved annotation revision.
+- **Machine transcript version**: an immutable machine-produced transcript identified as M1, M2,
+  and so on for one source. The M number identifies a new transcript, not a model family.
+- **Corrected transcript**: the latest or selected human-corrected version, identified separately
+  from M versions.
 - **Training package**: an immutable versioned export for one target profile.
 
 This distinction is mandatory. In particular, a 30-minute review chapter must never be described
@@ -56,9 +58,11 @@ as a training sample or exported dataset clip.
    Canonical audio is the playback master. Video is muted and follows the audio clock. This avoids
    doubled audio and permits mixed, left, right, Speaker A, and Speaker B audition modes.
 
-3. **Explicit server save remains**  
-   Local crash recovery is added, but it does not create a server revision. Only Save creates a
-   new immutable annotation revision.
+3. **Explicit server save and version choice remain**  
+   Local crash recovery and Undo remain browser-side and create no server version. The primary Save
+   updates the eligible current unapproved corrected version through an immutable internal
+   generation; the split-button action Save as new version creates the next visible version without
+   admin approval. Replaced generations remain recoverable for 10 days.
 
 4. **Review chapters are persisted**  
    Automatically chosen chapter boundaries are snapped once and stored. They remain stable across
@@ -69,9 +73,9 @@ as a training sample or exported dataset clip.
    recovery artifacts reference a derived overlap and become stale when its contributing activity
    boundaries change.
 
-6. **Evaluation uses immutable model output**  
+6. **Evaluation uses immutable machine-transcript output**  
    WER and CER never use the editable segment-level `model_text` field as the authoritative model
-   transcript. They compare a recorded model run with a selected corrected annotation revision.
+   transcript. They compare a selected M transcript with an exact corrected-version generation.
 
 7. **Official metrics use micro-averaging**  
    Corpus WER/CER are total edit distance divided by total reference words/characters. Macro
@@ -317,7 +321,7 @@ Buttons must retain standard Space and Enter activation semantics.
 - Key drafts by authenticated user, source, and base annotation version.
 - Debounce writes after local edits.
 - Purge a draft after successful Save, explicit discard, source deletion, or sign-out.
-- On return, offer Restore, Inspect, or Discard.
+- On return, offer Recover unsaved work, Inspect, or Discard.
 - If the server revision advanced, use the existing conflict flow rather than overwriting.
 - Allow deployments to disable browser draft storage for sensitive environments.
 - Never present local recovery as a saved revision.
@@ -327,12 +331,13 @@ Buttons must retain standard Space and Enter activation semantics.
 All database changes are additive numbered migrations. Before rollout, back up SQLite and record
 pre/post row counts. A migration must be safe to rerun through the existing migration registry.
 
-### 7.1 Model runs
+### 7.1 Machine transcript versions
 
 Add `model_runs`:
 
 - `id`
 - `source_id`
+- `source_transcript_ordinal` (displayed as M1, M2, and so on)
 - `initialization_job_id`
 - `model_name`
 - `model_revision`
@@ -343,9 +348,11 @@ Add `model_runs`:
 - `diarization_artifact_id`
 - `created_at`
 
-The artifact references point to immutable, checksum-verified registry entries. There is normally
-one initial run under the current product rule, but the schema supports historical runs without
-changing evaluation semantics.
+The artifact references point to immutable, checksum-verified registry entries. The M ordinal means
+"the nth machine transcript for this source" and is independent of provider or model family. For
+example, Whisper, Cohere, and a trained Whisper model may produce M1, M2, and M3 respectively. The
+trained-model/package identity is recorded as producer metadata; it receives an M ordinal only after
+it is run against this source.
 
 Backfill existing sources from active `analysis.raw_transcript`, `analysis.aligned_transcript`, and
 `analysis.diarization` artifacts. If the raw artifact is missing, mark comparison unavailable; do
@@ -354,11 +361,37 @@ not reconstruct it from edited `model_text` and do not rerun the model.
 The current `model_text` and `model_speaker` fields remain for compatibility and inline reviewer
 hints, but are deprecated as evaluation authority.
 
-### 7.2 Annotation attribution
+### 7.2 Corrected versions, save generations, and attribution
 
-Add nullable `created_by_user_id` and an optional change-summary field to annotation revisions.
-Backfilled historical revisions retain a null actor. Saving a new revision records the current
-principal server-side.
+Add visible corrected-version records and immutable internal storage generations. A corrected
+version has a source-local V ordinal, current-generation pointer, state (`unapproved`, `pending`,
+`approved`, or `rejected`), creator, timestamps, and optional approval identity. Each generation
+records canonical content, content fingerprint, parent generation, actor, origin, change summary,
+and expiry eligibility.
+
+The primary Save creates a replacement generation inside the eligible current unapproved version;
+the previous generation remains recoverable for 10 days. **Save as new version** creates the next V
+ordinal and does not require admin approval. Server-side fingerprint comparison makes no-op Save
+idempotent, and optimistic generation matching prevents concurrent overwrite.
+
+Backfilled annotation revisions retain their existing visible version numbers and a null actor when
+the historical principal is unknowable. Existing payloads are preserved during migration. Heavy
+immutable model/alignment data moves behind M-version artifact references instead of being repeated
+in each future corrected generation.
+
+### 7.2.1 Whole-source approval and retention
+
+Submitting for admin approval is permitted only for the clean latest corrected version after the
+entire source is verified, every applicable chapter is current and complete, no blocker remains,
+and required rights/routing checks pass. Submission freezes the exact generation and creates an
+admin task. Admins may approve, reject with a note, or return it for correction. Approved content is
+permanently immutable; later work starts a new unapproved version.
+
+After approval, an admin chooses either Keep all versions or the recommended Keep approved version
+and archive older payloads for 10 days. Cleanup requires a fresh verified backup, an explicit impact
+preview, and reference checks. It never removes source media, M transcripts, the approved payload,
+or content referenced by evaluation/training/approval records. Audit metadata and fingerprints
+remain after an eligible older payload is removed.
 
 ### 7.3 Review chapters
 
@@ -427,6 +460,11 @@ implementation.
 
 ### Review APIs
 
+- `PUT /api/sources/{source_id}/corrected-versions/current` (primary Save)
+- `POST /api/sources/{source_id}/corrected-versions` (Save as new version)
+- `GET /api/sources/{source_id}/corrected-versions`
+- `GET /api/sources/{source_id}/corrected-versions/{version}`
+- `POST /api/sources/{source_id}/corrected-versions/{version}/submit-approval`
 - `GET /api/sources/{source_id}/chapters`
 - `PUT /api/sources/{source_id}/chapters/config`
 - `POST /api/sources/{source_id}/chapters/regenerate`
@@ -436,6 +474,10 @@ implementation.
 
 Chapter regeneration requires explicit confirmation when completion records exist. Source
 ownership rules apply to all review APIs.
+
+Primary Save accepts the expected current generation and content fingerprint. It is idempotent for
+unchanged content, cannot update pending or approved content, and retains the replaced generation
+for 10 days. Creating a new corrected version does not require admin approval.
 
 ### Overlap APIs
 
@@ -450,14 +492,21 @@ separation implicitly.
 ### Admin evaluation APIs
 
 - `GET /api/admin/model-runs`
+- `GET /api/admin/approval-tasks`
+- `GET /api/admin/approval-tasks/{task_id}`
+- `POST /api/admin/approval-tasks/{task_id}/approve`
+- `POST /api/admin/approval-tasks/{task_id}/reject`
+- `POST /api/admin/sources/{source_id}/version-retention`
 - `GET /api/admin/sources/{source_id}/comparison`
 - `POST /api/admin/evaluations/preview`
 - `POST /api/admin/evaluations`
 - `GET /api/admin/evaluations/{report_id}`
 - `GET /api/admin/evaluations/{report_id}/download`
 
-The comparison endpoint accepts model run, annotation revision, chapter/range, speaker, verified
-scope, normalization policy, and overlap policy.
+Approval endpoints operate on the frozen generation submitted after whole-source verification.
+Retention cleanup requires a verified backup, impact preview, reference checks, and the approved
+10-day archive window. The comparison endpoint accepts M transcript, exact corrected-version
+generation, chapter/range, speaker, verified scope, normalization policy, and overlap policy.
 
 ### Admin training APIs
 
@@ -869,20 +918,31 @@ Exit criteria:
 - queue navigation opens the correct chapter and segment;
 - channel mode is unavailable until routing is verified.
 
-### Phase 5 — Immutable model transcript foundation
+### Phase 5 — Machine transcripts, corrected versions, and final approval
 
-- Add model-run and annotation-attribution migrations.
+- Add source-local M1/M2/M3 transcript ordinals with producer/model metadata and immutable artifact
+  references.
 - Backfill existing raw artifacts without reprocessing.
-- Add typed model-run retrieval and availability contracts.
+- Add visible corrected versions backed by immutable internal generations and actor/change metadata.
+- Implement split Save: primary Save updates the eligible unapproved version; Save as new version
+  creates the next version without admin approval.
+- Keep replaced generations recoverable for 10 days while crash recovery and Undo remain local.
+- Add whole-source submission and admin approve/reject/return tasks; lock approved content.
+- Add protected approved-history retention with backup, reference checks, impact preview, and the
+  10-day recovery window.
 - Deprecate editable segment `model_text` as evaluation authority.
-- Add admin authorization tests for model artifacts.
+- Add admin authorization tests for machine-transcript artifacts and approval/retention operations.
 
 Exit criteria:
 
-- split/join edits do not change the model hypothesis;
-- normal users cannot access raw model-run artifact endpoints;
+- split/join edits do not change any M transcript;
+- normal users cannot access raw machine-transcript artifact endpoints;
 - historical sources with missing artifacts show an honest unavailable state;
-- existing annotations and exports remain readable.
+- existing annotations and exports remain readable;
+- Save is idempotent, overwritten generations are recoverable for 10 days, and local Undo remains;
+- creating a corrected version needs no admin approval;
+- only a fully verified clean latest version can be submitted, and approved content is immutable;
+- cleanup cannot delete referenced provenance or any M transcript.
 
 ### Phase 6 — Direct overlap editing
 
@@ -981,7 +1041,7 @@ Exit criteria:
 - upload → initialize → review → save → verify → complete chapter;
 - select segment → Play once → stop at exact end;
 - loop segment while video follows;
-- close browser with edits → restore draft → save revision;
+- close browser with edits → recover unsaved work → Save;
 - modify overlap → stale prior recovery → re-review;
 - admin compares raw model run to corrected revision;
 - admin validates, previews, generates, and downloads both target profiles;
@@ -1075,7 +1135,8 @@ The program is complete when:
 - reviewers can search, filter, follow playback, recover drafts, verify segments, and complete
   chapters;
 - reviewers can increase, reduce, classify, split, merge, or semantically remove overlap;
-- original Whisper output and corrected revisions remain independently retrievable and auditable;
+- M1/M2/M3 machine transcripts and corrected versions remain independently retrievable and
+  auditable;
 - administrators can view accurate strict/normalized WER and CER with coverage and diff details;
 - administrators can validate and preview target-specific training data;
 - immutable Whisper and Moshi training packages include leakage-safe splits, QC, checksums, and
@@ -1095,7 +1156,7 @@ The program is complete when:
 7. Use precomputed peaks, peaks v2, and virtual transcript rendering.
 8. Add verification, completion, search, filters, quality queue, draft recovery, and channel
    audition.
-9. Establish immutable model-run records and annotation attribution.
+9. Establish immutable M transcripts, corrected-version generations, split Save, and final approval.
 10. Add direct overlap editing and stale-dependency handling.
 11. Add admin WER/CER evaluation.
 12. Add admin training validation, preview, package generation, and history.

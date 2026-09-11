@@ -24,6 +24,8 @@ const instance = {
   setPlaybackRate: vi.fn(),
   getCurrentTime: vi.fn(() => 0),
   getDuration: vi.fn(() => 3),
+  getScroll: vi.fn(() => 0),
+  setScrollTime: vi.fn(),
   getWrapper: vi.fn(() => document.createElement("div")),
 };
 const plugin = {
@@ -138,6 +140,25 @@ describe("waveform controls", () => {
     expect(plugin.addRegion.mock.calls[0][0]).toMatchObject({ id: "act_1", content: "A" });
   });
 
+  it("shows only speaker lanes from the selected chapter using chapter-relative positions", async () => {
+    const chapterAnnotation = {
+      ...annotation,
+      activities: [
+        ...annotation.activities,
+        { id: "act_2", speaker: "B" as const, start_sample: 48_000, end_sample: 72_000, origin: "model" as const },
+      ],
+    };
+    await render({
+      annotation: chapterAnnotation,
+      timelineRange: { start_sample: 24_000, end_sample: 72_000 },
+    });
+    const regions = container.querySelectorAll<HTMLElement>(".lane-region");
+    expect(regions).toHaveLength(1);
+    expect(regions[0].textContent).toBe("B");
+    expect(regions[0].style.left).toBe("50%");
+    expect(regions[0].style.width).toBe("50%");
+  });
+
   it("mounts annotation tools into the requested left-rail target", async () => {
     const target = document.createElement("div");
     document.body.append(target);
@@ -225,5 +246,31 @@ describe("waveform controls", () => {
     await act(async () => listeners.get("timeupdate")?.(0.41));
     expect(instance.setTime).toHaveBeenLastCalledWith(0.2);
     expect(labels()).toContain("Clear loop");
+  });
+
+  it("offers channel audition only for verified independent stereo routing", async () => {
+    await render({
+      channelAudioUrl: "/media/source_1/channels",
+      annotation: {
+        ...annotation,
+        channel_routing_mode: "independent_stereo",
+        channel_routing_verified: true,
+        speaker_channel_map: { A: 0, B: 1 },
+      },
+    });
+    const selector = container.querySelector<HTMLSelectElement>('[aria-label="Channel audition mode"]');
+    expect(selector).toBeTruthy();
+    expect(Array.from(selector!.options).map((option) => option.text)).toEqual([
+      "Mixed",
+      "Left channel",
+      "Right channel",
+      "Speaker A",
+      "Speaker B",
+    ]);
+    await act(async () => {
+      selector!.value = "speaker_b";
+      selector!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(selector!.value).toBe("speaker_b");
   });
 });

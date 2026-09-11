@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
@@ -596,6 +599,334 @@ def _recoverable_project_deletion(connection: sqlite3.Connection) -> None:
     )
 
 
+def _review_chapters_v1(connection: sqlite3.Connection) -> None:
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS review_chapter_sets (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 0),
+            mode TEXT NOT NULL CHECK(mode IN ('max_duration','count','manual')),
+            max_duration_seconds INTEGER NOT NULL CHECK(max_duration_seconds BETWEEN 60 AND 7200),
+            requested_count INTEGER CHECK(requested_count IS NULL OR requested_count BETWEEN 1 AND 500),
+            manual_boundaries_json TEXT NOT NULL DEFAULT '[]',
+            boundary_search_seconds INTEGER NOT NULL CHECK(boundary_search_seconds BETWEEN 0 AND 300),
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS review_chapters (
+            id TEXT PRIMARY KEY,
+            chapter_set_id TEXT NOT NULL REFERENCES review_chapter_sets(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+            start_sample INTEGER NOT NULL CHECK(start_sample >= 0),
+            end_sample INTEGER NOT NULL CHECK(end_sample > start_sample),
+            boundary_reason TEXT NOT NULL CHECK(boundary_reason IN ('source_edge','silence','segment','manual')),
+            UNIQUE(chapter_set_id, ordinal)
+        );
+
+        CREATE TABLE IF NOT EXISTS chapter_reviews (
+            chapter_id TEXT NOT NULL REFERENCES review_chapters(id) ON DELETE CASCADE,
+            reviewer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 0),
+            status TEXT NOT NULL DEFAULT 'in_progress' CHECK(status IN ('not_started','in_progress','complete')),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(chapter_id, reviewer_user_id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS review_chapter_sets_one_active_idx
+            ON review_chapter_sets(source_id) WHERE active=1;
+        CREATE INDEX IF NOT EXISTS review_chapters_set_range_idx
+            ON review_chapters(chapter_set_id, start_sample, end_sample);
+        CREATE INDEX IF NOT EXISTS chapter_reviews_reviewer_idx
+            ON chapter_reviews(reviewer_user_id, status, updated_at);
+        """,
+    )
+
+
+def _annotation_fingerprint(raw: str) -> str:
+    """Fingerprint annotation content without its internal generation number."""
+    value = json.loads(raw)
+    value.pop("version", None)
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _stable_id(prefix: str, *parts: object) -> str:
+    material = "\0".join(str(part) for part in parts).encode("utf-8")
+    return f"{prefix}_{hashlib.sha256(material).hexdigest()[:32]}"
+
+
+def _transcript_versions_and_approval_v1(connection: sqlite3.Connection) -> None:
+    """Add P5 metadata without replacing or rewriting annotation payloads."""
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS corrected_versions (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+            current_annotation_version INTEGER NOT NULL CHECK(current_annotation_version >= 1),
+            content_fingerprint TEXT CHECK(
+                content_fingerprint IS NULL OR length(content_fingerprint) = 64
+            ),
+            status TEXT NOT NULL DEFAULT 'unapproved' CHECK(status IN (
+                'unapproved','pending','approved','rejected'
+            )),
+            created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            submitted_at TEXT,
+            approved_at TEXT,
+            approved_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            decision_note TEXT NOT NULL DEFAULT '',
+            retention_state TEXT NOT NULL DEFAULT 'keep' CHECK(retention_state IN (
+                'keep','archive_pending','archived','payload_removed'
+            )),
+            archive_eligible_at TEXT,
+            UNIQUE(source_id, ordinal),
+            UNIQUE(source_id, current_annotation_version)
+        );
+
+        CREATE TABLE IF NOT EXISTS machine_transcript_versions (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+            producing_job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+            producer TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            model_revision TEXT,
+            language TEXT,
+            config_fingerprint TEXT,
+            raw_transcript_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+            aligned_transcript_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+            diarization_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+            raw_snapshot_path TEXT,
+            aligned_snapshot_path TEXT,
+            diarization_snapshot_path TEXT,
+            artifact_fingerprint TEXT NOT NULL,
+            artifact_manifest_json TEXT NOT NULL DEFAULT '{}',
+            provenance_status TEXT NOT NULL DEFAULT 'historical_unknown' CHECK(
+                provenance_status IN ('exact','historical_unknown')
+            ),
+            comparison_available INTEGER NOT NULL DEFAULT 0 CHECK(comparison_available IN (0,1)),
+            created_at TEXT NOT NULL,
+            UNIQUE(source_id, ordinal),
+            UNIQUE(source_id, artifact_fingerprint)
+        );
+
+        CREATE TABLE IF NOT EXISTS annotation_approval_tasks (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            corrected_version_id TEXT NOT NULL REFERENCES corrected_versions(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 1),
+            content_fingerprint TEXT NOT NULL CHECK(length(content_fingerprint) = 64),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                'pending','approved','rejected','returned','superseded'
+            )),
+            submitted_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            reviewed_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            review_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS corrected_version_retention_decisions (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            approved_corrected_version_id TEXT NOT NULL REFERENCES corrected_versions(id),
+            mode TEXT NOT NULL CHECK(mode IN ('keep_all','archive_older')),
+            decided_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            affected_versions_json TEXT NOT NULL DEFAULT '[]',
+            estimated_bytes INTEGER NOT NULL DEFAULT 0 CHECK(estimated_bytes >= 0),
+            backup_reference TEXT,
+            execute_after TEXT,
+            status TEXT NOT NULL DEFAULT 'recorded' CHECK(status IN (
+                'recorded','waiting','complete','cancelled','blocked'
+            )),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS annotation_shared_blobs (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('aligned_words')),
+            content_fingerprint TEXT NOT NULL CHECK(length(content_fingerprint) = 64),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(kind, content_fingerprint)
+        );
+
+        CREATE INDEX IF NOT EXISTS corrected_versions_source_idx
+            ON corrected_versions(source_id, ordinal DESC);
+        CREATE INDEX IF NOT EXISTS machine_transcript_versions_source_idx
+            ON machine_transcript_versions(source_id, ordinal DESC);
+        CREATE INDEX IF NOT EXISTS annotation_approval_tasks_status_idx
+            ON annotation_approval_tasks(status, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS annotation_approval_one_pending_source_idx
+            ON annotation_approval_tasks(source_id) WHERE status='pending';
+        """,
+    )
+    _add_columns(
+        connection,
+        "annotation_revisions",
+        {
+            "corrected_version_id": "TEXT REFERENCES corrected_versions(id)",
+            "generation": "INTEGER NOT NULL DEFAULT 1",
+            "content_fingerprint": "TEXT",
+            "parent_annotation_version": "INTEGER",
+            "created_by_user_id": "TEXT REFERENCES users(id) ON DELETE SET NULL",
+            "origin": "TEXT NOT NULL DEFAULT 'historical'",
+            "change_summary_json": "TEXT NOT NULL DEFAULT '{}'",
+            "recoverable_until": "TEXT",
+            "retention_state": "TEXT NOT NULL DEFAULT 'current'",
+            "shared_aligned_words_id": "TEXT REFERENCES annotation_shared_blobs(id)",
+        },
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS annotation_revisions_corrected_version_idx
+        ON annotation_revisions(corrected_version_id, generation DESC)
+        """
+    )
+
+    # Every old server revision remains available as the same visible V number.
+    # Fingerprints and pointers live in lightweight corrected_versions rows;
+    # annotation_revisions is not updated, so its large JSON records are not
+    # physically rewritten by this migration.
+    rows = connection.execute(
+        """
+        SELECT id,source_id,version,annotation_json,created_at
+        FROM annotation_revisions ORDER BY source_id,version
+        """
+    ).fetchall()
+    for row in rows:
+        version_id = _stable_id("corrected", row[1], row[2])
+        fingerprint = _annotation_fingerprint(str(row[3]))
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO corrected_versions(
+                id,source_id,ordinal,current_annotation_version,content_fingerprint,
+                status,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                version_id,
+                row[1],
+                row[2],
+                row[2],
+                fingerprint,
+                "unapproved",
+                row[4],
+                row[4],
+            ),
+        )
+
+
+def _p5_provenance_hardening(connection: sqlite3.Connection) -> None:
+    _add_columns(
+        connection,
+        "machine_transcript_versions",
+        {
+            "artifact_manifest_json": "TEXT NOT NULL DEFAULT '{}'",
+            "provenance_status": "TEXT NOT NULL DEFAULT 'historical_unknown'",
+        },
+    )
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS annotation_version_references (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 1),
+            reference_kind TEXT NOT NULL,
+            reference_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_id, annotation_version, reference_kind, reference_id)
+        );
+        CREATE INDEX IF NOT EXISTS annotation_version_references_version_idx
+            ON annotation_version_references(source_id, annotation_version);
+        """,
+    )
+
+    # M rows created before provenance hardening are truthful historical records:
+    # their immutable files and hashes are known, but the model/config must not
+    # be claimed exact if old jobs did not persist those fields.
+    machine_rows = connection.execute(
+        """
+        SELECT id,raw_transcript_artifact_id,aligned_transcript_artifact_id,
+               diarization_artifact_id
+        FROM machine_transcript_versions ORDER BY source_id,ordinal
+        """
+    ).fetchall()
+    for row in machine_rows:
+        manifest: dict[str, Any] = {}
+        for label, artifact_id in (
+            ("raw", row[1]),
+            ("aligned", row[2]),
+            ("diarization", row[3]),
+        ):
+            if not artifact_id:
+                continue
+            artifact = connection.execute(
+                "SELECT id,role,sha256,size_bytes,media_type FROM artifacts WHERE id=?",
+                (artifact_id,),
+            ).fetchone()
+            if artifact is not None:
+                manifest[label] = {
+                    "artifact_id": artifact[0],
+                    "role": artifact[1],
+                    "sha256": artifact[2],
+                    "size_bytes": artifact[3],
+                    "media_type": artifact[4],
+                }
+        connection.execute(
+            """
+            UPDATE machine_transcript_versions
+            SET artifact_manifest_json=?,provenance_status='historical_unknown',
+                model_name='historical model (metadata unavailable)',
+                model_revision=NULL,config_fingerprint=NULL
+            WHERE id=?
+            """,
+            (json.dumps(manifest, ensure_ascii=False, sort_keys=True), row[0]),
+        )
+
+    # Completed jobs are immutable outputs. Register any annotation generation
+    # explicitly frozen in their preconditions so retention cannot remove it.
+    for job_id, source_id, preconditions_json, created_at in connection.execute(
+        "SELECT id,source_id,preconditions_json,created_at FROM jobs WHERE source_id IS NOT NULL"
+    ).fetchall():
+        preconditions = json.loads(preconditions_json or "{}")
+        annotation = preconditions.get("annotation") or {}
+        version = annotation.get("version")
+        if not isinstance(version, int) or version < 1:
+            continue
+        reference_id = _stable_id("annotation_ref", source_id, version, "job", job_id)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO annotation_version_references(
+                id,source_id,annotation_version,reference_kind,reference_id,created_at
+            ) VALUES(?,?,?,'job_input',?,?)
+            """,
+            (reference_id, source_id, version, job_id, created_at),
+        )
+
+
+def _p5_retention_audit(connection: sqlite3.Connection) -> None:
+    _add_columns(
+        connection,
+        "annotation_revisions",
+        {"payload_removed_at": "TEXT"},
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "legacy_compatibility", _legacy_compatibility),
     (2, "worker_protocol_v1", _worker_protocol_v1),
@@ -604,6 +935,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     (5, "user_authentication_v1", _user_authentication_v1),
     (6, "dataset_ownership_v1", _dataset_ownership_v1),
     (7, "recoverable_project_deletion", _recoverable_project_deletion),
+    (8, "review_chapters_v1", _review_chapters_v1),
+    (9, "transcript_versions_and_approval_v1", _transcript_versions_and_approval_v1),
+    (10, "p5_provenance_hardening", _p5_provenance_hardening),
+    (11, "p5_retention_audit", _p5_retention_audit),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

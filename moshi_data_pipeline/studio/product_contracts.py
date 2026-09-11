@@ -122,7 +122,9 @@ class ModelRunSummary(ContractModel):
     contract_version: Literal["studio.evaluation/v1"] = EVALUATION_CONTRACT_VERSION
     id: str = Field(min_length=1)
     source_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=1)
     initialization_job_id: str | None = None
+    producer: str = Field(min_length=1)
     model_name: str = Field(min_length=1)
     model_revision: str | None = None
     language: str | None = None

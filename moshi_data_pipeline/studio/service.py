@@ -11,6 +11,7 @@ from moshi_data_pipeline.config import PipelineConfig
 from moshi_data_pipeline.gpu_job_protocol import JOB_KINDS as GPU_JOB_KINDS
 from moshi_data_pipeline.studio.artifacts import ArtifactStore
 from moshi_data_pipeline.studio.catalog import PrincipalLike, StudioCatalog
+from moshi_data_pipeline.studio.chapters import generate_chapter_set
 from moshi_data_pipeline.studio.clip_registry import clip_artifacts
 from moshi_data_pipeline.studio.domain import (
     AnnotationDocument,
@@ -38,13 +39,18 @@ from moshi_data_pipeline.studio.lifecycle import (
     LifecycleProvider,
     LocalLifecycleProvider,
 )
-from moshi_data_pipeline.studio.media import StudioPaths
+from moshi_data_pipeline.studio.media import StudioPaths, load_json_file
 from moshi_data_pipeline.studio.normalization import normalize_annotation_bounds
 from moshi_data_pipeline.studio.planning import (
     derived_overlaps,
     derived_silences,
     propose_clip_plan,
     validate_annotation,
+)
+from moshi_data_pipeline.studio.product_contracts import (
+    ReviewChapterConfig,
+    ReviewChapterSet,
+    WaveformPeakWindow,
 )
 from moshi_data_pipeline.studio.quality_metrics import source_quality_metrics
 
@@ -96,6 +102,8 @@ class StudioService:
         self.artifacts.reconcile_commits()
         self.contexts = JobContextBuilder(self.catalog, self.paths, config)
         self._repair_annotation_bounds()
+        self.catalog.backfill_machine_transcript_versions()
+        self.catalog.cleanup_expired_annotation_payloads()
         self.catalog.repair_orphaned_processing_sources()
         if enable_local_worker:
             from moshi_data_pipeline.studio.worker import StudioWorker
@@ -260,8 +268,94 @@ class StudioService:
         self.dispatcher.wake()
         return public_gpu_check(check) or {}, created
 
-    def source_detail(self, source_id: str) -> dict[str, Any]:
-        source = self.catalog.get_source(source_id)
+    def ensure_chapter_set(
+        self,
+        source_id: str,
+        config: ReviewChapterConfig | None = None,
+        *,
+        principal: PrincipalLike | None = None,
+        force: bool = False,
+    ) -> ReviewChapterSet | None:
+        source = self.catalog.get_source(source_id, principal=principal)
+        duration = int(source["duration_samples"] or 0)
+        if duration <= 0:
+            return None
+        annotation = self.catalog.latest_annotation(source_id)
+        active = self.catalog.active_chapter_set(source_id)
+        if (
+            active is not None
+            and active.annotation_version == annotation.version
+            and config is None
+            and not force
+        ):
+            return active
+        selected_config = config or (active.config if active else ReviewChapterConfig())
+        generated = generate_chapter_set(
+            source_id,
+            annotation,
+            duration,
+            selected_config,
+            silences=derived_silences(annotation.activities, duration),
+        )
+        return self.catalog.replace_chapter_set(generated, principal=principal)
+
+    def waveform_peak_window(
+        self,
+        source_id: str,
+        *,
+        start_sample: int = 0,
+        end_sample: int | None = None,
+        max_points: int = 1_200,
+    ) -> WaveformPeakWindow:
+        if max_points < 1 or max_points > 5_000:
+            raise ValueError("max_points must be between 1 and 5000")
+        path = self.active_artifact_path(
+            source_id, "source.peaks", self.paths.peaks(source_id)
+        )
+        payload = load_json_file(path)
+        if not payload or not payload.get("points"):
+            raise KeyError(f"Waveform peaks are unavailable for {source_id}")
+        duration = int(payload["duration_samples"])
+        stop = duration if end_sample is None else int(end_sample)
+        start = int(start_sample)
+        if start < 0 or stop <= start or stop > duration:
+            raise ValueError("Peak window must be a non-empty range inside the source")
+        levels = payload.get("levels") or []
+        finest = min(
+            levels,
+            key=lambda level: int(level.get("samples_per_point") or duration),
+            default=None,
+        )
+        source_points = finest["points"] if finest and finest.get("points") else payload["points"]
+        point_count = len(source_points)
+        first = max(0, min(point_count - 1, (start * point_count) // duration))
+        last = max(first + 1, min(point_count, -(-stop * point_count // duration)))
+        selected = source_points[first:last]
+        bucket_size = max(1, -(-len(selected) // max_points))
+        points = [
+            (
+                min(float(pair[0]) for pair in selected[index : index + bucket_size]),
+                max(float(pair[1]) for pair in selected[index : index + bucket_size]),
+            )
+            for index in range(0, len(selected), bucket_size)
+        ]
+        return WaveformPeakWindow(
+            source_id=source_id,
+            sample_rate=int(payload["sample_rate"]),
+            duration_samples=duration,
+            start_sample=start,
+            end_sample=stop,
+            samples_per_point=max(1, -(-(stop - start) // len(points))),
+            points=points,
+        )
+
+    def source_detail(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
+        source = self.catalog.get_source(source_id, principal=principal)
         annotation = self.catalog.latest_annotation(source_id)
         duration = int(source["duration_samples"] or 0)
         overlap_recoveries = self.catalog.overlap_recoveries(source_id)
@@ -269,6 +363,27 @@ class StudioService:
             **source,
             "annotation": annotation.model_dump(mode="json"),
             "annotation_revisions": self.catalog.annotation_revisions(source_id),
+            "corrected_versions": self.catalog.corrected_versions(source_id),
+            "current_corrected_version": self.catalog.current_corrected_version(source_id),
+            "machine_transcripts": (
+                self.catalog.machine_transcripts(source_id)
+                if bool(getattr(principal, "is_admin", False))
+                else []
+            ),
+            "chapter_set": (
+                chapter_set.model_dump(mode="json")
+                if (chapter_set := self.ensure_chapter_set(source_id, principal=principal))
+                else None
+            ),
+            "chapter_reviews": (
+                self.catalog.chapter_reviews(source_id, principal=principal)
+                if principal is not None
+                else []
+            ),
+            "local_drafts_enabled": os.environ.get(
+                "MOSHI_DISABLE_LOCAL_DRAFTS", ""
+            ).strip().lower()
+            not in {"1", "true", "yes", "on"},
             "overlaps": [
                 {"start_sample": start, "end_sample": end}
                 for start, end in derived_overlaps(annotation.activities)
@@ -489,7 +604,7 @@ class StudioService:
             registered, commit_id = self.artifacts.commit_uploads(job, produced_artifacts)
             try:
                 mutation = self._prepare_remote_mutation(job, result, registered)
-                return self.catalog.commit_leased_job_result(
+                completed = self.catalog.commit_leased_job_result(
                     job_id,
                     worker_id,
                     lease_token,
@@ -500,6 +615,20 @@ class StudioService:
                     mutation=mutation,
                     artifact_commit_id=commit_id,
                 )
+                if job.get("source_id") and kind in {
+                    "initialize",
+                    "transcribe",
+                    "rediarize",
+                    "realign",
+                }:
+                    self.catalog.ensure_machine_transcript_version(
+                        str(job["source_id"]),
+                        model_name=self.config.transcription.model,
+                        model_revision=self.config.transcription.model_revision,
+                        config_fingerprint=self.config.fingerprint("transcription"),
+                        provenance_status="exact",
+                    )
+                return completed
             except Exception:
                 if commit_id is not None:
                     self.artifacts.rollback_commit(commit_id)
@@ -521,19 +650,27 @@ class StudioService:
             rights_confirmed=rights.rights_confirmed,
         )
 
-    def save_annotation(
+    def save_annotation_record(
         self,
         source_id: str,
         expected_version: int,
         annotation: AnnotationDocument,
         *,
         principal: PrincipalLike,
-    ) -> AnnotationDocument:
-        source = self.catalog.get_source(source_id)
+        save_mode: str = "update",
+        expected_content_fingerprint: str | None = None,
+    ) -> tuple[AnnotationDocument, dict[str, Any]]:
+        source = self.catalog.get_source(source_id, principal=principal)
         if annotation.source_id != source_id:
             raise ValueError("Annotation source_id does not match the route")
         current = self.catalog.latest_annotation(source_id)
         prior = {value.id: value for value in current.transcript}
+        incoming_ids = {value.id for value in annotation.transcript}
+        structural_changes = [
+            value for value in annotation.transcript if value.id not in prior
+        ] + [
+            value for value in current.transcript if value.id not in incoming_ids
+        ]
         transcript = []
         for utterance in annotation.transcript:
             previous = prior.get(utterance.id)
@@ -548,12 +685,26 @@ class StudioService:
                 utterance.end_sample,
                 utterance.text,
             )
+            overlap_context_changed = any(
+                peer.id != utterance.id
+                and peer.speaker != utterance.speaker
+                and peer.start_sample < utterance.end_sample
+                and peer.end_sample > utterance.start_sample
+                for peer in structural_changes
+            )
             transcript.append(
                 utterance.model_copy(
                     update={
+                        # Machine output is authoritative in M versions. These
+                        # compatibility fields remain readable during P5 but a
+                        # human Save cannot rewrite their provenance.
+                        "model_text": previous.model_text if previous else "",
+                        "model_speaker": previous.model_speaker if previous else None,
+                        "quality_flags": previous.quality_flags if previous else [],
+                        "review_candidates": previous.review_candidates if previous else [],
                         "human_verified": (
                             False
-                            if alignment_input_changed
+                            if alignment_input_changed or overlap_context_changed
                             else utterance.human_verified
                         )
                     }
@@ -568,10 +719,107 @@ class StudioService:
         )
         if errors:
             raise ValueError("; ".join(errors))
-        return self.catalog.save_annotation(
+        return self.catalog.save_annotation_record(
             source_id,
             expected_version,
             normalized,
+            principal=principal,
+            save_mode=save_mode,
+            expected_content_fingerprint=expected_content_fingerprint,
+            origin="human_save",
+        )
+
+    def save_annotation(
+        self,
+        source_id: str,
+        expected_version: int,
+        annotation: AnnotationDocument,
+        *,
+        principal: PrincipalLike,
+        save_mode: str = "update",
+        expected_content_fingerprint: str | None = None,
+    ) -> AnnotationDocument:
+        value, _ = self.save_annotation_record(
+            source_id,
+            expected_version,
+            annotation,
+            principal=principal,
+            save_mode=save_mode,
+            expected_content_fingerprint=expected_content_fingerprint,
+        )
+        return value
+
+    def annotation_approval_eligibility(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        source = self.catalog.get_source(source_id, principal=principal)
+        annotation = self.catalog.latest_annotation(source_id)
+        version = self.catalog.current_corrected_version(source_id)
+        blockers: list[str] = []
+        if version is None:
+            blockers.append("Save a corrected version first")
+        elif version["status"] == "pending":
+            blockers.append("This version is already pending admin approval")
+        elif version["status"] == "approved":
+            blockers.append("This version is already approved")
+        if not annotation.transcript:
+            blockers.append("The source has no transcript segments")
+        unverified = sum(not item.human_verified for item in annotation.transcript)
+        if unverified:
+            blockers.append(f"Verify all transcript segments ({unverified} remaining)")
+        metrics = source_quality_metrics(
+            annotation,
+            self.catalog.overlap_recoveries(source_id),
+        )
+        unresolved = int(metrics["unresolved_flagged_utterances"])
+        if unresolved:
+            blockers.append(f"Resolve {unresolved} blocking quality item(s)")
+        self.ensure_chapter_set(source_id, principal=principal)
+        chapters = self.catalog.source_chapter_completion(source_id, annotation.version)
+        if chapters["total"] == 0:
+            blockers.append("Create the review chapter set")
+        elif chapters["complete"] != chapters["total"]:
+            blockers.append(
+                f"Complete every current chapter ({chapters['complete']}/{chapters['total']})"
+            )
+        if not bool(source["rights_confirmed"]):
+            blockers.append("Confirm source rights")
+        if (
+            annotation.channel_routing_mode == "independent_stereo"
+            and not annotation.channel_routing_verified
+        ):
+            blockers.append("Verify independent stereo channel routing")
+        return {
+            "eligible": not blockers,
+            "blockers": blockers,
+            "annotation_version": annotation.version,
+            "content_fingerprint": version.get("content_fingerprint") if version else None,
+            "corrected_version": version,
+            "verified_segments": len(annotation.transcript) - unverified,
+            "total_segments": len(annotation.transcript),
+            "completed_chapters": chapters["complete"],
+            "total_chapters": chapters["total"],
+        }
+
+    def submit_annotation_approval(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        eligibility = self.annotation_approval_eligibility(
+            source_id,
+            principal=principal,
+        )
+        if not eligibility["eligible"]:
+            raise ValueError("; ".join(eligibility["blockers"]))
+        return self.catalog.submit_annotation_approval(
+            source_id,
+            annotation_version=int(eligibility["annotation_version"]),
+            content_fingerprint=str(eligibility["content_fingerprint"]),
             principal=principal,
         )
 
@@ -582,7 +830,7 @@ class StudioService:
         *,
         principal: PrincipalLike,
     ) -> dict[str, Any]:
-        source = self.catalog.get_source(source_id)
+        source = self.catalog.get_source(source_id, principal=principal)
         annotation = self.catalog.latest_annotation(source_id)
         if annotation.assistant_speaker is None:
             raise ValueError("Choose the Moshi speaker before planning clips")

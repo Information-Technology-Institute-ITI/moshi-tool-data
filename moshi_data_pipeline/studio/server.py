@@ -6,7 +6,7 @@ import os
 import re
 import smtplib
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -44,7 +44,9 @@ from moshi_data_pipeline.studio.dataset_export import (
     build_dataset_archive,
 )
 from moshi_data_pipeline.studio.domain import (
+    AnnotationApprovalDecision,
     AnnotationSave,
+    CorrectedVersionRetentionDecision,
     ProjectCreate,
     ProjectOwnerUpdate,
     ProjectUpdate,
@@ -53,6 +55,7 @@ from moshi_data_pipeline.studio.gpu_dispatcher import GpuDispatcherSettings
 from moshi_data_pipeline.studio.gpu_status import public_gpu_check
 from moshi_data_pipeline.studio.lifecycle import LifecycleProvider
 from moshi_data_pipeline.studio.media import store_upload
+from moshi_data_pipeline.studio.product_contracts import ReviewChapterConfig
 from moshi_data_pipeline.studio.protocol import (
     ClaimRequest,
     JobCompletion,
@@ -179,6 +182,14 @@ def create_studio_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        async def retention_cleanup_loop() -> None:
+            while True:
+                await asyncio.sleep(60 * 60)
+                await asyncio.to_thread(
+                    service.catalog.cleanup_expired_annotation_payloads
+                )
+
+        retention_task = asyncio.create_task(retention_cleanup_loop())
         if start_worker:
             service.worker.start()
         if start_lifecycle:
@@ -188,6 +199,9 @@ def create_studio_app(
         try:
             yield
         finally:
+            retention_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await retention_task
             if start_dispatcher:
                 service.dispatcher.stop()
             if start_worker:
@@ -846,6 +860,25 @@ def create_studio_app(
         require_admin(require_principal(request))
         return {"users": service.catalog.list_active_users()}
 
+    @app.get("/api/admin/annotation-approvals")
+    def list_annotation_approvals(request: Request, status: str | None = None):
+        require_admin(require_principal(request))
+        return {"tasks": service.catalog.annotation_approval_tasks(status)}
+
+    @app.post("/api/admin/annotation-approvals/{task_id}/decision")
+    def decide_annotation_approval(
+        task_id: str,
+        payload: AnnotationApprovalDecision,
+        request: Request,
+    ):
+        principal = require_admin(require_principal(request))
+        return service.catalog.decide_annotation_approval(
+            task_id,
+            payload.decision,
+            payload.note,
+            principal=principal,
+        )
+
     @app.patch("/api/admin/projects/{project_id}/owner")
     def transfer_project_owner(
         project_id: str,
@@ -947,8 +980,66 @@ def create_studio_app(
             raise
 
     @app.get("/api/sources/{source_id}")
-    def get_source(source_id: str):
-        return service.source_detail(source_id)
+    def get_source(source_id: str, request: Request):
+        return service.source_detail(source_id, principal=require_principal(request))
+
+    @app.get("/api/sources/{source_id}/chapters")
+    def get_review_chapters(source_id: str, request: Request):
+        chapter_set = service.ensure_chapter_set(
+            source_id, principal=require_principal(request)
+        )
+        if chapter_set is None:
+            raise ValueError("Initialize the source before creating review chapters")
+        return chapter_set.model_dump(mode="json")
+
+    @app.put("/api/sources/{source_id}/chapters")
+    def configure_review_chapters(
+        source_id: str,
+        payload: ReviewChapterConfig,
+        request: Request,
+    ):
+        chapter_set = service.ensure_chapter_set(
+            source_id,
+            payload,
+            principal=require_principal(request),
+            force=True,
+        )
+        if chapter_set is None:
+            raise ValueError("Initialize the source before creating review chapters")
+        return chapter_set.model_dump(mode="json")
+
+    @app.get("/api/sources/{source_id}/waveform-peaks")
+    def get_waveform_peak_window(
+        source_id: str,
+        start_sample: int = 0,
+        end_sample: int | None = None,
+        max_points: int = 1_200,
+    ):
+        return service.waveform_peak_window(
+            source_id,
+            start_sample=start_sample,
+            end_sample=end_sample,
+            max_points=max_points,
+        ).model_dump(mode="json")
+
+    @app.put("/api/review-chapters/{chapter_id}/review")
+    def update_chapter_review(
+        chapter_id: str,
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+    ):
+        return service.catalog.save_chapter_review(
+            chapter_id,
+            int(payload.get("annotation_version", -1)),
+            str(payload.get("status", "")),
+            principal=require_principal(request),
+        )
+
+    @app.get("/api/sources/{source_id}/chapter-reviews")
+    def get_chapter_reviews(source_id: str, request: Request):
+        principal = require_principal(request)
+        service.catalog.get_source(source_id, principal=principal)
+        return service.catalog.chapter_reviews(source_id, principal=principal)
 
     @app.delete("/api/sources/{source_id}")
     def delete_source(
@@ -996,10 +1087,18 @@ def create_studio_app(
         )
 
     @app.get("/api/sources/{source_id}/annotations")
-    def get_annotation(source_id: str):
+    def get_annotation(source_id: str, request: Request):
+        principal = require_principal(request)
         return {
             "annotation": service.catalog.latest_annotation(source_id).model_dump(mode="json"),
             "revisions": service.catalog.annotation_revisions(source_id),
+            "corrected_versions": service.catalog.corrected_versions(source_id),
+            "current_corrected_version": service.catalog.current_corrected_version(source_id),
+            "machine_transcripts": (
+                service.catalog.machine_transcripts(source_id)
+                if principal.is_admin
+                else []
+            ),
         }
 
     @app.get("/api/sources/{source_id}/annotations/{version}")
@@ -1008,12 +1107,114 @@ def create_studio_app(
 
     @app.put("/api/sources/{source_id}/annotations")
     def save_annotation(source_id: str, payload: AnnotationSave, request: Request):
-        return service.save_annotation(
+        annotation, save_info = service.save_annotation_record(
             source_id,
             payload.expected_version,
             payload.annotation,
             principal=require_principal(request),
-        ).model_dump(mode="json")
+            save_mode=payload.save_mode,
+            expected_content_fingerprint=payload.expected_content_fingerprint,
+        )
+        return {**annotation.model_dump(mode="json"), "_save": save_info}
+
+    @app.get("/api/sources/{source_id}/corrected-versions/{ordinal}")
+    def get_corrected_version(source_id: str, ordinal: int):
+        return service.catalog.corrected_version_annotation(source_id, ordinal).model_dump(
+            mode="json"
+        )
+
+    @app.get("/api/sources/{source_id}/corrected-versions/{ordinal}/recoverable-generations")
+    def get_recoverable_corrected_generations(source_id: str, ordinal: int):
+        return {
+            "generations": service.catalog.recoverable_corrected_generations(
+                source_id, ordinal
+            )
+        }
+
+    @app.post(
+        "/api/sources/{source_id}/corrected-versions/{ordinal}/recoverable-generations/{annotation_version}",
+        status_code=201,
+    )
+    def recover_corrected_generation(
+        source_id: str,
+        ordinal: int,
+        annotation_version: int,
+        request: Request,
+    ):
+        annotation, save_info = service.catalog.recover_corrected_generation(
+            source_id,
+            ordinal,
+            annotation_version,
+            principal=require_principal(request),
+        )
+        return {**annotation.model_dump(mode="json"), "_save": save_info}
+
+    @app.get("/api/sources/{source_id}/machine-transcripts")
+    def get_machine_transcripts(source_id: str, request: Request):
+        require_admin(require_principal(request))
+        return {"machine_transcripts": service.catalog.machine_transcripts(source_id)}
+
+    @app.get("/api/sources/{source_id}/machine-transcripts/{ordinal}/{artifact_kind}")
+    def get_machine_transcript_artifact(
+        source_id: str,
+        ordinal: int,
+        artifact_kind: str,
+        request: Request,
+    ):
+        require_admin(require_principal(request))
+        if artifact_kind not in {"raw", "aligned", "diarization"}:
+            raise KeyError(artifact_kind)
+        value = service.catalog.machine_transcript(source_id, ordinal)
+        relative = value.get(f"{artifact_kind}_snapshot_path")
+        if not relative:
+            raise KeyError(artifact_kind)
+        path = service.paths.resolve_relative(str(relative))
+        if not path.is_file():
+            raise KeyError(artifact_kind)
+        expected_sha256 = (value.get("artifact_manifest") or {}).get(
+            artifact_kind, {}
+        ).get("sha256")
+        if expected_sha256 and service.catalog._file_sha256(path) != expected_sha256:
+            raise RuntimeError("Machine transcript snapshot checksum verification failed")
+        return FileResponse(path, media_type="application/json")
+
+    @app.get("/api/sources/{source_id}/approval-eligibility")
+    def get_annotation_approval_eligibility(source_id: str, request: Request):
+        return service.annotation_approval_eligibility(
+            source_id,
+            principal=require_principal(request),
+        )
+
+    @app.post("/api/sources/{source_id}/approval-submissions", status_code=201)
+    def submit_annotation_approval(source_id: str, request: Request):
+        return service.submit_annotation_approval(
+            source_id,
+            principal=require_principal(request),
+        )
+
+    @app.get("/api/admin/sources/{source_id}/retention")
+    def get_corrected_version_retention(source_id: str, request: Request):
+        require_admin(require_principal(request))
+        return service.catalog.retention_preview(source_id)
+
+    @app.post("/api/admin/sources/{source_id}/retention", status_code=201)
+    def set_corrected_version_retention(
+        source_id: str,
+        payload: CorrectedVersionRetentionDecision,
+        request: Request,
+    ):
+        principal = require_admin(require_principal(request))
+        return service.catalog.record_retention_decision(
+            source_id,
+            payload.mode,
+            payload.backup_reference,
+            principal=principal,
+        )
+
+    @app.post("/api/admin/annotation-retention/cleanup")
+    def cleanup_expired_annotation_payloads(request: Request):
+        require_admin(require_principal(request))
+        return service.catalog.cleanup_expired_annotation_payloads()
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str):

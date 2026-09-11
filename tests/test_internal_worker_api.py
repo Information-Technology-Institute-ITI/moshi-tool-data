@@ -414,7 +414,10 @@ def test_artifact_and_typed_annotation_commit_are_atomic(tmp_path) -> None:
         assert duplicate.status_code == 200, duplicate.text
         assert duplicate.json()["status"] == "complete"
 
-    assert service.catalog.latest_annotation(source["id"]).version == saved.version + 1
+    # The worker artifact commits atomically, but identical annotation content
+    # is a server-side no-op and does not mint a duplicate generation.
+    assert service.catalog.latest_annotation(source["id"]).version == saved.version
+    assert service.catalog.machine_transcripts(source["id"])[0]["ordinal"] == 1
     assert observed_staging == {
         "produced_visible": False,
         "artifact_state": "missing",

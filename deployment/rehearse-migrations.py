@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -33,11 +34,22 @@ def schema_version(connection: sqlite3.Connection) -> int:
 
 
 def snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
+    annotation_digest = hashlib.sha256()
+    for row in connection.execute(
+        "SELECT source_id,version,annotation_json FROM annotation_revisions ORDER BY source_id,version"
+    ):
+        annotation_digest.update(str(row[0]).encode("utf-8"))
+        annotation_digest.update(b"\0")
+        annotation_digest.update(str(row[1]).encode("ascii"))
+        annotation_digest.update(b"\0")
+        annotation_digest.update(str(row[2]).encode("utf-8"))
+        annotation_digest.update(b"\n")
     return {
         "schema_version": schema_version(connection),
         "page_count": int(connection.execute("PRAGMA page_count").fetchone()[0]),
         "page_size": int(connection.execute("PRAGMA page_size").fetchone()[0]),
         "tables": table_counts(connection),
+        "annotation_payload_sha256": annotation_digest.hexdigest(),
     }
 
 
@@ -82,11 +94,18 @@ def main() -> int:
         destination.close()
         source.close()
 
-    counts_preserved = before["tables"] == after["tables"]
+    counts_preserved = all(
+        after["tables"].get(table) == count
+        for table, count in before["tables"].items()
+    )
+    annotation_payloads_preserved = (
+        before["annotation_payload_sha256"] == after["annotation_payload_sha256"]
+    )
     valid = (
         integrity == "ok"
         and not foreign_keys
         and counts_preserved
+        and annotation_payloads_preserved
         and after["schema_version"] == LATEST_SCHEMA_VERSION
     )
     report = {
@@ -97,6 +116,7 @@ def main() -> int:
         "before": before,
         "after": after,
         "counts_preserved": counts_preserved,
+        "annotation_payloads_preserved": annotation_payloads_preserved,
         "integrity_check": integrity,
         "foreign_key_errors": foreign_keys,
         "valid": valid,
@@ -111,4 +131,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ApiError,
   api,
@@ -14,13 +14,17 @@ import {
   watchJob,
 } from "./api";
 import AuthScreen from "./components/AuthScreen";
+import ApprovalQueuePage from "./components/ApprovalQueuePage";
 import ErrorBoundary from "./components/ErrorBoundary";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
 import CommandPalette from "./components/CommandPalette";
+import DraftRecoveryBanner from "./components/DraftRecoveryBanner";
+import ReviewChapterNav from "./components/ReviewChapterNav";
 import ReviewPlayerCard from "./components/ReviewPlayerCard";
 import ReviewToolRail from "./components/ReviewToolRail";
+import ReviewWorkflowPanel from "./components/ReviewWorkflowPanel";
 import TranscriptPanel, { type TranscriptPanelHandle } from "./components/TranscriptPanel";
 import WaveformEditor, {
   type FocusRange,
@@ -31,6 +35,12 @@ import {
   REVIEW_COMMANDS,
   type ReviewCommand,
 } from "./reviewCommands";
+import {
+  DEFAULT_REVIEW_FILTERS,
+  matchesReviewFilters,
+  segmentsInChapter,
+  type ReviewFilters,
+} from "./reviewWorkflow";
 import {
   addAllOverlapSegments,
   addOverlapSegments,
@@ -44,23 +54,30 @@ import {
   splitSegment,
   type SplitPreview,
   chronological,
+  updateSegment,
 } from "./transcript";
 import {
   clearDraftsForUser,
   useAnnotationSaver,
   type Conflict,
 } from "./useAnnotationSaver";
+import { purgeRecoveryDrafts, useDraftRecovery } from "./useDraftRecovery";
 import type {
   AdminUser,
   Annotation,
+  AnnotationApprovalTask,
+  ApprovalEligibility,
   AuthUser,
+  CorrectedVersion,
   Job,
   Project,
+  RecoverableGeneration,
   Source,
   SourceDetail,
   Speaker,
   TranscriptUtterance,
 } from "./types";
+import type { ReviewChapterConfig, ReviewChapterSet } from "./productContracts";
 
 type ProjectDetail = {
   project: Project;
@@ -82,7 +99,7 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [page, setPage] = useState<"workspace" | "gpu">("workspace");
+  const [page, setPage] = useState<"workspace" | "gpu" | "approvals">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
   const studioNavigationGuard = useRef<null | ((action: () => void) => void)>(null);
   const studioDirty = useRef(false);
@@ -245,7 +262,10 @@ function App() {
   async function handleSignout() {
     // Drafts are scoped per user and must never surface for the next person
     // signing in on this browser.
-    if (authUser) clearDraftsForUser(authUser.id);
+    if (authUser) {
+      clearDraftsForUser(authUser.id);
+      await purgeRecoveryDrafts(authUser.id).catch(() => undefined);
+    }
     await run(signout);
     stopWatching.current?.();
     setAuthUser(null);
@@ -294,10 +314,13 @@ function App() {
 
   const view = page === "gpu" && isAdmin ? (
     <GpuStatusPage />
+  ) : page === "approvals" && isAdmin ? (
+    <ApprovalQueuePage setError={setError} />
   ) : source && project ? (
     <Studio
       detail={source}
       project={project}
+      userId={authUser?.id || "local"}
       onBack={() => setSource(null)}
       onDeleted={() => openProject(project.project.id)}
       onJob={monitor}
@@ -351,14 +374,24 @@ function App() {
         </button>
         <div className="top-actions">
           {isAdmin && (
-            <button
-              className={`system-nav ${page === "gpu" ? "active" : ""}`}
-              type="button"
-              aria-current={page === "gpu" ? "page" : undefined}
-              onClick={() => navigate(() => setPage("gpu"))}
-            >
-              GPU status
-            </button>
+            <>
+              <button
+                className={`system-nav ${page === "approvals" ? "active" : ""}`}
+                type="button"
+                aria-current={page === "approvals" ? "page" : undefined}
+                onClick={() => navigate(() => setPage("approvals"))}
+              >
+                Approvals
+              </button>
+              <button
+                className={`system-nav ${page === "gpu" ? "active" : ""}`}
+                type="button"
+                aria-current={page === "gpu" ? "page" : undefined}
+                onClick={() => navigate(() => setPage("gpu"))}
+              >
+                GPU status
+              </button>
+            </>
           )}
           <div className="top-meta">
             <span className="status-dot" />
@@ -1106,11 +1139,41 @@ function annotationContent(annotation: Annotation): string {
   return JSON.stringify(content);
 }
 
+function legacyCorrectedVersions(detail: SourceDetail): CorrectedVersion[] {
+  if (detail.corrected_versions?.length) return detail.corrected_versions;
+  return detail.annotation_revisions.map((revision) => ({
+    id: `legacy-${detail.id}-${revision.version}`,
+    source_id: detail.id,
+    ordinal: revision.version,
+    current_annotation_version: revision.version,
+    generation: 1,
+    content_fingerprint: "",
+    status: "unapproved",
+    created_at: revision.created_at,
+    updated_at: revision.created_at,
+    decision_note: "",
+    retention_state: "keep",
+  }));
+}
+
 type PendingSplit = SplitPreview;
+
+const REVIEW_RAIL_MIN_WIDTH = 280;
+const REVIEW_RAIL_MAX_WIDTH = 560;
+const REVIEW_RAIL_STORAGE_KEY = "moshi-review-tool-rail-width";
+
+function boundedRailWidth(value: number): number {
+  const viewportMaximum = Math.max(
+    REVIEW_RAIL_MIN_WIDTH,
+    Math.min(REVIEW_RAIL_MAX_WIDTH, window.innerWidth - 640),
+  );
+  return Math.round(Math.max(REVIEW_RAIL_MIN_WIDTH, Math.min(viewportMaximum, value)));
+}
 
 function Studio({
   detail,
   project,
+  userId,
   onBack,
   onDeleted,
   onJob,
@@ -1121,6 +1184,7 @@ function Studio({
 }: {
   detail: SourceDetail;
   project: ProjectDetail;
+  userId: string;
   onBack: () => void;
   onDeleted: () => void;
   onJob: (job: Job) => void;
@@ -1131,7 +1195,25 @@ function Studio({
 }) {
   const [annotation, setAnnotation] = useState<Annotation>(detail.annotation);
   const [savedAnnotation, setSavedAnnotation] = useState<Annotation>(detail.annotation);
-  const [revisions, setRevisions] = useState(detail.annotation_revisions);
+  const [versions, setVersions] = useState<CorrectedVersion[]>(legacyCorrectedVersions(detail));
+  const [machineTranscripts, setMachineTranscripts] = useState(detail.machine_transcripts || []);
+  const [approvalEligibility, setApprovalEligibility] = useState<ApprovalEligibility | null>(null);
+  const [submittingApproval, setSubmittingApproval] = useState(false);
+  const [recoverableGenerations, setRecoverableGenerations] = useState<RecoverableGeneration[]>([]);
+  const [chapterSet, setChapterSet] = useState<ReviewChapterSet | null>(
+    detail.chapter_set || null,
+  );
+  const [chapterReviews, setChapterReviews] = useState(detail.chapter_reviews || []);
+  const [reviewFilters, setReviewFilters] = useState<ReviewFilters>(DEFAULT_REVIEW_FILTERS);
+  const [chapterId, setChapterId] = useState<string>(() => {
+    const available = detail.chapter_set?.chapters || [];
+    const requested = new URL(window.location.href).searchParams.get("chapter")
+      || window.sessionStorage.getItem(`review-chapter:${detail.id}`);
+    return available.some((chapter) => chapter.id === requested)
+      ? requested as string
+      : available[0]?.id || "";
+  });
+  const [configuringChapters, setConfiguringChapters] = useState(false);
   const [history, setHistory] = useState<Annotation[]>([]);
   const [future, setFuture] = useState<Annotation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1142,13 +1224,21 @@ function Studio({
   const [regionToDelete, setRegionToDelete] = useState<string | null>(null);
   const [splitPreview, setSplitPreview] = useState<PendingSplit | null>(null);
   const [pendingBounds, setPendingBounds] = useState(false);
+  const [contentDirty, setContentDirty] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<null | (() => void)>(null);
   const [railOpen, setRailOpen] = useState(false);
+  const [railWidth, setRailWidth] = useState(() => {
+    const stored = Number(window.localStorage.getItem(REVIEW_RAIL_STORAGE_KEY));
+    return boundedRailWidth(Number.isFinite(stored) && stored > 0 ? stored : 350);
+  });
   const [commandDialog, setCommandDialog] = useState<"palette" | "help" | null>(null);
+  const [inspectingDraft, setInspectingDraft] = useState(false);
   const [inspectorTarget, setInspectorTarget] = useState<HTMLDivElement | null>(null);
   const [timelineToolsTarget, setTimelineToolsTarget] = useState<HTMLDivElement | null>(null);
   const transcriptPanel = useRef<TranscriptPanelHandle | null>(null);
   const waveformEditor = useRef<WaveformEditorHandle | null>(null);
+  const playheadRef = useRef(0);
+  const playheadTimer = useRef<number | null>(null);
   const focusNonce = useRef(0);
   // True between the first keystroke of a run of typing and the moment it is
   // committed, so a whole edit undoes at once instead of one letter at a time.
@@ -1156,8 +1246,10 @@ function Studio({
 
   const processing = detail.status === "processing";
   const readOnly = processing;
-  const dirty =
-    pendingBounds || annotationContent(annotation) !== annotationContent(savedAnnotation);
+  const dirty = pendingBounds || contentDirty;
+  const currentVersion = versions.find(
+    (value) => value.current_annotation_version === savedAnnotation.version,
+  ) || versions[0] || null;
 
   const saver = useAnnotationSaver({
     sourceId: detail.id,
@@ -1166,11 +1258,90 @@ function Studio({
   });
   const saving = saver.status === "saving";
   const locked = readOnly || saving || !!splitPreview;
+  const recovery = useDraftRecovery({
+    userId,
+    sourceId: detail.id,
+    baseRevision: savedAnnotation.version,
+    annotation,
+    dirty,
+    enabled: detail.local_drafts_enabled !== false,
+  });
+
+  async function refreshVersionState() {
+    const [versionEnvelope, eligibility] = await Promise.all([
+      api<{
+        corrected_versions: CorrectedVersion[];
+        machine_transcripts: SourceDetail["machine_transcripts"];
+      }>(`/api/sources/${detail.id}/annotations`),
+      api<ApprovalEligibility>(`/api/sources/${detail.id}/approval-eligibility`),
+    ]);
+    setVersions(versionEnvelope.corrected_versions || []);
+    setMachineTranscripts(versionEnvelope.machine_transcripts || []);
+    setApprovalEligibility(eligibility);
+  }
+
+  useEffect(() => {
+    let active = true;
+    api<ApprovalEligibility>(`/api/sources/${detail.id}/approval-eligibility`)
+      .then((value) => {
+        if (active) setApprovalEligibility(value);
+      })
+      .catch(() => {
+        if (active) setApprovalEligibility(null);
+      });
+    return () => { active = false; };
+  }, [detail.id, savedAnnotation.version]);
+
+  useEffect(() => {
+    if (!currentVersion) {
+      setRecoverableGenerations([]);
+      return;
+    }
+    let active = true;
+    api<{ generations: RecoverableGeneration[] }>(
+      `/api/sources/${detail.id}/corrected-versions/${currentVersion.ordinal}/recoverable-generations`,
+    )
+      .then((value) => {
+        if (active) setRecoverableGenerations(value.generations);
+      })
+      .catch(() => {
+        if (active) setRecoverableGenerations([]);
+      });
+    return () => { active = false; };
+  }, [currentVersion?.id, currentVersion?.generation, detail.id]);
+
+  function changeRailWidth(width: number) {
+    const next = boundedRailWidth(width);
+    setRailWidth(next);
+    window.localStorage.setItem(REVIEW_RAIL_STORAGE_KEY, String(next));
+  }
+
+  useEffect(() => {
+    const keepRailInBounds = () => setRailWidth((current) => boundedRailWidth(current));
+    window.addEventListener("resize", keepRailInBounds);
+    return () => window.removeEventListener("resize", keepRailInBounds);
+  }, []);
 
   useEffect(() => {
     setAnnotation(detail.annotation);
     setSavedAnnotation(detail.annotation);
-    setRevisions(detail.annotation_revisions);
+    setVersions(legacyCorrectedVersions(detail));
+    setMachineTranscripts(detail.machine_transcripts || []);
+    setApprovalEligibility(null);
+    setRecoverableGenerations([]);
+    setChapterSet(detail.chapter_set || null);
+    setChapterReviews(detail.chapter_reviews || []);
+    setReviewFilters(DEFAULT_REVIEW_FILTERS);
+    setChapterId((current) => {
+      const available = detail.chapter_set?.chapters || [];
+      const stored = window.sessionStorage.getItem(`review-chapter:${detail.id}`);
+      const requested = new URL(window.location.href).searchParams.get("chapter")
+        || stored
+        || current;
+      return available.some((chapter) => chapter.id === requested)
+        ? requested
+        : available[0]?.id || "";
+    });
     setHistory([]);
     setFuture([]);
     setSelectedId(null);
@@ -1180,11 +1351,41 @@ function Studio({
     setConflict(null);
     setSplitPreview(null);
     setPendingBounds(false);
+    setContentDirty(false);
     setRailOpen(false);
     setCommandDialog(null);
+    setInspectingDraft(false);
     typing.current = false;
     saver.reset();
   }, [detail.id, detail.annotation.version]);
+
+  useEffect(() => () => {
+    if (playheadTimer.current !== null) window.clearTimeout(playheadTimer.current);
+  }, []);
+
+  function updatePlayhead(sample: number) {
+    playheadRef.current = sample;
+    if (playheadTimer.current !== null) return;
+    playheadTimer.current = window.setTimeout(() => {
+      playheadTimer.current = null;
+      setPlayhead(playheadRef.current);
+      const matchingChapter = chapterSet?.chapters.find((chapter) => (
+        chapter.start_sample <= playheadRef.current
+        && playheadRef.current < chapter.end_sample
+      )) || chapterSet?.chapters.at(-1);
+      if (matchingChapter) setChapterId((current) => (
+        current === matchingChapter.id ? current : matchingChapter.id
+      ));
+    }, 160);
+  }
+
+  useEffect(() => {
+    if (!chapterId) return;
+    window.sessionStorage.setItem(`review-chapter:${detail.id}`, chapterId);
+    const url = new URL(window.location.href);
+    url.searchParams.set("chapter", chapterId);
+    window.history.replaceState(window.history.state, "", url);
+  }, [chapterId, detail.id]);
 
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
 
@@ -1220,6 +1421,7 @@ function Studio({
     setHistory((values) => [...values.slice(-49), annotation]);
     setFuture([]);
     setAnnotation(next);
+    setContentDirty(annotationContent(next) !== annotationContent(savedAnnotation));
   }
 
   /** Records one local, undoable edit. */
@@ -1240,6 +1442,7 @@ function Studio({
     }
     setFuture([]);
     setAnnotation(next);
+    setContentDirty(annotationContent(next) !== annotationContent(savedAnnotation));
   }
 
   /** Ends a run of typing without saving it. */
@@ -1256,6 +1459,7 @@ function Studio({
     setHistory((values) => values.slice(0, -1));
     const restored = { ...previous, version: annotation.version };
     setAnnotation(restored);
+    setContentDirty(annotationContent(restored) !== annotationContent(savedAnnotation));
   }
 
   function redo() {
@@ -1267,6 +1471,7 @@ function Studio({
     setFuture((values) => values.slice(1));
     const restored = { ...next, version: annotation.version };
     setAnnotation(restored);
+    setContentDirty(annotationContent(restored) !== annotationContent(savedAnnotation));
   }
 
   /** Plays the exact segment range once or continuously through the shared controller. */
@@ -1331,7 +1536,7 @@ function Studio({
   }
 
   function addSegmentAtPlayhead() {
-    const start = Math.max(0, playhead);
+    const start = Math.max(0, playheadRef.current);
     const limit = detail.duration_samples || start + 2 * 24_000;
     const end = Math.min(limit, start + 2 * 24_000);
     if (end <= start) {
@@ -1430,7 +1635,7 @@ function Studio({
     setNotice("Segment deleted. Undo restores it.");
   }
 
-  async function saveNow() {
+  async function saveNow(mode: "update" | "new_version" = "update") {
     if (readOnly || saving || splitPreview || saver.isSaving()) return;
     const prepared = transcriptPanel.current?.prepareForSave() ?? annotation;
     if (!prepared) {
@@ -1442,17 +1647,78 @@ function Studio({
       applyLocalEdit(prepared);
       snapshot = prepared;
     }
-    if (annotationContent(snapshot) === annotationContent(savedAnnotation)) return;
-    const saved = await saver.save(snapshot);
+    if (annotationContent(snapshot) === annotationContent(savedAnnotation)) {
+      setContentDirty(false);
+      return;
+    }
+    const saved = await saver.save(
+      snapshot,
+      mode,
+      currentVersion?.content_fingerprint,
+    );
     if (!saved) return;
-    setAnnotation(saved);
-    setSavedAnnotation(saved);
+    const { _save: receivedSaveInfo, ...savedValue } = saved;
+    const saveInfo = receivedSaveInfo || {
+      no_op: false,
+      created_new_version: mode === "new_version" || !currentVersion,
+      content_fingerprint: "",
+      corrected_version: {
+        id: `legacy-${detail.id}-${savedValue.version}`,
+        source_id: detail.id,
+        ordinal: mode === "new_version"
+          ? Math.max(0, ...versions.map((value) => value.ordinal)) + 1
+          : currentVersion?.ordinal || savedValue.version,
+        current_annotation_version: savedValue.version,
+        generation: (currentVersion?.generation || 0) + 1,
+        content_fingerprint: "",
+        status: "unapproved" as const,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        decision_note: "",
+        retention_state: "keep" as const,
+      },
+    };
+    setAnnotation(savedValue);
+    setSavedAnnotation(savedValue);
+    setContentDirty(false);
     setPendingBounds(false);
-    setRevisions((values) => [
-      { version: saved.version, created_at: new Date().toISOString() },
-      ...values.filter((value) => value.version !== saved.version),
-    ]);
-    setNotice(`Annotation revision ${saved.version} saved`);
+    await recovery.purge();
+    setVersions((values) => [
+      saveInfo.corrected_version,
+      ...values.filter((value) => value.id !== saveInfo.corrected_version.id),
+    ].sort((left, right) => right.ordinal - left.ordinal));
+    try {
+      const refreshedChapters = await api<ReviewChapterSet>(`/api/sources/${detail.id}/chapters`);
+      setChapterSet(refreshedChapters);
+      setChapterId((current) => (
+        refreshedChapters.chapters.some((chapter) => chapter.id === current)
+          ? current
+          : refreshedChapters.chapters[0]?.id || ""
+      ));
+    } catch {
+      // The annotation remains safely saved if chapter refresh is temporarily unavailable.
+    }
+    await refreshVersionState().catch(() => undefined);
+    setNotice(
+      saveInfo.no_op
+        ? `V${saveInfo.corrected_version.ordinal} already contains these changes.`
+        : saveInfo.created_new_version
+          ? `Corrected version V${saveInfo.corrected_version.ordinal} created.`
+          : `Corrected version V${saveInfo.corrected_version.ordinal} saved.`,
+    );
+  }
+
+  function verifySegment(id: string, moveNext: boolean) {
+    const segment = annotation.transcript.find((item) => item.id === id);
+    if (!segment || locked) return;
+    const next = visibleSegments[visibleSegments.findIndex((item) => item.id === id) + 1];
+    edit(updateSegment(annotation, id, {
+      human_verified: moveNext ? true : !segment.human_verified,
+    }));
+    if (moveNext && next) {
+      setSelectedId(next.id);
+      playSegment(next, false);
+    }
   }
 
   async function deleteSource() {
@@ -1471,14 +1737,45 @@ function Studio({
     }
   }
 
-  async function restoreRevision(version: number) {
+  function selectChapter(id: string) {
+    const chapter = chapterSet?.chapters.find((candidate) => candidate.id === id);
+    if (!chapter) return;
+    commitEdit();
+    setChapterId(id);
+    setSelectedId(null);
+    setFilteredIds(null);
+    waveformEditor.current?.seekToSample(chapter.start_sample);
+  }
+
+  async function configureChapters(config: ReviewChapterConfig) {
+    if (configuringChapters) return;
+    setConfiguringChapters(true);
+    try {
+      const value = await api<ReviewChapterSet>(
+        `/api/sources/${detail.id}/chapters`,
+        jsonRequest("PUT", config),
+      );
+      setChapterSet(value);
+      setChapterId(value.chapters[0]?.id || "");
+      setSelectedId(null);
+      setFilteredIds(null);
+      waveformEditor.current?.seekToSample(value.chapters[0]?.start_sample || 0);
+      setNotice(`Divided into ${value.chapters.length} review chapters.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setConfiguringChapters(false);
+    }
+  }
+
+  async function restoreVersion(ordinal: number) {
     if (locked || saver.isSaving()) return;
     try {
       const previous = await api<Annotation>(
-        `/api/sources/${detail.id}/annotations/${version}`,
+        `/api/sources/${detail.id}/corrected-versions/${ordinal}`,
       );
       edit({ ...previous, version: annotation.version });
-      setNotice(`Revision ${version} loaded as unsaved changes. Click Save to keep it.`);
+      setNotice(`V${ordinal} loaded as unsaved changes. Choose Save or Save as new version.`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -1505,8 +1802,22 @@ function Studio({
       job.kind === "initialize" && job.source_id === detail.id && job.status === "failed",
   );
 
+  const activeChapter = chapterSet?.chapters.find((chapter) => chapter.id === chapterId)
+    || chapterSet?.chapters[0]
+    || null;
+  const chapterSegmentIds = activeChapter
+    ? segmentsInChapter(annotation.transcript, activeChapter).map((segment) => segment.id)
+    : null;
+  const workflowSegmentIds = annotation.transcript
+    .filter((segment) => matchesReviewFilters(annotation, segment, reviewFilters))
+    .map((segment) => segment.id);
+  const visibleIds = chapterSegmentIds
+    ? chapterSegmentIds.filter((id) => (
+      (!filteredIds || filteredIds.includes(id)) && workflowSegmentIds.includes(id)
+    ))
+    : (filteredIds || workflowSegmentIds).filter((id) => workflowSegmentIds.includes(id));
   const visibleSegments = chronological(annotation.transcript).filter(
-    (segment) => !filteredIds || filteredIds.includes(segment.id),
+    (segment) => !visibleIds || visibleIds.includes(segment.id),
   );
   const selectedPosition = visibleSegments.findIndex((segment) => segment.id === selectedId);
   const selectedSegment = selectedPosition >= 0 ? visibleSegments[selectedPosition] : null;
@@ -1528,6 +1839,94 @@ function Studio({
     setSelectedId(segment.id);
     playSegment(segment, false);
   }
+
+  async function recoverGeneration(annotationVersion: number) {
+    if (!currentVersion || locked || dirty) return;
+    if (!window.confirm(
+      `Replace V${currentVersion.ordinal} with the selected earlier save? The current generation will remain recoverable for 10 days.`,
+    )) return;
+    try {
+      const recovered = await api<Annotation & { _save?: unknown }>(
+        `/api/sources/${detail.id}/corrected-versions/${currentVersion.ordinal}/recoverable-generations/${annotationVersion}`,
+        jsonRequest("POST"),
+      );
+      const { _save: _saveInfo, ...value } = recovered;
+      setAnnotation(value);
+      setSavedAnnotation(value);
+      setContentDirty(false);
+      setHistory([]);
+      setFuture([]);
+      await recovery.purge();
+      await refreshVersionState();
+      const refreshedChapters = await api<ReviewChapterSet>(
+        `/api/sources/${detail.id}/chapters`,
+      );
+      setChapterSet(refreshedChapters);
+      setChapterId(refreshedChapters.chapters[0]?.id || "");
+      setChapterReviews([]);
+      setNotice(`Recovered an earlier save into V${currentVersion.ordinal}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  function openQualitySegment(id: string) {
+    const segment = annotation.transcript.find((item) => item.id === id);
+    if (!segment) return;
+    const chapter = chapterSet?.chapters.find((item) => (
+      segment.start_sample >= item.start_sample && segment.start_sample < item.end_sample
+    ));
+    if (chapter) setChapterId(chapter.id);
+    setReviewFilters(DEFAULT_REVIEW_FILTERS);
+    setFilteredIds(null);
+    setSelectedId(id);
+    waveformEditor.current?.seekToSample(segment.start_sample);
+  }
+
+  async function completeActiveChapter() {
+    if (!activeChapter || !chapterSet || dirty || saving) return;
+    try {
+      const review = await api<NonNullable<SourceDetail["chapter_reviews"]>[number]>(
+        `/api/review-chapters/${activeChapter.id}/review`,
+        jsonRequest("PUT", {
+          annotation_version: chapterSet.annotation_version,
+          status: "complete",
+        }),
+      );
+      setChapterReviews((values) => [
+        ...values.filter((item) => item.chapter_id !== review.chapter_id),
+        { ...review, stale: false },
+      ]);
+      setNotice(`Chapter ${activeChapter.ordinal} marked complete.`);
+      await refreshVersionState().catch(() => undefined);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function submitForApproval() {
+    if (dirty || submittingApproval || !approvalEligibility?.eligible) return;
+    setSubmittingApproval(true);
+    try {
+      const task = await api<AnnotationApprovalTask>(
+        `/api/sources/${detail.id}/approval-submissions`,
+        jsonRequest("POST"),
+      );
+      await refreshVersionState();
+      setNotice(`V${task.corrected_version_ordinal} submitted for admin approval.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSubmittingApproval(false);
+    }
+  }
+
+  const activeChapterSegments = activeChapter
+    ? segmentsInChapter(chronological(annotation.transcript), activeChapter)
+    : chronological(annotation.transcript);
+  const activeChapterReview = activeChapter
+    ? chapterReviews.find((review) => review.chapter_id === activeChapter.id)
+    : undefined;
 
   const commandRuns: Record<(typeof REVIEW_COMMANDS)[number]["id"], () => void> = {
     save: () => void saveNow(),
@@ -1643,17 +2042,23 @@ function Studio({
         ? "Save failed — changes unsaved"
         : dirty
           ? "Unsaved changes"
-          : `Saved · v${savedAnnotation.version}`;
+          : currentVersion
+            ? `Saved · V${currentVersion.ordinal}`
+            : "No corrected version saved";
   const saveTone = saving ? "saving" : saver.status === "failed" ? "failed" : dirty ? "dirty" : "saved";
 
   return (
-    <section className="studio-page">
+    <section
+      className="studio-page"
+      style={{ "--review-rail-width": `${railWidth}px` } as CSSProperties}
+    >
       <ReviewToolRail
         open={railOpen}
+        width={railWidth}
         projectName={project.project.name}
         sourceName={detail.original_name}
         durationSamples={detail.duration_samples || 0}
-        savedVersion={savedAnnotation.version}
+        currentVersion={currentVersion}
         segmentCount={annotation.transcript.length}
         saveLabel={saveLabel}
         saveTone={saveTone}
@@ -1662,19 +2067,44 @@ function Studio({
         saving={saving}
         canUndo={!!history.length}
         canRedo={!!future.length}
-        revisions={revisions}
+        versions={versions}
+        machineTranscripts={machineTranscripts}
+        approvalEligibility={approvalEligibility}
+        submittingApproval={submittingApproval}
+        recoverableGenerations={recoverableGenerations}
         onClose={() => setRailOpen(false)}
         onBack={() => void leave(onBack)}
         onUndo={undo}
         onRedo={redo}
-        onSave={() => void saveNow()}
-        onRestore={(version) => void restoreRevision(version)}
+        onSave={(mode) => void saveNow(mode)}
+        onRestore={(ordinal) => void restoreVersion(ordinal)}
         onDelete={() => void deleteSource()}
         onOpenPalette={() => setCommandDialog("palette")}
         onOpenHelp={() => setCommandDialog("help")}
         onPause={() => waveformEditor.current?.pausePlayback()}
+        onSubmitApproval={() => void submitForApproval()}
+        onRecoverGeneration={(annotationVersion) => void recoverGeneration(annotationVersion)}
+        onWidthChange={changeRailWidth}
         inspectorRef={setInspectorTarget}
         timelineToolsRef={setTimelineToolsTarget}
+        workflowTools={(
+          <ReviewWorkflowPanel
+            annotation={annotation}
+            chapterSegments={activeChapterSegments}
+            filters={reviewFilters}
+            savedQueueCount={detail.quality_dashboard?.review_queue?.length || 0}
+            reviewStatus={activeChapterReview?.status || "not_started"}
+            reviewStale={!!activeChapterReview && (
+              activeChapterReview.stale
+              || activeChapterReview.annotation_version !== savedAnnotation.version
+              || dirty
+            )}
+            disabled={locked || dirty || chapterSet?.annotation_version !== savedAnnotation.version}
+            onFilters={setReviewFilters}
+            onOpenSegment={openQualitySegment}
+            onCompleteChapter={() => void completeActiveChapter()}
+          />
+        )}
       />
       <div className="studio-main">
         <button type="button" className="review-tools-toggle" onClick={() => setRailOpen(true)}>
@@ -1685,19 +2115,39 @@ function Studio({
             Preparing this source. Editing unlocks when the result is committed.
           </div>
         )}
+        {recovery.draft && (
+          <DraftRecoveryBanner
+            draft={recovery.draft}
+            conflict={recovery.conflict}
+            inspecting={inspectingDraft}
+            onInspect={() => setInspectingDraft((value) => !value)}
+            onRestore={() => {
+              if (!recovery.draft || recovery.conflict) return;
+              applyLocalEdit({ ...recovery.draft.annotation, version: savedAnnotation.version });
+              recovery.dismiss();
+              setNotice("Local recovery draft restored. Review it, then click Save when ready.");
+            }}
+            onDiscard={() => void recovery.purge()}
+          />
+        )}
 
         <ReviewPlayerCard processing={processing}>
           <WaveformEditor
             ref={waveformEditor}
             audioUrl={detail.urls.canonical_audio}
+            channelAudioUrl={detail.urls.canonical_channels}
+            peaksUrl={detail.urls.peaks
+              ? `/api/sources/${detail.id}/waveform-peaks?max_points=4000`
+              : null}
             videoUrl={detail.urls.video_proxy}
             annotation={annotation}
             durationSamples={detail.duration_samples || 0}
+            timelineRange={activeChapter}
             frameRate={detail.inspection?.video_frame_rate || 25}
             readOnly={locked}
             focusRange={focusRange}
             toolTarget={timelineToolsTarget}
-            onTimeChange={setPlayhead}
+            onTimeChange={updatePlayhead}
             onRegionClick={focusRegion}
             onRegionDelete={setRegionToDelete}
             onChange={edit}
@@ -1705,12 +2155,27 @@ function Studio({
         </ReviewPlayerCard>
 
         <section className="review-segments-card card" aria-label="Transcript segments">
+          {chapterSet && activeChapter && (
+            <ReviewChapterNav
+              chapterSet={chapterSet}
+              currentId={activeChapter.id}
+              segments={annotation.transcript}
+              disabled={saving}
+              configuring={configuringChapters}
+              showPeakWindow={!!detail.urls.peaks}
+              onSelect={selectChapter}
+              onSeek={(sample) => waveformEditor.current?.seekToSample(sample)}
+              onConfigure={(config) => void configureChapters(config)}
+            />
+          )}
           <TranscriptPanel
             ref={transcriptPanel}
             annotation={annotation}
             durationSamples={detail.duration_samples || 0}
             selectedId={selectedId}
-            filteredIds={filteredIds}
+            filteredIds={visibleIds}
+            chapterSegmentCount={activeChapterSegments.length}
+            canClearFilter={filteredIds !== null || reviewFilters !== DEFAULT_REVIEW_FILTERS}
             playheadSample={playhead}
             readOnly={locked}
             onSelect={(id) => {
@@ -1727,8 +2192,12 @@ function Studio({
             onAddAllOverlaps={addAllOverlaps}
             onJoin={joinWith}
             onDelete={removeSegment}
+            onVerify={verifySegment}
             onAdd={addSegmentAtPlayhead}
-            onClearFilter={() => setFilteredIds(null)}
+            onClearFilter={() => {
+              setFilteredIds(null);
+              setReviewFilters(DEFAULT_REVIEW_FILTERS);
+            }}
             onPendingBoundsChange={setPendingBounds}
             inspectorTarget={inspectorTarget}
           />
@@ -1760,22 +2229,22 @@ function Studio({
             setConflict(null);
             setSavedAnnotation(conflict.server);
             setAnnotation(rebased);
+            setContentDirty(true);
             saver.reset();
-            setNotice("Your edits are still unsaved. Click Save to replace the latest revision.");
+            void refreshVersionState().catch(() => undefined);
+            setNotice("Your edits are still unsaved. Click Save to update the current version.");
           }}
           onTakeServer={() => {
             setConflict(null);
             setAnnotation(conflict.server);
             setSavedAnnotation(conflict.server);
+            setContentDirty(false);
             setHistory([]);
             setFuture([]);
             setPendingBounds(false);
-            setRevisions((values) => [
-              { version: conflict.server.version, created_at: new Date().toISOString() },
-              ...values.filter((value) => value.version !== conflict.server.version),
-            ]);
+            void refreshVersionState().catch(() => undefined);
             saver.reset();
-            setNotice("The server revision was loaded.");
+            setNotice("The current server version was loaded.");
           }}
         />
       )}

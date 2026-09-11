@@ -4,7 +4,7 @@ import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
 import type { ActivityRegion, Annotation, ExclusionRegion, Speaker } from "../types";
 import { sampleId, seconds } from "../api";
-import type { PlaybackRange } from "../productContracts";
+import type { PlaybackRange, PlaybackState, SampleRange } from "../productContracts";
 import {
   PLAYBACK_SAMPLE_RATE,
   PlaybackController,
@@ -28,9 +28,13 @@ export type FocusRange = PlaybackRange & {
 
 type Props = {
   audioUrl: string;
+  channelAudioUrl?: string | null;
+  peaksUrl?: string | null;
   videoUrl?: string | null;
   annotation: Annotation;
   durationSamples: number;
+  /** The chapter shown across the full waveform and speaker-lane width. */
+  timelineRange?: SampleRange | null;
   frameRate: number;
   onChange: (annotation: Annotation) => void;
   /** Seek, and optionally loop, the given original-audio range. */
@@ -58,15 +62,19 @@ export type WaveformEditorHandle = {
   pausePlayback: () => void;
   togglePlayback: () => void;
   seekBySeconds: (seconds: number) => void;
+  seekToSample: (sample: number) => void;
   beginSelection: () => void;
   finishActivity: (speaker: Speaker) => void;
 };
 
 const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function WaveformEditor({
   audioUrl,
+  channelAudioUrl,
+  peaksUrl,
   videoUrl,
   annotation,
   durationSamples,
+  timelineRange,
   frameRate,
   onChange,
   focusRange,
@@ -82,6 +90,7 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
   const playbackController = useRef<PlaybackController | null>(null);
   const waveReady = useRef(false);
   const regions = useRef<RegionsPlugin | null>(null);
+  const channelGains = useRef<[GainNode, GainNode] | null>(null);
   const annotationRef = useRef(annotation);
   // Held in refs because the WaveSurfer instance is created once per audioUrl
   // and its listeners would otherwise capture the first render's callbacks.
@@ -93,7 +102,9 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
   // State, not just the ref, because the regions are drawn from an effect that
   // has to re-run the moment the audio is decoded.
   const [ready, setReady] = useState(false);
-  const [zoom, setZoom] = useState(35);
+  const [peakData, setPeakData] = useState<number[] | null>(null);
+  const [peaksResolved, setPeaksResolved] = useState(!peaksUrl);
+  const [zoom, setZoom] = useState(1);
   const [anchor, setAnchor] = useState<number | null>(null);
   const [playback, setPlayback] = useState<PlaybackSnapshot>({
     status: "loading",
@@ -103,29 +114,97 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     audition_mode: "mixed",
     error: null,
   });
+  const pixelsPerSecond = useRef(1);
+  const timelineViewport = useRef({ startSample: 0, endSample: durationSamples });
 
   annotationRef.current = annotation;
   onTimeRef.current = onTimeChange;
   onRegionClickRef.current = onRegionClick;
   readOnlyRef.current = readOnly;
+  const auditionAvailable = !!channelAudioUrl
+    && annotation.channel_routing_mode === "independent_stereo"
+    && annotation.channel_routing_verified;
+  const playbackAudioUrl = auditionAvailable ? channelAudioUrl : audioUrl;
+  const timelineStart = Math.max(0, Math.min(
+    durationSamples,
+    timelineRange?.start_sample ?? 0,
+  ));
+  const timelineEnd = Math.max(
+    timelineStart + 1,
+    Math.min(durationSamples, timelineRange?.end_sample ?? durationSamples),
+  );
+  const timelineDuration = Math.max(1, timelineEnd - timelineStart);
+  timelineViewport.current = { startSample: timelineStart, endSample: timelineEnd };
 
   useEffect(() => {
-    if (!container.current) return;
+    let cancelled = false;
+    if (!peaksUrl) {
+      setPeakData(null);
+      setPeaksResolved(true);
+      return () => { cancelled = true; };
+    }
+    setPeaksResolved(false);
+    void fetch(peaksUrl, { credentials: "same-origin" })
+      .then((response) => {
+        if (!response.ok) throw new Error("Waveform overview is unavailable");
+        return response.json() as Promise<{ points?: [number, number][] }>;
+      })
+      .then((payload) => {
+        if (!cancelled) setPeakData((payload.points || []).flat());
+      })
+      .catch(() => {
+        if (!cancelled) setPeakData(null);
+      })
+      .finally(() => {
+        if (!cancelled) setPeaksResolved(true);
+      });
+    return () => { cancelled = true; };
+  }, [peaksUrl]);
+
+  useEffect(() => {
+    if (!container.current || !peaksResolved) return;
     const regionPlugin = RegionsPlugin.create();
     const instance = WaveSurfer.create({
       container: container.current,
-      url: audioUrl,
+      url: playbackAudioUrl,
       height: 72,
       waveColor: "#324052",
       progressColor: "#e7f6f2",
       cursorColor: "#f4d35e",
       normalize: true,
-      minPxPerSec: zoom,
+      minPxPerSec: 1,
+      autoCenter: false,
       plugins: [regionPlugin],
+      ...(peakData?.length
+        ? { peaks: [peakData], duration: durationSamples / SAMPLE_RATE }
+        : {}),
     });
+    let audioContext: AudioContext | null = null;
+    if (auditionAvailable && typeof instance.getMediaElement === "function" && window.AudioContext) {
+      try {
+        audioContext = new window.AudioContext();
+        const source = audioContext.createMediaElementSource(instance.getMediaElement());
+        const splitter = audioContext.createChannelSplitter(2);
+        const left = audioContext.createGain();
+        const right = audioContext.createGain();
+        source.connect(splitter);
+        splitter.connect(left, 0);
+        splitter.connect(right, 1);
+        left.connect(audioContext.destination);
+        right.connect(audioContext.destination);
+        channelGains.current = [left, right];
+      } catch {
+        void audioContext?.close();
+        audioContext = null;
+        channelGains.current = null;
+      }
+    }
     const controller = new PlaybackController(
       {
-        play: (stopAt) => instance.play(undefined, stopAt),
+        play: async (stopAt) => {
+          if (audioContext?.state === "suspended") await audioContext.resume();
+          await instance.play(undefined, stopAt);
+        },
         pause: () => instance.pause(),
         setTime: (time) => instance.setTime(time),
         getCurrentTime: () => instance.getCurrentTime(),
@@ -146,7 +225,6 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     regions.current = regionPlugin;
     instance.on("ready", () => {
       waveReady.current = true;
-      instance.zoom(zoom);
       setReady(true);
       void controller.markReady();
     });
@@ -156,12 +234,27 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     instance.on("pause", () => controller.handleAudioPause());
     instance.on("finish", () => controller.handleAudioEnded());
     instance.on("error", (error) => controller.markError(error));
+    instance.on("scroll", (visibleStartTime) => {
+      const viewport = timelineViewport.current;
+      const minimum = viewport.startSample / SAMPLE_RATE;
+      const visibleSeconds = container.current
+        ? container.current.clientWidth / pixelsPerSecond.current
+        : 0;
+      const maximum = Math.max(minimum, viewport.endSample / SAMPLE_RATE - visibleSeconds);
+      const bounded = Math.max(minimum, Math.min(maximum, visibleStartTime));
+      if (Math.abs(bounded - visibleStartTime) > 0.001) instance.setScrollTime(bounded);
+    });
     const wrapper = instance.getWrapper();
     const prepareWaveformSeek = (event: MouseEvent) => {
       const rect = wrapper.getBoundingClientRect();
-      const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+      const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
       controller.prepareExternalSeek(
-        Math.round(Math.max(0, Math.min(1, ratio)) * instance.getDuration() * SAMPLE_RATE),
+        Math.round(
+          Math.max(0, Math.min(
+            durationSamples,
+            ((instance.getScroll() + localX) / pixelsPerSecond.current) * SAMPLE_RATE,
+          )),
+        ),
       );
     };
     wrapper.addEventListener("click", prepareWaveformSeek, { capture: true });
@@ -171,11 +264,15 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
       // the waveform wrapper, which has not happened yet at this point.
       const wrapper = instance.getWrapper();
       const rect = wrapper.getBoundingClientRect();
-      const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
-      const bounded = Math.max(0, Math.min(1, ratio));
+      const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
       onRegionClickRef.current?.(
         region.id,
-        Math.round(bounded * instance.getDuration() * SAMPLE_RATE),
+        Math.round(
+          Math.max(0, Math.min(
+            durationSamples,
+            ((instance.getScroll() + localX) / pixelsPerSecond.current) * SAMPLE_RATE,
+          )),
+        ),
       );
     });
     return () => {
@@ -183,17 +280,46 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
       wrapper.removeEventListener("click", prepareWaveformSeek, { capture: true });
       controller.destroy();
       instance.destroy();
+      channelGains.current = null;
+      void audioContext?.close();
       wave.current = null;
       playbackController.current = null;
       waveReady.current = false;
       regions.current = null;
       setReady(false);
     };
-  }, [audioUrl, durationSamples]);
+  }, [auditionAvailable, durationSamples, peakData, peaksResolved, playbackAudioUrl]);
 
   useEffect(() => {
-    if (waveReady.current) wave.current?.zoom(zoom);
-  }, [zoom]);
+    const gains = channelGains.current;
+    if (!gains) return;
+    const mappedChannel = playback.audition_mode === "speaker_a"
+      ? annotation.speaker_channel_map.A
+      : playback.audition_mode === "speaker_b"
+        ? annotation.speaker_channel_map.B
+        : undefined;
+    const leftOnly = playback.audition_mode === "left" || mappedChannel === 0;
+    const rightOnly = playback.audition_mode === "right" || mappedChannel === 1;
+    gains[0].gain.value = rightOnly ? 0 : 1;
+    gains[1].gain.value = leftOnly ? 0 : 1;
+  }, [annotation.speaker_channel_map.A, annotation.speaker_channel_map.B, playback.audition_mode]);
+
+  useEffect(() => {
+    if (!ready || !wave.current || !container.current) return;
+    const instance = wave.current;
+    const applyTimeline = () => {
+      const chapterSeconds = timelineDuration / SAMPLE_RATE;
+      const fitPixelsPerSecond = Math.max(0.05, container.current!.clientWidth / chapterSeconds);
+      pixelsPerSecond.current = fitPixelsPerSecond * zoom;
+      instance.zoom(pixelsPerSecond.current);
+      instance.setScrollTime(timelineStart / SAMPLE_RATE);
+    };
+    applyTimeline();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(applyTimeline);
+    observer.observe(container.current);
+    return () => observer.disconnect();
+  }, [ready, timelineDuration, timelineStart, zoom]);
 
   // Selecting a transcript entry moves the playhead to its start and, when
   // asked, loops its original-audio range. This never alters stored data.
@@ -329,6 +455,7 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     pausePlayback: () => playbackController.current?.pause(),
     togglePlayback: () => void playbackController.current?.toggle(),
     seekBySeconds: (delta) => seekRelative(delta),
+    seekToSample: (sample) => playbackController.current?.seekToSample(sample),
     beginSelection,
     finishActivity,
   }));
@@ -341,10 +468,26 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
       ]
     : null;
 
-  const playheadPosition = `${Math.max(
-    0,
-    Math.min(100, durationSamples > 0 ? ((current * SAMPLE_RATE) / durationSamples) * 100 : 0),
-  )}%`;
+  const playheadInTimeline = playback.current_sample >= timelineStart
+    && playback.current_sample <= timelineEnd;
+  const playheadPosition = `${Math.max(0, Math.min(
+    100,
+    ((playback.current_sample - timelineStart) / timelineDuration) * 100,
+  ))}%`;
+  const visibleActivities = annotation.activities.filter((item) => (
+    item.end_sample > timelineStart && item.start_sample < timelineEnd
+  ));
+  const visibleExclusions = annotation.exclusions.filter((item) => (
+    item.end_sample > timelineStart && item.start_sample < timelineEnd
+  ));
+  const timelineStyle = (startSample: number, endSample: number) => {
+    const clippedStart = Math.max(timelineStart, startSample);
+    const clippedEnd = Math.min(timelineEnd, endSample);
+    return {
+      left: `${((clippedStart - timelineStart) / timelineDuration) * 100}%`,
+      width: `${((clippedEnd - clippedStart) / timelineDuration) * 100}%`,
+    };
+  };
 
   const railTools = !readOnly && (
     <div className="timeline-tools">
@@ -402,6 +545,10 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
         />
       )}
       <div className="wave-shell">
+        <div className="timeline-caption">
+          <strong>{timelineRange ? "Selected chapter timeline" : "Full recording timeline"}</strong>
+          <span>{seconds(timelineStart)}s to {seconds(timelineEnd)}s</span>
+        </div>
         <div ref={container} aria-label="Editable source waveform" />
         {anchor !== null && (
           <div className="selection-hint">
@@ -441,12 +588,31 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
             <option value={1.5}>1.5×</option>
           </select>
         </label>
+        {auditionAvailable && (
+          <label>
+            Audition
+            <select
+              aria-label="Channel audition mode"
+              value={playback.audition_mode}
+              onChange={(event) => playbackController.current?.setAuditionMode(
+                event.target.value as PlaybackState["audition_mode"],
+              )}
+            >
+              <option value="mixed">Mixed</option>
+              <option value="left">Left channel</option>
+              <option value="right">Right channel</option>
+              {annotation.speaker_channel_map.A !== undefined && <option value="speaker_a">Speaker A</option>}
+              {annotation.speaker_channel_map.B !== undefined && <option value="speaker_b">Speaker B</option>}
+            </select>
+          </label>
+        )}
         <label className="zoom-control">
           Zoom
           <input
             type="range"
-            min="10"
-            max="160"
+            min="1"
+            max="8"
+            step="0.25"
             value={zoom}
             onChange={(event) => setZoom(Number(event.target.value))}
           />
@@ -470,26 +636,23 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
           <div className="lane-row" key={speaker}>
             <strong className={`lane-label speaker-${speaker.toLowerCase()}`}>Speaker {speaker}</strong>
             <div className="lane-track">
-              {annotation.activities
+              {visibleActivities
                 .filter((item) => item.speaker === speaker)
                 .map((item) => (
                   <button
                     key={item.id}
                     className={`lane-region speaker-${speaker.toLowerCase()}`}
-                    style={{
-                      left: `${(item.start_sample / durationSamples) * 100}%`,
-                      width: `${((item.end_sample - item.start_sample) / durationSamples) * 100}%`,
-                    }}
+                    style={timelineStyle(item.start_sample, item.end_sample)}
                     onClick={(event) => {
-                      // The lane is a miniature of the whole source, so the click
-                      // position maps straight onto a sample. Seeking there keeps
-                      // the player, the playhead and the transcript in step.
+                      // The lane is a miniature of the selected chapter. Convert
+                      // its local position back to the unchanged global timestamp.
                       const rect = event.currentTarget.parentElement!.getBoundingClientRect();
                       const ratio = rect.width > 0
                         ? (event.clientX - rect.left) / rect.width
                         : 0;
                       const at = Math.round(
-                        Math.max(0, Math.min(1, ratio)) * durationSamples,
+                        timelineStart
+                        + Math.max(0, Math.min(1, ratio)) * timelineDuration,
                       );
                       playbackController.current?.seekToSample(at);
                       onRegionClick?.(item.id, at);
@@ -503,36 +666,37 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
                     {speaker}
                   </button>
                 ))}
-              <span
-                className="lane-playhead"
-                style={{ left: playheadPosition }}
-                aria-hidden="true"
-              />
+              {playheadInTimeline && (
+                <span
+                  className="lane-playhead"
+                  style={{ left: playheadPosition }}
+                  aria-hidden="true"
+                />
+              )}
             </div>
           </div>
         ))}
         <div className="lane-row">
           <strong className="lane-label excluded">Excluded</strong>
           <div className="lane-track">
-            {annotation.exclusions.map((item) => (
+            {visibleExclusions.map((item) => (
               <button
                 key={item.id}
                 className="lane-region excluded"
-                style={{
-                  left: `${(item.start_sample / durationSamples) * 100}%`,
-                  width: `${((item.end_sample - item.start_sample) / durationSamples) * 100}%`,
-                }}
+                style={timelineStyle(item.start_sample, item.end_sample)}
                 onDoubleClick={() => removeSelected(item.id)}
                 title={`${item.kind} · double-click to remove`}
               >
                 ×
               </button>
             ))}
-            <span
-              className="lane-playhead"
-              style={{ left: playheadPosition }}
-              aria-hidden="true"
-            />
+            {playheadInTimeline && (
+              <span
+                className="lane-playhead"
+                style={{ left: playheadPosition }}
+                aria-hidden="true"
+              />
+            )}
           </div>
         </div>
       </div>

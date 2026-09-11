@@ -148,6 +148,20 @@ class StudioWorker:
                 )
             else:
                 raise ValueError(f"Unknown job kind: {kind}")
+            if source_id is not None and kind in {
+                "initialize",
+                "transcribe",
+                "rediarize",
+                "realign",
+            }:
+                self.catalog.ensure_machine_transcript_version(
+                    str(source_id),
+                    producing_job_id=job_id,
+                    model_name=config.transcription.model,
+                    model_revision=config.transcription.model_revision,
+                    config_fingerprint=config.fingerprint("transcription"),
+                    provenance_status="exact",
+                )
             self.catalog.update_job(
                 job_id,
                 status="complete",

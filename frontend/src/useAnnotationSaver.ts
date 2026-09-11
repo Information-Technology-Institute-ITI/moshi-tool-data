@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, api, jsonRequest } from "./api";
-import type { Annotation } from "./types";
+import type { Annotation, CorrectedVersion } from "./types";
 
 export type SaveStatus = "idle" | "saving" | "saved" | "failed";
+export type SaveMode = "update" | "new_version";
+export type SavedAnnotation = Annotation & {
+  _save?: {
+    no_op: boolean;
+    created_new_version: boolean;
+    corrected_version: CorrectedVersion;
+    content_fingerprint: string;
+  };
+};
 
 export type Conflict = {
   /** The complete working copy the reviewer attempted to save. */
@@ -47,14 +56,23 @@ export function useAnnotationSaver({ sourceId, onConflict, onError }: Options) {
   callbacks.current = { onConflict, onError };
 
   const save = useCallback(
-    async (value: Annotation): Promise<Annotation | null> => {
+    async (
+      value: Annotation,
+      mode: SaveMode = "update",
+      expectedContentFingerprint?: string | null,
+    ): Promise<SavedAnnotation | null> => {
       if (inFlight.current) return null;
       inFlight.current = true;
       if (mounted.current) setStatus("saving");
       try {
-        const saved = await api<Annotation>(
+        const saved = await api<SavedAnnotation>(
           `/api/sources/${sourceId}/annotations`,
-          jsonRequest("PUT", { expected_version: value.version, annotation: value }),
+          jsonRequest("PUT", {
+            expected_version: value.version,
+            expected_content_fingerprint: expectedContentFingerprint || undefined,
+            save_mode: mode,
+            annotation: value,
+          }),
         );
         if (mounted.current) setStatus("saved");
         return saved;

@@ -79,11 +79,6 @@ def source_quality_metrics(
         for value in transcript
         if value.human_verified and value.text.strip()
     ]
-    cer_values = [
-        character_error_rate(value.text, value.model_text)
-        for value in golden
-        if value.model_text.strip()
-    ]
     speaker_values = [
         value
         for value in golden
@@ -124,9 +119,10 @@ def source_quality_metrics(
         ),
         "golden_examples": len(golden),
         "golden_target": 20,
-        "model_character_error_rate": (
-            sum(cer_values) / len(cer_values) if cer_values else None
-        ),
+        # P5 makes immutable M versions the only authoritative hypotheses.
+        # The compatibility model_text field is intentionally not scored here;
+        # P7 computes WER/CER from an explicitly selected M version.
+        "model_character_error_rate": None,
         "speaker_correction_rate": (
             sum(value.model_speaker != value.speaker for value in speaker_values)
             / len(speaker_values)

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import shutil
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -14,6 +15,10 @@ from typing import Any, Protocol
 
 from moshi_data_pipeline.studio.domain import AnnotationDocument, ClipPlanDocument, new_id
 from moshi_data_pipeline.studio.migrations import apply_migrations
+from moshi_data_pipeline.studio.product_contracts import (
+    ReviewChapterConfig,
+    ReviewChapterSet,
+)
 
 WORKER_PROTOCOL_VERSION = "1.0"
 GPU_DISPATCH_PROTOCOL_VERSION = "2.0"
@@ -44,6 +49,28 @@ def _json(value: Any) -> str:
 
 def _loads(value: str | None, default: Any) -> Any:
     return json.loads(value) if value else default
+
+
+def _annotation_content_fingerprint(annotation: AnnotationDocument) -> str:
+    value = annotation.model_dump(mode="json")
+    value.pop("version", None)
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _annotation_from_row(row: sqlite3.Row) -> AnnotationDocument:
+    value = AnnotationDocument.model_validate_json(row["annotation_json"])
+    keys = set(row.keys())
+    if "shared_aligned_words_json" in keys and row["shared_aligned_words_json"]:
+        value = value.model_copy(
+            update={"aligned_words": _loads(row["shared_aligned_words_json"], [])}
+        )
+    return value
 
 
 class VersionConflictError(RuntimeError):
@@ -1233,9 +1260,20 @@ class StudioCatalog:
             ).fetchall()
         return [self._decode_source(dict(row)) for row in rows]
 
-    def get_source(self, source_id: str) -> dict[str, Any]:
+    def get_source(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> dict[str, Any]:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+            row = (
+                self._source_mutation_row(connection, source_id, principal=principal)
+                if principal is not None
+                else connection.execute(
+                    "SELECT * FROM sources WHERE id=?", (source_id,)
+                ).fetchone()
+            )
         if row is None:
             raise KeyError(source_id)
         return self._decode_source(dict(row))
@@ -1402,47 +1440,638 @@ class StudioCatalog:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT annotation_json FROM annotation_revisions
-                WHERE source_id=? ORDER BY version DESC LIMIT 1
+                SELECT r.annotation_json,b.payload_json AS shared_aligned_words_json
+                FROM annotation_revisions r
+                LEFT JOIN annotation_shared_blobs b ON b.id=r.shared_aligned_words_id
+                WHERE r.source_id=? ORDER BY r.version DESC LIMIT 1
                 """,
                 (source_id,),
             ).fetchone()
         if row is None:
             return AnnotationDocument(source_id=source_id)
-        return AnnotationDocument.model_validate_json(row["annotation_json"])
+        return _annotation_from_row(row)
 
     def annotation_at(self, source_id: str, version: int) -> AnnotationDocument:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT annotation_json FROM annotation_revisions
-                WHERE source_id=? AND version=?
+                SELECT r.annotation_json,r.retention_state,
+                       b.payload_json AS shared_aligned_words_json
+                FROM annotation_revisions r
+                LEFT JOIN annotation_shared_blobs b ON b.id=r.shared_aligned_words_id
+                WHERE r.source_id=? AND r.version=?
                 """,
                 (source_id, version),
             ).fetchone()
-        if row is None:
+        if row is None or row["retention_state"] == "payload_removed":
             raise KeyError(f"{source_id}:v{version}")
-        return AnnotationDocument.model_validate_json(row["annotation_json"])
+        return _annotation_from_row(row)
 
     def annotation_revisions(self, source_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT version,created_at FROM annotation_revisions
+                SELECT version,created_at,corrected_version_id,generation,
+                       content_fingerprint,origin,recoverable_until,retention_state,
+                       payload_removed_at
+                FROM annotation_revisions
                 WHERE source_id=? ORDER BY version DESC
                 """,
                 (source_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_annotation(
+    def corrected_versions(self, source_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT v.*,r.generation,r.created_by_user_id AS saved_by_user_id
+                FROM corrected_versions v
+                JOIN annotation_revisions r
+                  ON r.source_id=v.source_id AND r.version=v.current_annotation_version
+                WHERE v.source_id=? ORDER BY v.ordinal DESC
+                """,
+                (source_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def current_corrected_version(self, source_id: str) -> dict[str, Any] | None:
+        versions = self.corrected_versions(source_id)
+        return versions[0] if versions else None
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def ensure_machine_transcript_version(
+        self,
+        source_id: str,
+        *,
+        producing_job_id: str | None = None,
+        model_name: str | None = None,
+        model_revision: str | None = None,
+        config_fingerprint: str | None = None,
+        provenance_status: str = "historical_unknown",
+    ) -> dict[str, Any] | None:
+        """Snapshot the currently registered machine output as the next source-local M version."""
+        if provenance_status not in {"exact", "historical_unknown"}:
+            raise ValueError("Invalid machine transcript provenance status")
+        analysis_roles = {
+            "analysis.raw_transcript": "raw",
+            "analysis.aligned_transcript": "aligned",
+            "analysis.diarization": "diarization",
+        }
+        with self._lock, self.connect() as connection:
+            source = connection.execute(
+                """
+                SELECT s.id,s.project_id,p.language
+                FROM sources s JOIN projects p ON p.id=s.project_id
+                WHERE s.id=?
+                """,
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(source_id)
+            artifacts = connection.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE source_id=? AND state='active'
+                  AND role IN ('analysis.raw_transcript','analysis.aligned_transcript','analysis.diarization')
+                ORDER BY created_at,id
+                """,
+                (source_id,),
+            ).fetchall()
+            by_role = {str(row["role"]): dict(row) for row in artifacts}
+            if not by_role:
+                return None
+            fingerprint_payload = [
+                (role, by_role[role]["sha256"])
+                for role in sorted(by_role)
+            ]
+            artifact_fingerprint = hashlib.sha256(
+                _json(fingerprint_payload).encode("utf-8")
+            ).hexdigest()
+            existing = connection.execute(
+                """
+                SELECT * FROM machine_transcript_versions
+                WHERE source_id=? AND artifact_fingerprint=?
+                """,
+                (source_id, artifact_fingerprint),
+            ).fetchone()
+            if existing is not None:
+                return self._machine_transcript_record(existing)
+
+            ordinal = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ordinal),0)+1 FROM machine_transcript_versions WHERE source_id=?",
+                    (source_id,),
+                ).fetchone()[0]
+            )
+            job_ids = [
+                str(value["producing_job_id"])
+                for value in by_role.values()
+                if value.get("producing_job_id")
+            ]
+            producing_job_id = producing_job_id or (job_ids[-1] if job_ids else None)
+            job = (
+                connection.execute("SELECT * FROM jobs WHERE id=?", (producing_job_id,)).fetchone()
+                if producing_job_id
+                else None
+            )
+            payload = _loads(job["payload_json"], {}) if job is not None else {}
+            result = _loads(job["result_json"], {}) if job is not None else {}
+            producer = str(job["kind"]) if job is not None else "historical"
+            model_name = str(
+                model_name
+                or
+                result.get("model_name")
+                or result.get("model")
+                or payload.get("model_name")
+                or payload.get("model")
+                or "historical pipeline"
+            )
+            model_revision = model_revision or result.get("model_revision") or payload.get(
+                "model_revision"
+            )
+
+            workspace = self.path.parent.resolve()
+            snapshot_root = (
+                workspace
+                / ".protected"
+                / "machine-transcripts"
+                / source_id
+                / f"M{ordinal}-{artifact_fingerprint[:12]}"
+            )
+            snapshot_paths: dict[str, str | None] = {
+                "raw": None,
+                "aligned": None,
+                "diarization": None,
+            }
+            for role, label in analysis_roles.items():
+                artifact = by_role.get(role)
+                if artifact is None:
+                    continue
+                candidate = (workspace / str(artifact["relative_path"])).resolve()
+                try:
+                    candidate.relative_to(workspace)
+                except ValueError:
+                    continue
+                if not candidate.is_file() or self._file_sha256(candidate) != artifact["sha256"]:
+                    continue
+                snapshot_root.mkdir(parents=True, exist_ok=True)
+                destination = snapshot_root / f"{label}.json"
+                if not destination.exists():
+                    shutil.copy2(candidate, destination)
+                if self._file_sha256(destination) != artifact["sha256"]:
+                    raise RuntimeError("Machine transcript snapshot verification failed")
+                snapshot_paths[label] = destination.relative_to(workspace).as_posix()
+
+            artifact_manifest = {}
+            for role, label in analysis_roles.items():
+                artifact = by_role.get(role)
+                if artifact is None:
+                    continue
+                artifact_manifest[label] = {
+                    "artifact_id": artifact["id"],
+                    "role": artifact["role"],
+                    "sha256": artifact["sha256"],
+                    "size_bytes": artifact["size_bytes"],
+                    "media_type": artifact["media_type"],
+                    "snapshot_path": snapshot_paths[label],
+                }
+
+            now = self._now()
+            value_id = new_id("machine_transcript")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO machine_transcript_versions(
+                        id,source_id,ordinal,producing_job_id,producer,model_name,
+                        model_revision,language,config_fingerprint,
+                        raw_transcript_artifact_id,aligned_transcript_artifact_id,
+                        diarization_artifact_id,raw_snapshot_path,aligned_snapshot_path,
+                        diarization_snapshot_path,artifact_fingerprint,
+                        comparison_available,artifact_manifest_json,
+                        provenance_status,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        value_id,
+                        source_id,
+                        ordinal,
+                        producing_job_id,
+                        producer,
+                        model_name,
+                        model_revision,
+                        source["language"],
+                        config_fingerprint
+                        or (job["input_fingerprint"] if job is not None else None),
+                        by_role.get("analysis.raw_transcript", {}).get("id"),
+                        by_role.get("analysis.aligned_transcript", {}).get("id"),
+                        by_role.get("analysis.diarization", {}).get("id"),
+                        snapshot_paths["raw"],
+                        snapshot_paths["aligned"],
+                        snapshot_paths["diarization"],
+                        artifact_fingerprint,
+                        int(snapshot_paths["raw"] is not None),
+                        _json(artifact_manifest),
+                        provenance_status,
+                        now,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self.machine_transcript(source_id, ordinal)
+
+    def machine_transcripts(self, source_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM machine_transcript_versions
+                WHERE source_id=? ORDER BY ordinal DESC
+                """,
+                (source_id,),
+            ).fetchall()
+        return [self._machine_transcript_record(row) for row in rows]
+
+    @staticmethod
+    def _machine_transcript_record(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["artifact_manifest"] = _loads(value.pop("artifact_manifest_json", "{}"), {})
+        return value
+
+    def backfill_machine_transcript_versions(
+        self,
+        *,
+        model_name: str | None = None,
+        model_revision: str | None = None,
+        config_fingerprint: str | None = None,
+    ) -> dict[str, int]:
+        with self.connect() as connection:
+            source_ids = [
+                str(row[0])
+                for row in connection.execute("SELECT id FROM sources ORDER BY created_at,id")
+            ]
+        created = 0
+        available = 0
+        for source_id in source_ids:
+            before = len(self.machine_transcripts(source_id))
+            value = self.ensure_machine_transcript_version(
+                source_id,
+                model_name=model_name,
+                model_revision=model_revision,
+                config_fingerprint=config_fingerprint,
+            )
+            if value is not None:
+                available += 1
+                if len(self.machine_transcripts(source_id)) > before:
+                    created += 1
+        return {"sources": len(source_ids), "available": available, "created": created}
+
+    def machine_transcript(self, source_id: str, ordinal: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM machine_transcript_versions
+                WHERE source_id=? AND ordinal=?
+                """,
+                (source_id, ordinal),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"{source_id}:M{ordinal}")
+        return self._machine_transcript_record(row)
+
+    def corrected_version_annotation(self, source_id: str, ordinal: int) -> AnnotationDocument:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT current_annotation_version FROM corrected_versions
+                WHERE source_id=? AND ordinal=?
+                """,
+                (source_id, ordinal),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"{source_id}:V{ordinal}")
+        return self.annotation_at(source_id, int(row["current_annotation_version"]))
+
+    def recoverable_corrected_generations(
+        self,
+        source_id: str,
+        ordinal: int,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            version = connection.execute(
+                "SELECT id FROM corrected_versions WHERE source_id=? AND ordinal=?",
+                (source_id, ordinal),
+            ).fetchone()
+            if version is None:
+                raise KeyError(f"{source_id}:V{ordinal}")
+            rows = connection.execute(
+                """
+                SELECT version AS annotation_version,generation,content_fingerprint,
+                       created_at,recoverable_until,change_summary_json
+                FROM annotation_revisions
+                WHERE source_id=? AND corrected_version_id=?
+                  AND retention_state='recoverable' AND recoverable_until>?
+                ORDER BY generation DESC
+                """,
+                (source_id, version["id"], self._now()),
+            ).fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            value["change_summary"] = _loads(value.pop("change_summary_json"), {})
+            values.append(value)
+        return values
+
+    def recover_corrected_generation(
+        self,
+        source_id: str,
+        ordinal: int,
+        annotation_version: int,
+        *,
+        principal: PrincipalLike,
+    ) -> tuple[AnnotationDocument, dict[str, Any]]:
+        with self.connect() as connection:
+            source = self._source_mutation_row(connection, source_id, principal=principal)
+            version = connection.execute(
+                "SELECT * FROM corrected_versions WHERE source_id=? AND ordinal=?",
+                (source_id, ordinal),
+            ).fetchone()
+            target = connection.execute(
+                """
+                SELECT corrected_version_id,retention_state,recoverable_until
+                FROM annotation_revisions
+                WHERE source_id=? AND version=?
+                """,
+                (source_id, annotation_version),
+            ).fetchone()
+            if (
+                version is None
+                or target is None
+                or target["corrected_version_id"] != version["id"]
+                or target["retention_state"] != "recoverable"
+                or not target["recoverable_until"]
+                or str(target["recoverable_until"]) <= self._now()
+            ):
+                raise KeyError(f"{source_id}:V{ordinal}:g{annotation_version}")
+            if version["status"] in {"pending", "approved"}:
+                raise ValueError("A pending or approved version cannot be replaced")
+            current = int(source["active_annotation_version"])
+        recovered = self.annotation_at(source_id, annotation_version)
+        return self.save_annotation_record(
+            source_id,
+            current,
+            recovered,
+            principal=principal,
+            save_mode="update",
+            origin="generation_recovery",
+        )
+
+    def active_chapter_set(self, source_id: str) -> ReviewChapterSet | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM review_chapter_sets
+                WHERE source_id=? AND active=1
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            chapters = connection.execute(
+                """
+                SELECT id,ordinal,start_sample,end_sample,boundary_reason
+                FROM review_chapters
+                WHERE chapter_set_id=? ORDER BY ordinal
+                """,
+                (row["id"],),
+            ).fetchall()
+        config = ReviewChapterConfig(
+            mode=row["mode"],
+            max_duration_seconds=int(row["max_duration_seconds"]),
+            count=row["requested_count"],
+            manual_boundaries_samples=_loads(row["manual_boundaries_json"], []),
+            boundary_search_seconds=int(row["boundary_search_seconds"]),
+        )
+        return ReviewChapterSet(
+            id=row["id"],
+            source_id=row["source_id"],
+            annotation_version=int(row["annotation_version"]),
+            active=bool(row["active"]),
+            config=config,
+            chapters=[dict(chapter) for chapter in chapters],
+        )
+
+    def replace_chapter_set(
+        self,
+        chapter_set: ReviewChapterSet,
+        *,
+        principal: PrincipalLike | None = None,
+    ) -> ReviewChapterSet:
+        """Atomically activate a generated chapter set and retain its predecessors."""
+        config = chapter_set.config
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(
+                connection, chapter_set.source_id, principal=principal
+            )
+            connection.execute(
+                "UPDATE review_chapter_sets SET active=0 WHERE source_id=? AND active=1",
+                (chapter_set.source_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO review_chapter_sets(
+                    id,source_id,annotation_version,mode,max_duration_seconds,
+                    requested_count,manual_boundaries_json,boundary_search_seconds,
+                    active,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    chapter_set.id,
+                    chapter_set.source_id,
+                    chapter_set.annotation_version,
+                    config.mode,
+                    config.max_duration_seconds,
+                    config.count,
+                    _json(config.manual_boundaries_samples),
+                    config.boundary_search_seconds,
+                    1,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO review_chapters(
+                    id,chapter_set_id,ordinal,start_sample,end_sample,boundary_reason
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        chapter.id,
+                        chapter_set.id,
+                        chapter.ordinal,
+                        chapter.start_sample,
+                        chapter.end_sample,
+                        chapter.boundary_reason,
+                    )
+                    for chapter in chapter_set.chapters
+                ],
+            )
+            connection.commit()
+        return chapter_set
+
+    def save_chapter_review(
+        self,
+        chapter_id: str,
+        annotation_version: int,
+        status: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        if status not in {"not_started", "in_progress", "complete"}:
+            raise ValueError("Invalid chapter review status")
+        if annotation_version < 0:
+            raise ValueError("annotation_version must be zero or greater")
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            chapter = connection.execute(
+                """
+                SELECT c.id,s.source_id,s.annotation_version,s.active
+                FROM review_chapters c
+                JOIN review_chapter_sets s ON s.id=c.chapter_set_id
+                WHERE c.id=?
+                """,
+                (chapter_id,),
+            ).fetchone()
+            if chapter is None:
+                connection.rollback()
+                raise KeyError(chapter_id)
+            if not chapter["active"] or int(chapter["annotation_version"]) != annotation_version:
+                connection.rollback()
+                raise ValueError("Chapter review does not match the active annotation version")
+            self._source_mutation_row(
+                connection, chapter["source_id"], principal=principal
+            )
+            connection.execute(
+                """
+                INSERT INTO chapter_reviews(
+                    chapter_id,reviewer_user_id,annotation_version,status,updated_at
+                ) VALUES(?,?,?,?,?)
+                ON CONFLICT(chapter_id,reviewer_user_id) DO UPDATE SET
+                    annotation_version=excluded.annotation_version,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (chapter_id, principal.user_id, annotation_version, status, now),
+            )
+            connection.commit()
+        return {
+            "chapter_id": chapter_id,
+            "reviewer_user_id": principal.user_id,
+            "annotation_version": annotation_version,
+            "status": status,
+            "updated_at": now,
+        }
+
+    def chapter_reviews(
+        self,
+        source_id: str,
+        *,
+        principal: PrincipalLike,
+    ) -> list[dict[str, Any]]:
+        """Return this reviewer's state for every chapter in the active set."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.id AS chapter_id,
+                       COALESCE(
+                         r.annotation_version,
+                         (SELECT r2.annotation_version
+                          FROM chapter_reviews r2
+                          JOIN review_chapters c2 ON c2.id=r2.chapter_id
+                          JOIN review_chapter_sets s2 ON s2.id=c2.chapter_set_id
+                          WHERE r2.reviewer_user_id=? AND s2.source_id=s.source_id
+                            AND c2.ordinal=c.ordinal
+                          ORDER BY r2.updated_at DESC LIMIT 1)
+                       ) AS annotation_version,
+                       COALESCE(
+                         r.status,
+                         (SELECT r2.status
+                          FROM chapter_reviews r2
+                          JOIN review_chapters c2 ON c2.id=r2.chapter_id
+                          JOIN review_chapter_sets s2 ON s2.id=c2.chapter_set_id
+                          WHERE r2.reviewer_user_id=? AND s2.source_id=s.source_id
+                            AND c2.ordinal=c.ordinal
+                          ORDER BY r2.updated_at DESC LIMIT 1),
+                         'not_started'
+                       ) AS status,
+                       COALESCE(
+                         r.updated_at,
+                         (SELECT r2.updated_at
+                          FROM chapter_reviews r2
+                          JOIN review_chapters c2 ON c2.id=r2.chapter_id
+                          JOIN review_chapter_sets s2 ON s2.id=c2.chapter_set_id
+                          WHERE r2.reviewer_user_id=? AND s2.source_id=s.source_id
+                            AND c2.ordinal=c.ordinal
+                          ORDER BY r2.updated_at DESC LIMIT 1)
+                       ) AS updated_at,
+                       s.annotation_version AS active_annotation_version
+                FROM review_chapter_sets s
+                JOIN review_chapters c ON c.chapter_set_id=s.id
+                LEFT JOIN chapter_reviews r
+                  ON r.chapter_id=c.id AND r.reviewer_user_id=?
+                WHERE s.source_id=? AND s.active=1
+                ORDER BY c.ordinal
+                """,
+                (
+                    principal.user_id,
+                    principal.user_id,
+                    principal.user_id,
+                    principal.user_id,
+                    source_id,
+                ),
+            ).fetchall()
+        return [
+            {
+                "chapter_id": row["chapter_id"],
+                "reviewer_user_id": principal.user_id,
+                "annotation_version": row["annotation_version"],
+                "status": row["status"],
+                "updated_at": row["updated_at"],
+                "stale": (
+                    row["annotation_version"] is not None
+                    and int(row["annotation_version"])
+                    != int(row["active_annotation_version"])
+                ),
+            }
+            for row in rows
+        ]
+
+    def save_annotation_record(
         self,
         source_id: str,
         expected_version: int,
         annotation: AnnotationDocument,
         *,
         principal: PrincipalLike | None = None,
-    ) -> AnnotationDocument:
+        save_mode: str = "update",
+        expected_content_fingerprint: str | None = None,
+        origin: str = "system",
+    ) -> tuple[AnnotationDocument, dict[str, Any]]:
+        if save_mode not in {"update", "new_version"}:
+            raise ValueError("save_mode must be update or new_version")
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._source_mutation_row(connection, source_id, principal=principal)
@@ -1458,16 +2087,197 @@ class StudioCatalog:
                 raise VersionConflictError(
                     f"Expected annotation version {expected_version}, current version is {current}"
                 )
+            current_revision = connection.execute(
+                """
+                SELECT r.*,b.payload_json AS shared_aligned_words_json
+                FROM annotation_revisions r
+                LEFT JOIN annotation_shared_blobs b ON b.id=r.shared_aligned_words_id
+                WHERE r.source_id=? AND r.version=?
+                """,
+                (source_id, current),
+            ).fetchone()
+            current_corrected = connection.execute(
+                """
+                SELECT * FROM corrected_versions
+                WHERE source_id=? AND current_annotation_version=?
+                """,
+                (source_id, current),
+            ).fetchone()
+            if (
+                expected_content_fingerprint
+                and current_revision is not None
+                and (
+                    current_revision["content_fingerprint"]
+                    or (current_corrected["content_fingerprint"] if current_corrected else None)
+                )
+                and expected_content_fingerprint
+                != (
+                    current_revision["content_fingerprint"]
+                    or current_corrected["content_fingerprint"]
+                )
+            ):
+                connection.rollback()
+                raise VersionConflictError("The saved content fingerprint has changed")
+
+            incoming_fingerprint = _annotation_content_fingerprint(annotation)
+            current_fingerprint = (
+                str(current_revision["content_fingerprint"])
+                if current_revision is not None and current_revision["content_fingerprint"]
+                else str(current_corrected["content_fingerprint"])
+                if current_corrected is not None and current_corrected["content_fingerprint"]
+                else (
+                    _annotation_content_fingerprint(
+                        _annotation_from_row(current_revision)
+                    )
+                    if current_revision is not None
+                    else None
+                )
+            )
+            if current_revision is not None and incoming_fingerprint == current_fingerprint:
+                value = _annotation_from_row(current_revision)
+                connection.commit()
+                record = dict(current_corrected) if current_corrected is not None else None
+                if record is not None:
+                    record["generation"] = int(current_revision["generation"] or 1)
+                    record["content_fingerprint"] = incoming_fingerprint
+                return value, {
+                    "no_op": True,
+                    "created_new_version": False,
+                    "corrected_version": record,
+                    "content_fingerprint": incoming_fingerprint,
+                }
+
             next_version = current + 1
             value = annotation.model_copy(update={"source_id": source_id, "version": next_version})
-            now = utc_now()
+            now = self._now()
+            actor_id = principal.user_id if principal is not None else None
+            must_create_version = (
+                current_corrected is None
+                or save_mode == "new_version"
+                or str(current_corrected["status"]) in {"pending", "approved"}
+            )
+            if must_create_version:
+                connection.execute(
+                    """
+                    UPDATE corrected_versions
+                    SET status='rejected',decision_note='Superseded by a newer corrected version',
+                        updated_at=?
+                    WHERE source_id=? AND status='pending'
+                    """,
+                    (now, source_id),
+                )
+                ordinal = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(ordinal),0)+1 FROM corrected_versions WHERE source_id=?",
+                        (source_id,),
+                    ).fetchone()[0]
+                )
+                corrected_version_id = new_id("corrected")
+                generation = 1
+                connection.execute(
+                    """
+                    INSERT INTO corrected_versions(
+                        id,source_id,ordinal,current_annotation_version,content_fingerprint,
+                        status,created_by_user_id,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        corrected_version_id,
+                        source_id,
+                        ordinal,
+                        next_version,
+                        incoming_fingerprint,
+                        "unapproved",
+                        actor_id,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE annotation_approval_tasks
+                    SET status='superseded',updated_at=?
+                    WHERE source_id=? AND status='pending'
+                    """,
+                    (now, source_id),
+                )
+            else:
+                corrected_version_id = str(current_corrected["id"])
+                ordinal = int(current_corrected["ordinal"])
+                generation = int(current_revision["generation"] or 1) + 1
+
+            prior_transcript = (
+                _annotation_from_row(current_revision).transcript
+                if current_revision is not None
+                else []
+            )
+            change_summary = {
+                "segments_before": len(prior_transcript),
+                "segments_after": len(value.transcript),
+                "verified_after": sum(item.human_verified for item in value.transcript),
+            }
+            shared_aligned_words_id = None
+            stored_value = value
+            if value.aligned_words:
+                aligned_payload = _json(value.aligned_words)
+                aligned_fingerprint = hashlib.sha256(aligned_payload.encode("utf-8")).hexdigest()
+                shared_aligned_words_id = f"aligned_words_{aligned_fingerprint[:32]}"
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO annotation_shared_blobs(
+                        id,kind,content_fingerprint,payload_json,created_at
+                    ) VALUES(?,'aligned_words',?,?,?)
+                    """,
+                    (shared_aligned_words_id, aligned_fingerprint, aligned_payload, now),
+                )
+                stored_value = value.model_copy(update={"aligned_words": []})
             connection.execute(
                 """
-                INSERT INTO annotation_revisions(source_id,version,annotation_json,created_at)
-                VALUES(?,?,?,?)
+                INSERT INTO annotation_revisions(
+                    source_id,version,annotation_json,created_at,corrected_version_id,
+                    generation,content_fingerprint,parent_annotation_version,
+                    created_by_user_id,origin,change_summary_json,retention_state,
+                    shared_aligned_words_id
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (source_id, next_version, value.model_dump_json(), now),
+                (
+                    source_id,
+                    next_version,
+                    stored_value.model_dump_json(),
+                    now,
+                    corrected_version_id,
+                    generation,
+                    incoming_fingerprint,
+                    current if current > 0 else None,
+                    actor_id,
+                    origin,
+                    _json(change_summary),
+                    "current",
+                    shared_aligned_words_id,
+                ),
             )
+            if not must_create_version:
+                recovery_until = (
+                    self._now_datetime() + timedelta(days=10)
+                ).astimezone(UTC).isoformat()
+                connection.execute(
+                    """
+                    UPDATE annotation_revisions
+                    SET corrected_version_id=?,retention_state='recoverable',recoverable_until=?
+                    WHERE source_id=? AND version=?
+                    """,
+                    (corrected_version_id, recovery_until, source_id, current),
+                )
+                connection.execute(
+                    """
+                    UPDATE corrected_versions
+                    SET current_annotation_version=?,content_fingerprint=?,
+                        status='unapproved',updated_at=?,
+                        submitted_at=NULL,decision_note=''
+                    WHERE id=?
+                    """,
+                    (next_version, incoming_fingerprint, now, corrected_version_id),
+                )
             connection.execute(
                 """
                 UPDATE sources SET active_annotation_version=?,clips_stale=1,
@@ -1480,7 +2290,533 @@ class StudioCatalog:
             connection.execute("DELETE FROM clip_decisions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM overlap_recoveries WHERE source_id=?", (source_id,))
             connection.commit()
+        record = next(
+            item for item in self.corrected_versions(source_id) if item["id"] == corrected_version_id
+        )
+        return value, {
+            "no_op": False,
+            "created_new_version": must_create_version,
+            "corrected_version": record,
+            "content_fingerprint": incoming_fingerprint,
+        }
+
+    def save_annotation(
+        self,
+        source_id: str,
+        expected_version: int,
+        annotation: AnnotationDocument,
+        *,
+        principal: PrincipalLike | None = None,
+        save_mode: str = "update",
+        expected_content_fingerprint: str | None = None,
+        origin: str = "system",
+    ) -> AnnotationDocument:
+        value, _ = self.save_annotation_record(
+            source_id,
+            expected_version,
+            annotation,
+            principal=principal,
+            save_mode=save_mode,
+            expected_content_fingerprint=expected_content_fingerprint,
+            origin=origin,
+        )
         return value
+
+    def source_chapter_completion(self, source_id: str, annotation_version: int) -> dict[str, int]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN EXISTS (
+                           SELECT 1 FROM chapter_reviews r
+                           WHERE r.chapter_id=c.id
+                             AND r.annotation_version=?
+                             AND r.status='complete'
+                       ) THEN 1 ELSE 0 END) AS complete
+                FROM review_chapter_sets s
+                JOIN review_chapters c ON c.chapter_set_id=s.id
+                WHERE s.source_id=? AND s.active=1 AND s.annotation_version=?
+                """,
+                (annotation_version, source_id, annotation_version),
+            ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "complete": int(row["complete"] or 0),
+        }
+
+    def submit_annotation_approval(
+        self,
+        source_id: str,
+        *,
+        annotation_version: int,
+        content_fingerprint: str,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = self._source_mutation_row(connection, source_id, principal=principal)
+            if int(source["active_annotation_version"]) != annotation_version:
+                connection.rollback()
+                raise VersionConflictError("The annotation changed before submission")
+            version = connection.execute(
+                """
+                SELECT v.*,COALESCE(r.content_fingerprint,v.content_fingerprint)
+                    AS effective_content_fingerprint
+                FROM corrected_versions v
+                JOIN annotation_revisions r
+                  ON r.source_id=v.source_id AND r.version=v.current_annotation_version
+                WHERE v.source_id=? AND v.current_annotation_version=?
+                """,
+                (source_id, annotation_version),
+            ).fetchone()
+            if (
+                version is None
+                or version["effective_content_fingerprint"] != content_fingerprint
+            ):
+                connection.rollback()
+                raise VersionConflictError("The corrected version changed before submission")
+            if version["status"] == "approved":
+                connection.rollback()
+                raise ValueError("This corrected version is already approved")
+            pending = connection.execute(
+                "SELECT * FROM annotation_approval_tasks WHERE source_id=? AND status='pending'",
+                (source_id,),
+            ).fetchone()
+            if pending is not None:
+                connection.commit()
+                return self.annotation_approval_task(str(pending["id"]))
+            task_id = new_id("approval")
+            connection.execute(
+                """
+                INSERT INTO annotation_approval_tasks(
+                    id,source_id,corrected_version_id,annotation_version,
+                    content_fingerprint,status,submitted_by_user_id,created_at,updated_at
+                ) VALUES(?,?,?,?,?,'pending',?,?,?)
+                """,
+                (
+                    task_id,
+                    source_id,
+                    version["id"],
+                    annotation_version,
+                    content_fingerprint,
+                    principal.user_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE corrected_versions
+                SET status='pending',submitted_at=?,updated_at=? WHERE id=?
+                """,
+                (now, now, version["id"]),
+            )
+            connection.commit()
+        return self.annotation_approval_task(task_id)
+
+    def annotation_approval_task(self, task_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT t.*,v.ordinal AS corrected_version_ordinal,
+                       s.original_name,p.id AS project_id,p.name AS project_name,
+                       submitter.display_name AS submitted_by_name,
+                       reviewer.display_name AS reviewed_by_name
+                FROM annotation_approval_tasks t
+                JOIN corrected_versions v ON v.id=t.corrected_version_id
+                JOIN sources s ON s.id=t.source_id
+                JOIN projects p ON p.id=s.project_id
+                LEFT JOIN users submitter ON submitter.id=t.submitted_by_user_id
+                LEFT JOIN users reviewer ON reviewer.id=t.reviewed_by_user_id
+                WHERE t.id=?
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return dict(row)
+
+    def annotation_approval_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
+        parameters: list[Any] = []
+        where = ""
+        if status:
+            where = "WHERE t.status=?"
+            parameters.append(status)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT t.*,v.ordinal AS corrected_version_ordinal,
+                       s.original_name,p.id AS project_id,p.name AS project_name,
+                       submitter.display_name AS submitted_by_name,
+                       reviewer.display_name AS reviewed_by_name
+                FROM annotation_approval_tasks t
+                JOIN corrected_versions v ON v.id=t.corrected_version_id
+                JOIN sources s ON s.id=t.source_id
+                JOIN projects p ON p.id=s.project_id
+                LEFT JOIN users submitter ON submitter.id=t.submitted_by_user_id
+                LEFT JOIN users reviewer ON reviewer.id=t.reviewed_by_user_id
+                {where}
+                ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,t.created_at DESC
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def decide_annotation_approval(
+        self,
+        task_id: str,
+        decision: str,
+        note: str,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        if decision not in {"approved", "rejected", "returned"}:
+            raise ValueError("Invalid approval decision")
+        if decision != "approved" and not note.strip():
+            raise ValueError("A review note is required when returning or rejecting a version")
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT * FROM annotation_approval_tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                connection.rollback()
+                raise KeyError(task_id)
+            if task["status"] != "pending":
+                connection.rollback()
+                raise ValueError("This approval task is no longer pending")
+            version = connection.execute(
+                "SELECT * FROM corrected_versions WHERE id=?",
+                (task["corrected_version_id"],),
+            ).fetchone()
+            revision = connection.execute(
+                """
+                SELECT content_fingerprint FROM annotation_revisions
+                WHERE source_id=? AND version=?
+                """,
+                (task["source_id"], task["annotation_version"]),
+            ).fetchone()
+            if (
+                version is None
+                or int(version["current_annotation_version"]) != int(task["annotation_version"])
+                or revision is None
+                or (
+                    revision["content_fingerprint"]
+                    or version["content_fingerprint"]
+                )
+                != task["content_fingerprint"]
+            ):
+                connection.execute(
+                    "UPDATE annotation_approval_tasks SET status='superseded',updated_at=? WHERE id=?",
+                    (now, task_id),
+                )
+                connection.commit()
+                raise VersionConflictError("The submitted content was superseded")
+            connection.execute(
+                """
+                UPDATE annotation_approval_tasks
+                SET status=?,reviewed_by_user_id=?,review_note=?,updated_at=?,decided_at=?
+                WHERE id=?
+                """,
+                (decision, principal.user_id, note.strip(), now, now, task_id),
+            )
+            version_status = "approved" if decision == "approved" else "rejected"
+            connection.execute(
+                """
+                UPDATE corrected_versions
+                SET status=?,approved_at=?,approved_by_user_id=?,decision_note=?,updated_at=?
+                WHERE id=?
+                """,
+                (
+                    version_status,
+                    now if decision == "approved" else None,
+                    principal.user_id if decision == "approved" else None,
+                    note.strip(),
+                    now,
+                    task["corrected_version_id"],
+                ),
+            )
+            connection.commit()
+        return self.annotation_approval_task(task_id)
+
+    def retention_preview(self, source_id: str) -> dict[str, Any]:
+        versions = self.corrected_versions(source_id)
+        approved = next((item for item in versions if item["status"] == "approved"), None)
+        if approved is None:
+            raise ValueError("Approve a corrected version before choosing retention")
+        affected = [item for item in versions if item["id"] != approved["id"]]
+        with self.connect() as connection:
+            estimated = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(length(r.annotation_json)),0)
+                    FROM annotation_revisions r
+                    JOIN corrected_versions v ON v.source_id=r.source_id
+                      AND (
+                        v.id=r.corrected_version_id
+                        OR (r.corrected_version_id IS NULL AND v.ordinal=r.version)
+                      )
+                    WHERE v.source_id=? AND v.id<>?
+                    """,
+                    (source_id, approved["id"]),
+                ).fetchone()[0]
+            )
+        return {
+            "approved_version": approved,
+            "affected_versions": [item["ordinal"] for item in affected],
+            "estimated_bytes": estimated,
+        }
+
+    def create_verified_catalog_backup(self, label: str) -> dict[str, Any]:
+        """Create a consistent SQLite backup and verify it before retention changes."""
+        safe_label = "".join(value for value in label if value.isalnum() or value in {"-", "_"})
+        timestamp = self._now_datetime().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        directory = self.path.parent / "backups"
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / (
+            f"catalog-{safe_label or 'backup'}-{timestamp}-{secrets.token_hex(4)}.sqlite3"
+        )
+        source_connection = sqlite3.connect(self.path, timeout=30)
+        target_connection = sqlite3.connect(destination)
+        try:
+            source_connection.backup(target_connection)
+            result = target_connection.execute("PRAGMA integrity_check").fetchone()
+            if result is None or result[0] != "ok":
+                raise RuntimeError("The retention backup failed its integrity check")
+        except Exception:
+            target_connection.close()
+            source_connection.close()
+            destination.unlink(missing_ok=True)
+            raise
+        else:
+            target_connection.close()
+            source_connection.close()
+        return {
+            "relative_path": destination.relative_to(self.path.parent).as_posix(),
+            "sha256": self._file_sha256(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+
+    def record_retention_decision(
+        self,
+        source_id: str,
+        mode: str,
+        backup_reference: str | None,
+        *,
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        if mode not in {"keep_all", "archive_older"}:
+            raise ValueError("Invalid retention mode")
+        preview = self.retention_preview(source_id)
+        if mode == "archive_older":
+            backup = self.create_verified_catalog_backup(f"before-retention-{source_id}")
+            backup_reference = (
+                f"{backup['relative_path']}#sha256={backup['sha256']}"
+            )
+        now_dt = self._now_datetime().astimezone(UTC)
+        now = now_dt.isoformat()
+        execute_after = (now_dt + timedelta(days=10)).isoformat() if mode == "archive_older" else None
+        decision_id = new_id("retention")
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_mutation_row(connection, source_id, principal=principal)
+            connection.execute(
+                """
+                UPDATE corrected_version_retention_decisions
+                SET status='cancelled',updated_at=?
+                WHERE source_id=? AND status IN ('waiting','blocked')
+                """,
+                (now, source_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO corrected_version_retention_decisions(
+                    id,source_id,approved_corrected_version_id,mode,decided_by_user_id,
+                    affected_versions_json,estimated_bytes,backup_reference,execute_after,
+                    status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    decision_id,
+                    source_id,
+                    preview["approved_version"]["id"],
+                    mode,
+                    principal.user_id,
+                    _json(preview["affected_versions"]),
+                    preview["estimated_bytes"],
+                    backup_reference,
+                    execute_after,
+                    "waiting" if mode == "archive_older" else "complete",
+                    now,
+                    now,
+                ),
+            )
+            if mode == "archive_older":
+                connection.execute(
+                    """
+                    UPDATE corrected_versions
+                    SET retention_state='archive_pending',archive_eligible_at=?,updated_at=?
+                    WHERE source_id=? AND id<>?
+                    """,
+                    (execute_after, now, source_id, preview["approved_version"]["id"]),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE corrected_versions
+                    SET retention_state='keep',archive_eligible_at=NULL,updated_at=?
+                    WHERE source_id=? AND retention_state='archive_pending'
+                    """,
+                    (now, source_id),
+                )
+            connection.commit()
+        return {
+            "id": decision_id,
+            "mode": mode,
+            "status": "waiting" if mode == "archive_older" else "complete",
+            "execute_after": execute_after,
+            **preview,
+        }
+
+    def cleanup_expired_annotation_payloads(self) -> dict[str, Any]:
+        """Remove only expired, unreferenced non-current annotation payloads."""
+        now = self._now()
+        removed: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT r.id,r.source_id,r.version,r.corrected_version_id,
+                       length(r.annotation_json) AS size_bytes,
+                       COALESCE(r.content_fingerprint,v.content_fingerprint) AS fingerprint,
+                       v.id AS visible_version_id,v.ordinal,v.status,
+                       v.current_annotation_version,v.retention_state AS version_retention_state,
+                       v.archive_eligible_at,r.recoverable_until
+                FROM annotation_revisions r
+                LEFT JOIN corrected_versions v ON v.source_id=r.source_id
+                  AND (
+                    v.id=r.corrected_version_id
+                    OR (r.corrected_version_id IS NULL AND v.ordinal=r.version)
+                  )
+                JOIN sources s ON s.id=r.source_id
+                WHERE r.retention_state<>'payload_removed'
+                  AND r.version<>s.active_annotation_version
+                  AND (
+                    (r.retention_state='recoverable' AND r.recoverable_until<=?)
+                    OR (
+                      v.retention_state='archive_pending'
+                      AND v.archive_eligible_at<=?
+                      AND v.status<>'approved'
+                    )
+                  )
+                ORDER BY r.source_id,r.version
+                """,
+                (now, now),
+            ).fetchall()
+            for row in rows:
+                references = {
+                    "immutable_outputs": connection.execute(
+                        """
+                        SELECT COUNT(*) FROM annotation_version_references
+                        WHERE source_id=? AND annotation_version=?
+                        """,
+                        (row["source_id"], row["version"]),
+                    ).fetchone()[0],
+                    "approval_tasks": connection.execute(
+                        """
+                        SELECT COUNT(*) FROM annotation_approval_tasks
+                        WHERE source_id=? AND annotation_version=? AND status='pending'
+                        """,
+                        (row["source_id"], row["version"]),
+                    ).fetchone()[0],
+                }
+                active_references = {key: int(value) for key, value in references.items() if value}
+                if active_references:
+                    blocked.append(
+                        {
+                            "source_id": row["source_id"],
+                            "annotation_version": row["version"],
+                            "references": active_references,
+                        }
+                    )
+                    continue
+                connection.execute(
+                    """
+                    UPDATE annotation_revisions
+                    SET annotation_json='{}',retention_state='payload_removed',
+                        content_fingerprint=COALESCE(content_fingerprint,?),
+                        payload_removed_at=?
+                    WHERE id=?
+                    """,
+                    (row["fingerprint"], now, row["id"]),
+                )
+                removed.append(
+                    {
+                        "source_id": row["source_id"],
+                        "annotation_version": int(row["version"]),
+                        "corrected_version_ordinal": row["ordinal"],
+                        "size_bytes": int(row["size_bytes"] or 0),
+                    }
+                )
+            connection.execute(
+                """
+                UPDATE corrected_versions
+                SET retention_state='payload_removed',updated_at=?
+                WHERE retention_state='archive_pending'
+                  AND archive_eligible_at<=?
+                  AND id NOT IN (
+                    SELECT DISTINCT corrected_version_id FROM annotation_revisions
+                    WHERE corrected_version_id IS NOT NULL AND retention_state<>'payload_removed'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM annotation_revisions r
+                    WHERE r.source_id=corrected_versions.source_id
+                      AND r.corrected_version_id IS NULL
+                      AND r.version=corrected_versions.ordinal
+                      AND r.retention_state<>'payload_removed'
+                  )
+                """,
+                (now, now),
+            )
+            due_decisions = connection.execute(
+                """
+                SELECT id,source_id FROM corrected_version_retention_decisions
+                WHERE status IN ('waiting','blocked') AND execute_after<=?
+                """,
+                (now,),
+            ).fetchall()
+            for decision in due_decisions:
+                remaining = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM annotation_revisions r
+                    JOIN corrected_versions v ON v.source_id=r.source_id
+                      AND (
+                        v.id=r.corrected_version_id
+                        OR (r.corrected_version_id IS NULL AND v.ordinal=r.version)
+                      )
+                    WHERE v.source_id=? AND v.retention_state='archive_pending'
+                      AND v.archive_eligible_at<=? AND r.retention_state<>'payload_removed'
+                    """,
+                    (decision["source_id"], now),
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    UPDATE corrected_version_retention_decisions
+                    SET status=?,updated_at=? WHERE id=?
+                    """,
+                    ("blocked" if remaining else "complete", now, decision["id"]),
+                )
+            connection.commit()
+        return {
+            "removed": removed,
+            "blocked": blocked,
+            "released_bytes": sum(item["size_bytes"] for item in removed),
+        }
 
     def replace_initial_annotation(
         self, source_id: str, annotation: AnnotationDocument
@@ -2182,17 +3518,145 @@ class StudioCatalog:
                     raise VersionConflictError(
                         f"Expected annotation version {expected}, current version is {current}"
                     )
-                value = AnnotationDocument.model_validate(raw).model_copy(
+                incoming = AnnotationDocument.model_validate(raw)
+                incoming_fingerprint = _annotation_content_fingerprint(incoming)
+                corrected = connection.execute(
+                    """
+                    SELECT * FROM corrected_versions
+                    WHERE source_id=? AND current_annotation_version=?
+                    """,
+                    (source_id, current),
+                ).fetchone()
+                if (
+                    corrected is not None
+                    and corrected["content_fingerprint"] == incoming_fingerprint
+                ):
+                    return current
+                value = incoming.model_copy(
                     update={"source_id": source_id, "version": current + 1}
                 )
+                create_version = corrected is None or corrected["status"] in {
+                    "pending",
+                    "approved",
+                }
+                if create_version:
+                    connection.execute(
+                        """
+                        UPDATE corrected_versions
+                        SET status='rejected',
+                            decision_note='Superseded by a newer corrected version',
+                            updated_at=?
+                        WHERE source_id=? AND status='pending'
+                        """,
+                        (now, source_id),
+                    )
+                    ordinal = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(ordinal),0)+1 FROM corrected_versions WHERE source_id=?",
+                            (source_id,),
+                        ).fetchone()[0]
+                    )
+                    corrected_version_id = new_id("corrected")
+                    generation = 1
+                    connection.execute(
+                        """
+                        INSERT INTO corrected_versions(
+                            id,source_id,ordinal,current_annotation_version,
+                            content_fingerprint,status,created_at,updated_at
+                        ) VALUES(?,?,?,?,?,'unapproved',?,?)
+                        """,
+                        (
+                            corrected_version_id,
+                            source_id,
+                            ordinal,
+                            value.version,
+                            incoming_fingerprint,
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE annotation_approval_tasks
+                        SET status='superseded',updated_at=?
+                        WHERE source_id=? AND status='pending'
+                        """,
+                        (now, source_id),
+                    )
+                else:
+                    corrected_version_id = str(corrected["id"])
+                    generation_row = connection.execute(
+                        "SELECT generation FROM annotation_revisions WHERE source_id=? AND version=?",
+                        (source_id, current),
+                    ).fetchone()
+                    generation = int(generation_row["generation"] or 1) + 1
+
+                shared_aligned_words_id = None
+                stored_value = value
+                if value.aligned_words:
+                    aligned_payload = _json(value.aligned_words)
+                    aligned_fingerprint = hashlib.sha256(
+                        aligned_payload.encode("utf-8")
+                    ).hexdigest()
+                    shared_aligned_words_id = f"aligned_words_{aligned_fingerprint[:32]}"
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO annotation_shared_blobs(
+                            id,kind,content_fingerprint,payload_json,created_at
+                        ) VALUES(?,'aligned_words',?,?,?)
+                        """,
+                        (shared_aligned_words_id, aligned_fingerprint, aligned_payload, now),
+                    )
+                    stored_value = value.model_copy(update={"aligned_words": []})
                 connection.execute(
                     """
                     INSERT INTO annotation_revisions(
-                        source_id,version,annotation_json,created_at
-                    ) VALUES(?,?,?,?)
+                        source_id,version,annotation_json,created_at,corrected_version_id,
+                        generation,content_fingerprint,parent_annotation_version,
+                        origin,change_summary_json,retention_state,shared_aligned_words_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (source_id, value.version, value.model_dump_json(), now),
+                    (
+                        source_id,
+                        value.version,
+                        stored_value.model_dump_json(),
+                        now,
+                        corrected_version_id,
+                        generation,
+                        incoming_fingerprint,
+                        current if current else None,
+                        "system",
+                        _json({"job_id": job_id, "kind": kind}),
+                        "current",
+                        shared_aligned_words_id,
+                    ),
                 )
+                if not create_version:
+                    recovery_until = (
+                        self._now_datetime() + timedelta(days=10)
+                    ).astimezone(UTC).isoformat()
+                    connection.execute(
+                        """
+                        UPDATE annotation_revisions
+                        SET corrected_version_id=?,retention_state='recoverable',
+                            recoverable_until=?
+                        WHERE source_id=? AND version=?
+                        """,
+                        (corrected_version_id, recovery_until, source_id, current),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE corrected_versions
+                        SET current_annotation_version=?,content_fingerprint=?,
+                            status='unapproved',updated_at=? WHERE id=?
+                        """,
+                        (
+                            value.version,
+                            incoming_fingerprint,
+                            now,
+                            corrected_version_id,
+                        ),
+                    )
                 connection.execute(
                     """
                     UPDATE sources SET active_annotation_version=?,clips_stale=1,

@@ -1,6 +1,6 @@
 # Moshi Dataset Studio — Executable Phases
 
-Status: P0 and P1 complete; P2 implementation awaiting local UI acceptance; external backup replication remains pending
+Status: P0 through P5 implementation complete; external backup replication remains pending
 Specification: [FINAL_PRODUCT_IMPLEMENTATION_PLAN.md](FINAL_PRODUCT_IMPLEMENTATION_PLAN.md)
 
 ## How to execute this program
@@ -30,7 +30,7 @@ P0 Baseline
          └─ P2 Layout and commands
              └─ P3 Chapters and long-source performance
                  └─ P4 Review productivity
-                     └─ P5 Immutable model transcript
+                    └─ P5 Machine transcripts, versions, and approval
                          └─ P6 Overlap editing
                              ├─ P7 Admin evaluation
                              └─ P8 Admin training preparation
@@ -152,7 +152,7 @@ A single synchronized player API used by waveform, video, transcript, and future
 
 Goal: establish the final interaction shell before adding more review tools.
 
-Status: **implementation complete; awaiting local UI acceptance (2026-09-09)**  
+Status: **complete (2026-09-11)**  
 Evidence: [P2_REVIEW_WORKSPACE.md](P2_REVIEW_WORKSPACE.md)
 
 ### Tasks
@@ -187,14 +187,18 @@ The final responsive review shell with accessible mouse and keyboard operation.
 - [x] Keyboard-only consecutive-segment review works.
 - [x] Sticky content never hides the transcript or dialogs.
 - [x] Shortcuts never fire while typing or using native controls.
+- [x] The transcript remains scrollable at normal zoom and the desktop tool rail has a safe,
+  user-adjustable width.
 
-Deferred until the interface updates are finished: server-save criteria, revision frequency,
-checkpoint grouping, and how dense revision history should be presented. Existing revisions remain
-untouched.
+The previously deferred Save/version decision is now resolved by
+[P5_TRANSCRIPT_AND_SAVE_POLICY.md](P5_TRANSCRIPT_AND_SAVE_POLICY.md). P2 itself still leaves existing
+revisions untouched.
 
 ## P3 — Review chapters and long-source performance
 
 Goal: make multi-hour sources practical without modifying their media or global timestamps.
+
+Status: implementation and automated gate complete on 2026-09-10; local UI acceptance remains available.
 
 Deferred UX decision for this phase: determine the maximum number of segments shown in one chapter
 or list window, using real-source testing before fixing the default. This limit must prevent difficult
@@ -202,29 +206,29 @@ segment selection without changing global timestamps or deleting segments.
 
 ### Tasks
 
-- **P3-T1 — Chapter persistence**
+- [x] **P3-T1 — Chapter persistence**
   - Add chapter-set, chapter, and chapter-review migrations and catalog methods.
   - Add maximum-duration and count-based configuration APIs.
 
-- **P3-T2 — Boundary generation**
+- [x] **P3-T2 — Boundary generation**
   - Generate a default maximum-30-minute chapter set.
   - Snap boundaries to silence or transcript boundaries without cutting aligned words.
   - Persist boundary reasons.
 
-- **P3-T3 — Chapter navigation**
+- [x] **P3-T3 — Chapter navigation**
   - Add previous/next, direct selection, time range, counts, and URL/session restoration.
   - Keep annotation times global.
 
-- **P3-T4 — Peak-backed waveform**
+- [x] **P3-T4 — Peak-backed waveform**
   - Consume existing precomputed peaks for the overview.
   - Add multi-resolution peak windows for detailed chapter zoom.
   - Avoid full-WAV decoding for waveform drawing.
 
-- **P3-T5 — Transcript virtualization**
+- [x] **P3-T5 — Transcript virtualization**
   - Render only the current chapter and virtual viewport.
   - Preserve selection, variable row heights, RTL text, and keyboard navigation.
 
-- **P3-T6 — State performance**
+- [x] **P3-T6 — State performance**
   - Replace render-time whole-annotation serialization with explicit change tracking.
   - Isolate high-frequency playhead updates from the full transcript tree.
 
@@ -234,41 +238,46 @@ Stable chapter navigation and bounded browser work for long sources.
 
 ### Gate
 
-- Default chapters never exceed 30 minutes.
-- Count mode produces the requested count when valid.
-- Boundaries preserve words and segments.
-- Multi-hour source load does not scale DOM or waveform decode with full duration.
+- [x] Default chapters never exceed 30 minutes.
+- [x] Count mode produces the requested count when valid.
+- [x] Boundaries preserve words and segments.
+- [x] Multi-hour source load does not scale DOM or waveform decode with full duration.
+
+Implementation and verification details: [P3_REVIEW_CHAPTERS.md](P3_REVIEW_CHAPTERS.md).
 
 ## P4 — Verification, discovery, resilience, and channel audition
 
 Goal: turn the editor into an efficient repeatable review workflow.
 
+Status: **implementation and automated gate complete on 2026-09-10; local UI acceptance remains available.**
+Evidence: [P4_REVIEW_WORKFLOW.md](P4_REVIEW_WORKFLOW.md)
+
 ### Tasks
 
-- **P4-T1 — Human verification**
+- [x] **P4-T1 — Human verification**
   - Add verify/unverify and Verify then next.
   - Clear verification after relevant text, speaker, timing, split, join, or overlap changes.
 
-- **P4-T2 — Completion progress**
+- [x] **P4-T2 — Completion progress**
   - Calculate eligible, verified, blocked, and completed counts for chapter and source.
   - Tie completion to an annotation revision and mark it stale after edits.
 
-- **P4-T3 — Search and filters**
+- [x] **P4-T3 — Search and filters**
   - Add text, speaker, flag, verification, alignment, overlap, empty-text, edited, and chapter filters.
 
-- **P4-T4 — Quality queue**
+- [x] **P4-T4 — Quality queue**
   - Surface existing priority data and navigate directly to the correct chapter and segment.
   - Distinguish local working-state counts from saved server counts.
 
-- **P4-T5 — Auto-follow**
+- [x] **P4-T5 — Auto-follow**
   - Follow the playing segment until manual scrolling suspends it.
   - Add Return to playhead.
 
-- **P4-T6 — Local draft recovery**
+- [x] **P4-T6 — Local draft recovery**
   - Add user/source/base-revision IndexedDB drafts.
   - Add restore, inspect, discard, conflict, purge, and deployment-disable behavior.
 
-- **P4-T7 — Channel audition**
+- [x] **P4-T7 — Channel audition**
   - Add Mixed, Left, Right, Speaker A, and Speaker B modes when verified channel data exists.
 
 ### Deliverable
@@ -277,43 +286,91 @@ A measurable, searchable, recoverable, keyboard-efficient review workflow.
 
 ### Gate
 
-- Completion and verification remain correct across save/reload.
-- Draft recovery cannot overwrite newer server work.
-- Queue and auto-follow open the correct chapter and segment.
-- Audition mode does not alter stored routing.
+- [x] Completion and verification remain correct across save/reload.
+- [x] Draft recovery cannot overwrite newer server work.
+- [x] Queue and auto-follow open the correct chapter and segment.
+- [x] Audition mode does not alter stored routing.
 
-## P5 — Immutable original model transcript
+## P5 — Immutable machine transcripts, corrected versions, and approval
 
-Goal: create a trustworthy provenance foundation for evaluation and training.
+Goal: create trustworthy transcript provenance, compact safe saving, and whole-source final
+approval for evaluation and training.
+
+Status: **complete (2026-09-11)**  
+Policy: [P5_TRANSCRIPT_AND_SAVE_POLICY.md](P5_TRANSCRIPT_AND_SAVE_POLICY.md)
 
 ### Tasks
 
-- **P5-T1 — Model-run schema**
-  - Add model-run and annotation-actor migrations.
+- [x] **P5-T1 — Machine transcript schema**
+  - Add source-local M1/M2/M3 transcript ordinals and annotation-actor migrations.
+  - Record producer/model metadata while keeping the M number independent of model family.
   - Reference checksum-verified raw, aligned, and diarization artifacts.
 
-- **P5-T2 — Historical backfill**
+- [x] **P5-T2 — Historical backfill**
   - Backfill from registered analysis artifacts.
-  - Mark missing raw output unavailable without inference or reconstruction.
+  - Mark missing raw output unavailable without inference or reconstruction, and mark unavailable
+    historical model/config metadata as `historical_unknown` rather than borrowing current settings.
 
-- **P5-T3 — Model-run APIs**
-  - Add typed admin retrieval and availability endpoints.
+- [x] **P5-T3 — Machine transcript APIs**
+  - Add typed retrieval and availability endpoints with source-local M labels.
   - Enforce server-side admin authorization and artifact ownership.
 
-- **P5-T4 — Editable-model-text deprecation**
+- [x] **P5-T4 — Corrected version and Save contract**
+  - Add visible corrected versions backed by immutable internal generations.
+  - Make Save update the eligible current unapproved version and make the split-button action Save
+    as new version; creating a version requires no admin approval.
+  - Add authoritative no-op fingerprints, optimistic generation conflicts, actor/origin metadata,
+    and generated change summaries.
+
+- [x] **P5-T5 — Recovery and local Undo**
+  - Retain replaced server generations for 10 days without showing them as corrected versions.
+  - Keep crash recovery and bounded Undo/Redo browser-side; neither creates a server version.
+
+- [x] **P5-T6 — Whole-source admin approval**
+  - Allow only a clean, fully verified, blocker-free latest version to be submitted.
+  - Freeze pending content and add admin approve/reject/return tasks with actor and fingerprint.
+  - Lock approved final versions permanently; later edits start a new unapproved version.
+
+- [x] **P5-T7 — Approved-history retention**
+  - After approval, offer Keep all or the recommended verified-backup/archive-for-10-days policy.
+  - Refuse payload cleanup while any evaluation, training package, approval, or immutable output
+    references the version; retain permanent audit metadata after eligible payload cleanup.
+  - Allow Keep all to cancel a waiting archive decision safely.
+
+- [x] **P5-T8 — Editable-model-text deprecation**
   - Retain segment `model_text` for compatibility and inline hints.
   - Remove it from authoritative evaluation logic.
 
 ### Deliverable
 
-Immutable, independently retrievable model runs and attributable corrected revisions.
+Immutable, independently retrievable M transcripts; attributable corrected versions with compact,
+recoverable saving; and an approved final whole-source version.
 
 ### Gate
 
-- Split/join/edit operations cannot change the stored model hypothesis.
-- Backfill is idempotent.
-- Historical missing-artifact states are explicit.
-- Non-admin model-run access is rejected.
+- [x] Split/join/edit operations cannot change any stored M transcript.
+- [x] M labels identify successive transcripts for a source, not model families.
+- [x] Backfill is idempotent.
+- [x] Historical missing-artifact states are explicit.
+- [x] Non-admin machine-transcript artifact access is rejected.
+- [x] Save and Save as new version follow the approved split-button contract.
+- [x] Overwritten generations remain recoverable for 10 days and local Undo remains available.
+- [x] Admin approval is required only for whole-source final approval, not for creating a new version.
+
+### Completion evidence
+
+- Schema 9 was rehearsed twice; provenance-hardening schema 10 and retention-audit schema 11 were
+  each rehearsed again against the production-size catalog before deployment.
+- Every rehearsal and the deployed migration preserved all 2,502 annotation revisions and their
+  combined annotation-payload SHA-256
+  `df3b625d389035725d52c36758a6ed11e77f76732dd2580921e57affd63847e5`; SQLite integrity and
+  foreign-key checks passed.
+- The deployed backfill created 2,502 corrected-version mappings and 55 immutable M1 snapshots
+  for the 55 sources with registered machine artifacts; the two sources without machine output did
+  not receive a fabricated M version.
+- Future aligned-word arrays are content-addressed and stored once, then transparently rehydrated.
+- Backend: 250 tests passed. Frontend: 221 tests passed. Production frontend build passed.
+- Approved versions are immutable and retention cleanup cannot break dependent provenance.
 
 ## P6 — Direct overlap editing
 

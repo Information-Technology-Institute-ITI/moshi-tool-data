@@ -188,4 +188,16 @@ describe("PlaybackController", () => {
       error: "decoder unavailable",
     });
   });
+
+  it("changes audition mode without changing playback or range state", async () => {
+    const { controller } = setup();
+    await controller.markReady();
+    await controller.playRange({ start_sample: 24_000, end_sample: 48_000, behavior: "loop" });
+    controller.setAuditionMode("speaker_b");
+    expect(controller.snapshot()).toMatchObject({
+      status: "playing",
+      audition_mode: "speaker_b",
+      active_range: { start_sample: 24_000, end_sample: 48_000, behavior: "loop" },
+    });
+  });
 });

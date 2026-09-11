@@ -12,6 +12,7 @@ from moshi_data_pipeline.studio.auth import (
     verify_password,
 )
 from moshi_data_pipeline.studio.catalog import StudioCatalog
+from moshi_data_pipeline.studio.migrations import LATEST_SCHEMA_VERSION
 from moshi_data_pipeline.studio.server import create_studio_app
 
 ORIGIN = "http://testserver"
@@ -234,5 +235,5 @@ def test_existing_v4_database_upgrades_with_auth_tables(tmp_path) -> None:
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert version == 7
+    assert version == LATEST_SCHEMA_VERSION
     assert {"users", "email_verification_tokens", "user_sessions"} <= tables

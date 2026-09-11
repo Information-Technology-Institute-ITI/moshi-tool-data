@@ -119,18 +119,36 @@ def create_waveform_peaks(
     with sf.SoundFile(audio_path) as stream:
         sample_rate = int(stream.samplerate)
         frames = int(stream.frames)
-        block = max(1, int(np.ceil(frames / points)))
-        values: list[list[float]] = []
+        # Keep roughly 20 peak pairs per second for chapter zoom, with a hard
+        # bound for very long recordings. The legacy `points` field remains a
+        # compact whole-source overview.
+        detailed_target = max(points, min(200_000, int(np.ceil(frames / max(1, sample_rate // 20)))))
+        block = max(1, int(np.ceil(frames / detailed_target)))
+        detailed: list[list[float]] = []
         while True:
             audio = stream.read(block, dtype="float32", always_2d=True)
             if not len(audio):
                 break
             mono = audio[:, 0]
-            values.append([round(float(mono.min()), 6), round(float(mono.max()), 6)])
+            detailed.append([round(float(mono.min()), 6), round(float(mono.max()), 6)])
+    overview_block = max(1, int(np.ceil(len(detailed) / points)))
+    values = [
+        [
+            min(pair[0] for pair in detailed[index : index + overview_block]),
+            max(pair[1] for pair in detailed[index : index + overview_block]),
+        ]
+        for index in range(0, len(detailed), overview_block)
+    ]
     payload = {
         "sample_rate": sample_rate,
         "duration_samples": frames,
         "points": values,
+        "levels": [
+            {
+                "samples_per_point": block,
+                "points": detailed,
+            }
+        ],
     }
     atomic_write_json(destination, payload)
     return payload

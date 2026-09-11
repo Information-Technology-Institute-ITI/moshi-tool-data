@@ -184,6 +184,12 @@ export function updateSegment(
   const before = annotation.transcript.find((item) => item.id === id);
   if (!before) return annotation;
   const after = { ...before, ...patch };
+  const verificationInputChanged =
+    after.text !== before.text
+    || after.speaker !== before.speaker
+    || after.start_sample !== before.start_sample
+    || after.end_sample !== before.end_sample;
+  if (verificationInputChanged) after.human_verified = false;
   const transcript = annotation.transcript.map((item) =>
     item.id === id ? after : item,
   );
@@ -822,7 +828,7 @@ function overlapSegment(
 /**
  * Gives the quieter speaker their own segment over each overlapped stretch.
  *
- * The original segment is left exactly as it is, words and all: the overlapped
+ * The original segment keeps its words and timing: the overlapped
  * words are copied, not moved, because both people really were talking. Saving
  * then keeps both — the full range under its original speaker, and the short
  * overlapped range under the other one.
@@ -839,7 +845,12 @@ export function addOverlapSegments(
   if (!windows.length) return { annotation, ids: [] };
   const parts = windows.map((window) => overlapSegment(annotation, segment, window));
   return {
-    annotation: withTranscript(annotation, [...annotation.transcript, ...parts]),
+    annotation: withTranscript(annotation, [
+      ...annotation.transcript.map((item) => (
+        item.id === segment.id ? { ...item, human_verified: false } : item
+      )),
+      ...parts,
+    ]),
     ids: parts.map((part) => part.id),
   };
 }

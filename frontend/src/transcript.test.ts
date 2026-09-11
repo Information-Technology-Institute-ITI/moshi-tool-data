@@ -97,6 +97,25 @@ describe("ordering and lookup", () => {
   });
 });
 
+describe("human verification", () => {
+  const verified = annotationWith([{ ...base.transcript[0], human_verified: true }]);
+
+  it("keeps verification when only review metadata changes", () => {
+    const next = updateSegment(verified, "u1", { human_verified: true });
+    expect(next.transcript[0].human_verified).toBe(true);
+  });
+
+  it.each([
+    ["text", { text: "corrected" }],
+    ["speaker", { speaker: "B" as const }],
+    ["start", { start_sample: 1 }],
+    ["end", { end_sample: 23_999 }],
+  ])("clears verification after a %s correction", (_label, patch) => {
+    const next = updateSegment(verified, "u1", patch);
+    expect(next.transcript[0].human_verified).toBe(false);
+  });
+});
+
 describe("add and delete", () => {
   it("adds a segment and keeps the list chronological", () => {
     const result = addSegment(base, 12_000, 18_000, "B", "interjection");
@@ -809,6 +828,15 @@ describe("overlapping speech gets a segment for each speaker", () => {
     // Both people really were talking, so the words are copied, not moved.
     expect(original).toEqual(annotation.transcript[0]);
     expect(result.annotation.aligned_words).toEqual(annotation.aligned_words);
+  });
+
+  it("clears verification when overlap changes the review context", () => {
+    const annotation = overlapping({
+      transcript: [{ ...overlapping().transcript[0], human_verified: true }],
+    });
+    const result = addOverlapSegments(annotation, "u1");
+    expect(result.annotation.transcript.find((item) => item.id === "u1")?.human_verified)
+      .toBe(false);
   });
 
   it("leaves the lanes untouched, because they are what it read", () => {

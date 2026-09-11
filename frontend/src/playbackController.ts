@@ -184,6 +184,11 @@ export class PlaybackController {
     this.update({ rate, error: null });
   }
 
+  setAuditionMode(mode: PlaybackState["audition_mode"]): void {
+    if (!["mixed", "left", "right", "speaker_a", "speaker_b"].includes(mode)) return;
+    this.update({ audition_mode: mode });
+  }
+
   handleTimeUpdate(seconds: number): void {
     const sample = this.clampSample(Math.round(seconds * PLAYBACK_SAMPLE_RATE));
     if (this.externalSeekTarget !== null) {
