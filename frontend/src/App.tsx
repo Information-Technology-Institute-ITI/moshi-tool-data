@@ -16,6 +16,7 @@ import {
 import AuthScreen from "./components/AuthScreen";
 import ApprovalQueuePage from "./components/ApprovalQueuePage";
 import ErrorBoundary from "./components/ErrorBoundary";
+import EvaluationPage from "./components/EvaluationPage";
 import GpuStatusPage from "./components/GpuStatusPage";
 import IntroPage from "./components/IntroPage";
 import JobProgress from "./components/JobProgress";
@@ -25,6 +26,7 @@ import ReviewChapterNav from "./components/ReviewChapterNav";
 import ReviewPlayerCard from "./components/ReviewPlayerCard";
 import ReviewToolRail from "./components/ReviewToolRail";
 import ReviewWorkflowPanel from "./components/ReviewWorkflowPanel";
+import OverlapReviewPanel from "./components/OverlapReviewPanel";
 import TranscriptPanel, { type TranscriptPanelHandle } from "./components/TranscriptPanel";
 import WaveformEditor, {
   type FocusRange,
@@ -99,7 +101,7 @@ function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [page, setPage] = useState<"workspace" | "gpu" | "approvals">("workspace");
+  const [page, setPage] = useState<"workspace" | "gpu" | "approvals" | "evaluations">("workspace");
   const stopWatching = useRef<null | (() => void)>(null);
   const studioNavigationGuard = useRef<null | ((action: () => void) => void)>(null);
   const studioDirty = useRef(false);
@@ -222,6 +224,17 @@ function App() {
     if (value) setSource(value);
   }
 
+  async function openSourceFromEvaluation(sourceId: string, projectId: string) {
+    const [projectValue, sourceValue] = await Promise.all([
+      run(() => api<ProjectDetail>(`/api/projects/${projectId}`)),
+      run(() => api<SourceDetail>(`/api/sources/${sourceId}`)),
+    ]);
+    if (!projectValue || !sourceValue) return;
+    setProject(projectValue);
+    setSource(sourceValue);
+    setPage("workspace");
+  }
+
   function monitor(next: Job) {
     setJob(next);
     stopWatching.current?.();
@@ -316,6 +329,11 @@ function App() {
     <GpuStatusPage />
   ) : page === "approvals" && isAdmin ? (
     <ApprovalQueuePage setError={setError} />
+  ) : page === "evaluations" && isAdmin ? (
+    <EvaluationPage
+      setError={setError}
+      onOpenSource={(sourceId, projectId) => void openSourceFromEvaluation(sourceId, projectId)}
+    />
   ) : source && project ? (
     <Studio
       detail={source}
@@ -375,6 +393,14 @@ function App() {
         <div className="top-actions">
           {isAdmin && (
             <>
+              <button
+                className={`system-nav ${page === "evaluations" ? "active" : ""}`}
+                type="button"
+                aria-current={page === "evaluations" ? "page" : undefined}
+                onClick={() => navigate(() => setPage("evaluations"))}
+              >
+                Evaluations
+              </button>
               <button
                 className={`system-nav ${page === "approvals" ? "active" : ""}`}
                 type="button"
@@ -1217,6 +1243,7 @@ function Studio({
   const [history, setHistory] = useState<Annotation[]>([]);
   const [future, setFuture] = useState<Annotation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedOverlapId, setSelectedOverlapId] = useState<string | null>(null);
   const [filteredIds, setFilteredIds] = useState<string[] | null>(null);
   const [focusRange, setFocusRange] = useState<FocusRange | null>(null);
   const [playhead, setPlayhead] = useState(0);
@@ -2088,22 +2115,45 @@ function Studio({
         inspectorRef={setInspectorTarget}
         timelineToolsRef={setTimelineToolsTarget}
         workflowTools={(
-          <ReviewWorkflowPanel
-            annotation={annotation}
-            chapterSegments={activeChapterSegments}
-            filters={reviewFilters}
-            savedQueueCount={detail.quality_dashboard?.review_queue?.length || 0}
-            reviewStatus={activeChapterReview?.status || "not_started"}
-            reviewStale={!!activeChapterReview && (
-              activeChapterReview.stale
-              || activeChapterReview.annotation_version !== savedAnnotation.version
-              || dirty
-            )}
-            disabled={locked || dirty || chapterSet?.annotation_version !== savedAnnotation.version}
-            onFilters={setReviewFilters}
-            onOpenSegment={openQualitySegment}
-            onCompleteChapter={() => void completeActiveChapter()}
-          />
+          <>
+            <ReviewWorkflowPanel
+              annotation={annotation}
+              chapterSegments={activeChapterSegments}
+              filters={reviewFilters}
+              savedQueueCount={detail.quality_dashboard?.review_queue?.length || 0}
+              reviewStatus={activeChapterReview?.status || "not_started"}
+              reviewStale={!!activeChapterReview && (
+                activeChapterReview.stale
+                || activeChapterReview.annotation_version !== savedAnnotation.version
+                || dirty
+              )}
+              disabled={locked || dirty || chapterSet?.annotation_version !== savedAnnotation.version}
+              onFilters={setReviewFilters}
+              onOpenSegment={openQualitySegment}
+              onCompleteChapter={() => void completeActiveChapter()}
+            />
+            <OverlapReviewPanel
+              annotation={annotation}
+              durationSamples={detail.duration_samples || 0}
+              selectedOverlapId={selectedOverlapId}
+              playheadSample={playhead}
+              frameRate={detail.inspection?.video_frame_rate || 25}
+              disabled={locked}
+              onChange={edit}
+              onPlay={(startSample, endSample) => {
+                focusNonce.current += 1;
+                setFocusRange({
+                  start_sample: startSample,
+                  end_sample: endSample,
+                  behavior: "once",
+                  nonce: focusNonce.current,
+                });
+              }}
+              onAudition={(mode) => waveformEditor.current?.setAuditionMode(mode)}
+              onSelectOverlap={setSelectedOverlapId}
+              onError={setError}
+            />
+          </>
         )}
       />
       <div className="studio-main">
@@ -2149,6 +2199,8 @@ function Studio({
             toolTarget={timelineToolsTarget}
             onTimeChange={updatePlayhead}
             onRegionClick={focusRegion}
+            onOverlapClick={setSelectedOverlapId}
+            selectedOverlapId={selectedOverlapId}
             onRegionDelete={setRegionToDelete}
             onChange={edit}
           />

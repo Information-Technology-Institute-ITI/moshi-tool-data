@@ -92,7 +92,7 @@ export interface OverlapReviewRecord extends SampleRange {
   annotation_version: number;
   speaker_a_activity_id: string;
   speaker_b_activity_id: string;
-  classification: "confirmed" | "false_positive" | "third_speaker" | "noise" | "unintelligible";
+  classification: "unreviewed" | "confirmed" | "false_positive" | "third_speaker" | "noise" | "unintelligible";
   training_decision: "raw" | "separate" | "exclude" | "needs_work";
   state: "current" | "stale";
   note: string;

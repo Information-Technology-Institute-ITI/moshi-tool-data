@@ -113,6 +113,27 @@ class TranscriptUtterance(BaseModel):
         return self
 
 
+class OverlapReview(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("overlap_review"))
+    speaker_a_activity_id: str
+    speaker_b_activity_id: str
+    start_sample: int = Field(ge=0)
+    end_sample: int = Field(gt=0)
+    classification: Literal[
+        "unreviewed", "confirmed", "false_positive", "third_speaker", "noise", "unintelligible"
+    ] = "unreviewed"
+    training_decision: Literal["raw", "separate", "exclude", "needs_work"] = "needs_work"
+    state: Literal["current", "stale"] = "current"
+    note: str = Field(default="", max_length=1_000)
+    recovery_artifact_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_bounds(self) -> OverlapReview:
+        if self.end_sample <= self.start_sample:
+            raise ValueError("Overlap review end_sample must be greater than start_sample")
+        return self
+
+
 class AnnotationDocument(BaseModel):
     source_id: str
     version: int = Field(default=0, ge=0)
@@ -125,11 +146,18 @@ class AnnotationDocument(BaseModel):
     speaker_references: list[SpeakerReferenceRegion] = Field(default_factory=list)
     exclusions: list[ExclusionRegion] = Field(default_factory=list)
     transcript: list[TranscriptUtterance] = Field(default_factory=list)
+    overlap_reviews: list[OverlapReview] = Field(default_factory=list)
     aligned_words: list[dict[str, Any]] = Field(default_factory=list)
     note: str = Field(default="", max_length=4_000)
 
     @model_validator(mode="after")
     def valid_channel_routing(self) -> AnnotationDocument:
+        overlap_pairs = [
+            (review.speaker_a_activity_id, review.speaker_b_activity_id)
+            for review in self.overlap_reviews
+        ]
+        if len(overlap_pairs) != len(set(overlap_pairs)):
+            raise ValueError("overlap_reviews must contain at most one review per A/B activity pair")
         if any(channel not in {0, 1} for channel in self.speaker_channel_map.values()):
             raise ValueError("speaker channel indexes must be 0 or 1")
         if self.speaker_channel_map and (

@@ -219,14 +219,13 @@ describe("unified review screen", () => {
     expect(container.querySelector(".flag-chip")?.textContent).toBe("repeated ngram");
   });
 
-  it("renders no removed control anywhere on the screen", async () => {
+  it("renders no retired processing control anywhere on the screen", async () => {
     await openReview(routedFetch());
     const text = container.textContent || "";
     for (const removed of [
       "Generate transcript",
       "Rediarize",
       "Realign",
-      "Overlap",
       "Clips",
       "Golden",
       "Moshi speaker",

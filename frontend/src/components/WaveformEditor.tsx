@@ -4,6 +4,7 @@ import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
 import type { ActivityRegion, Annotation, ExclusionRegion, Speaker } from "../types";
 import { sampleId, seconds } from "../api";
+import { overlapWindows } from "../overlapEditing";
 import type { PlaybackRange, PlaybackState, SampleRange } from "../productContracts";
 import {
   PLAYBACK_SAMPLE_RATE,
@@ -47,6 +48,9 @@ type Props = {
    * the position is what tells the parent which one they meant.
    */
   onRegionClick?: (regionId: string, atSample: number) => void;
+  /** Selects an overlap in the left review tool when its derived lane is clicked. */
+  onOverlapClick?: (overlapId: string) => void;
+  selectedOverlapId?: string | null;
   /**
    * Asks the parent to remove a speaker rectangle. Removing one can also take a
    * transcript segment with it, so the parent confirms first.
@@ -65,6 +69,7 @@ export type WaveformEditorHandle = {
   seekToSample: (sample: number) => void;
   beginSelection: () => void;
   finishActivity: (speaker: Speaker) => void;
+  setAuditionMode: (mode: PlaybackState["audition_mode"]) => void;
 };
 
 const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function WaveformEditor({
@@ -80,6 +85,8 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
   focusRange,
   onTimeChange,
   onRegionClick,
+  onOverlapClick,
+  selectedOverlapId,
   onRegionDelete,
   toolTarget,
   readOnly = false,
@@ -458,6 +465,7 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     seekToSample: (sample) => playbackController.current?.seekToSample(sample),
     beginSelection,
     finishActivity,
+    setAuditionMode: (mode) => playbackController.current?.setAuditionMode(mode),
   }));
 
   const current = playback.current_sample / SAMPLE_RATE;
@@ -478,6 +486,9 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
     item.end_sample > timelineStart && item.start_sample < timelineEnd
   ));
   const visibleExclusions = annotation.exclusions.filter((item) => (
+    item.end_sample > timelineStart && item.start_sample < timelineEnd
+  ));
+  const visibleOverlaps = overlapWindows(annotation).filter((item) => (
     item.end_sample > timelineStart && item.start_sample < timelineEnd
   ));
   const timelineStyle = (startSample: number, endSample: number) => {
@@ -632,6 +643,28 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
         </div>
       )}
       <div className="lane-grid">
+        <div className="lane-row overlap-lane-row">
+          <strong className="lane-label overlap">Overlap</strong>
+          <div className="lane-track">
+            {visibleOverlaps.map((item) => (
+              <button
+                key={item.id}
+                className={`lane-region overlap ${item.review.state}`}
+                style={timelineStyle(item.start_sample, item.end_sample)}
+                onClick={() => {
+                  playbackController.current?.seekToSample(item.start_sample);
+                  onOverlapClick?.(item.id);
+                }}
+                title={`${seconds(item.start_sample)}–${seconds(item.end_sample)}s · ${item.review.classification}`}
+              >
+                A+B
+              </button>
+            ))}
+            {playheadInTimeline && (
+              <span className="lane-playhead" style={{ left: playheadPosition }} aria-hidden="true" />
+            )}
+          </div>
+        </div>
         {(["A", "B"] as Speaker[]).map((speaker) => (
           <div className="lane-row" key={speaker}>
             <strong className={`lane-label speaker-${speaker.toLowerCase()}`}>Speaker {speaker}</strong>
@@ -641,7 +674,10 @@ const WaveformEditor = forwardRef<WaveformEditorHandle, Props>(function Waveform
                 .map((item) => (
                   <button
                     key={item.id}
-                    className={`lane-region speaker-${speaker.toLowerCase()}`}
+                    className={`lane-region speaker-${speaker.toLowerCase()} ${visibleOverlaps.some((overlap) => (
+                      overlap.id === selectedOverlapId
+                      && (overlap.speaker_a_activity_id === item.id || overlap.speaker_b_activity_id === item.id)
+                    )) ? "overlap-contributor" : ""}`}
                     style={timelineStyle(item.start_sample, item.end_sample)}
                     onClick={(event) => {
                       // The lane is a miniature of the selected chapter. Convert

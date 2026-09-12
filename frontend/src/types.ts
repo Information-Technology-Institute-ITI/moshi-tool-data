@@ -119,6 +119,19 @@ export interface TranscriptUtterance {
   review_candidates: TranscriptCandidate[];
 }
 
+export interface OverlapReview {
+  id: string;
+  speaker_a_activity_id: string;
+  speaker_b_activity_id: string;
+  start_sample: number;
+  end_sample: number;
+  classification: "unreviewed" | "confirmed" | "false_positive" | "third_speaker" | "noise" | "unintelligible";
+  training_decision: "raw" | "separate" | "exclude" | "needs_work";
+  state: "current" | "stale";
+  note: string;
+  recovery_artifact_ids: string[];
+}
+
 /**
  * One WhisperX-aligned word. `start` and `end` are seconds on the original
  * source timeline, and are null when alignment could not place the word.
@@ -145,6 +158,7 @@ export interface Annotation {
   speaker_references: SpeakerReferenceRegion[];
   exclusions: ExclusionRegion[];
   transcript: TranscriptUtterance[];
+  overlap_reviews?: OverlapReview[];
   aligned_words: AlignedWord[];
   note: string;
 }

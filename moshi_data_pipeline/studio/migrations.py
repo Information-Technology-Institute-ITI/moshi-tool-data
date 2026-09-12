@@ -927,6 +927,79 @@ def _p5_retention_audit(connection: sqlite3.Connection) -> None:
     )
 
 
+def _p6_overlap_review(connection: sqlite3.Connection) -> None:
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS overlap_reviews (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 1),
+            speaker_a_activity_id TEXT NOT NULL,
+            speaker_b_activity_id TEXT NOT NULL,
+            start_sample INTEGER NOT NULL CHECK(start_sample >= 0),
+            end_sample INTEGER NOT NULL CHECK(end_sample > start_sample),
+            classification TEXT NOT NULL CHECK(classification IN (
+                'unreviewed','confirmed','false_positive','third_speaker','noise','unintelligible'
+            )),
+            training_decision TEXT NOT NULL CHECK(training_decision IN (
+                'raw','separate','exclude','needs_work'
+            )),
+            state TEXT NOT NULL CHECK(state IN ('current','stale')),
+            note TEXT NOT NULL DEFAULT '',
+            reviewer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            recovery_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(source_id, annotation_version, speaker_a_activity_id, speaker_b_activity_id)
+        );
+        CREATE TABLE IF NOT EXISTS overlap_review_events (
+            id TEXT PRIMARY KEY,
+            overlap_review_id TEXT NOT NULL REFERENCES overlap_reviews(id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            annotation_version INTEGER NOT NULL,
+            actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            before_json TEXT,
+            after_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS overlap_reviews_source_idx
+            ON overlap_reviews(source_id, annotation_version, start_sample);
+        CREATE INDEX IF NOT EXISTS overlap_review_events_review_idx
+            ON overlap_review_events(overlap_review_id, created_at);
+        """,
+    )
+
+
+def _p7_evaluation_reports(connection: sqlite3.Connection) -> None:
+    _execute_statements(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS evaluation_reports (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            machine_transcript_version_id TEXT NOT NULL
+                REFERENCES machine_transcript_versions(id),
+            corrected_version_id TEXT NOT NULL REFERENCES corrected_versions(id),
+            annotation_version INTEGER NOT NULL CHECK(annotation_version >= 1),
+            content_fingerprint TEXT NOT NULL CHECK(length(content_fingerprint) = 64),
+            normalization_policy TEXT NOT NULL,
+            overlap_policy TEXT NOT NULL CHECK(overlap_policy IN (
+                'deduplicate','include','exclude'
+            )),
+            scope_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS evaluation_reports_source_idx
+            ON evaluation_reports(source_id, created_at DESC);
+        """,
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "legacy_compatibility", _legacy_compatibility),
     (2, "worker_protocol_v1", _worker_protocol_v1),
@@ -939,6 +1012,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     (9, "transcript_versions_and_approval_v1", _transcript_versions_and_approval_v1),
     (10, "p5_provenance_hardening", _p5_provenance_hardening),
     (11, "p5_retention_audit", _p5_retention_audit),
+    (12, "p6_overlap_review", _p6_overlap_review),
+    (13, "p7_evaluation_reports", _p7_evaluation_reports),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

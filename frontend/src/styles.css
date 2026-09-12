@@ -511,6 +511,49 @@ kbd { padding: .16rem .38rem; border: 1px solid #3b5058; border-bottom-width: 2p
 .command-empty { padding: 1rem; color: var(--muted); text-align: center; }
 .timeline-tools-help { grid-column: 1 / -1; margin: 0; padding: .55rem .65rem; border-left: 2px solid var(--mint); background: #102126; color: var(--muted); font-size: .72rem; line-height: 1.5; }
 
+/* P6 overlap review ---------------------------------------------------- */
+.lane-label.overlap { color: #d7a9ff; }
+.lane-region.overlap { border-color: #8b5db0; background: rgba(177, 114, 226, .42); color: #f0d9ff; font-size: .58rem; }
+.lane-region.overlap.stale { border-color: var(--red); background: rgba(255, 96, 120, .32); }
+.lane-region.overlap-contributor { outline: 2px solid var(--yellow); outline-offset: -2px; filter: brightness(1.2); }
+.overlap-review { display: grid; gap: .6rem; }
+.overlap-summary { display: flex; align-items: baseline; justify-content: space-between; color: var(--muted); font-size: .72rem; }
+.overlap-summary strong { color: #d7a9ff; font-size: 1rem; }
+.overlap-editor-grid { display: grid; gap: .55rem; }
+.overlap-editor-grid label { display: grid; gap: .25rem; color: var(--muted); font-size: .68rem; }
+.overlap-editor-grid input, .overlap-editor-grid select, .overlap-editor-grid textarea { min-width: 0; padding: .45rem; font-size: .72rem; }
+.overlap-editor-grid textarea { min-height: 58px; resize: vertical; }
+.overlap-nudges, .overlap-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .35rem; }
+.overlap-audition { display: grid; grid-template-columns: repeat(3, 1fr); gap: .35rem; }
+.overlap-audition button { padding: .42rem .25rem; font-size: .66rem; }
+.overlap-nudges button, .overlap-actions button { padding: .42rem; font-size: .66rem; }
+.overlap-warning { border-left: 2px solid var(--amber); padding: .45rem .55rem; background: #2a2114; color: #e7d09b; line-height: 1.45; }
+
+/* P7 evaluation -------------------------------------------------------- */
+.evaluation-page { display: grid; gap: 1rem; }
+.evaluation-controls { display: grid; grid-template-columns: minmax(280px, 2fr) repeat(3, minmax(150px, 1fr)); gap: .75rem; }
+.evaluation-controls label { display: grid; gap: .3rem; color: var(--muted); font-size: .72rem; }
+.evaluation-controls select { min-width: 0; }
+.evaluation-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .55rem; }
+.evaluation-controls > small { grid-column: 1 / -1; color: var(--amber); }
+.evaluation-audio { width: 100%; height: 38px; }
+.evaluation-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .7rem; }
+.evaluation-metric { display: grid; gap: .28rem; padding: .9rem; }
+.evaluation-metric small { color: var(--muted); font-size: .67rem; text-transform: uppercase; }
+.evaluation-metric strong { color: var(--mint); font: 1.35rem ui-monospace, monospace; }
+.evaluation-metric span { color: var(--muted); font-size: .68rem; }
+.evaluation-diffs { max-height: 520px; overflow-y: auto; }
+.evaluation-diffs h2, .evaluation-history h2 { margin-bottom: .75rem; }
+.evaluation-diffs > button { width: 100%; display: grid; grid-template-columns: 145px 1fr 1fr; gap: .7rem; margin-bottom: .4rem; padding: .65rem; text-align: left; }
+.evaluation-diffs > button > span { min-width: 0; overflow-wrap: anywhere; }
+.evaluation-diffs small { display: block; margin-bottom: .2rem; color: var(--muted); font-size: .62rem; text-transform: uppercase; }
+.evaluation-history { display: grid; gap: .45rem; }
+.evaluation-history > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .7rem; border-bottom: 1px solid var(--line); padding-bottom: .45rem; }
+.evaluation-history > div > button { display: grid; gap: .18rem; text-align: left; }
+.evaluation-history span, .evaluation-history small { color: var(--muted); font-size: .72rem; }
+.evaluation-history a { color: var(--mint); font-size: .72rem; }
+.evaluation-version-note { border-left: 3px solid var(--mint); background: #102a25; padding: .75rem; color: var(--muted); font-size: .8rem; }
+
 @media (max-width: 900px) {
   .hero, .workspace-heading, .project-grid, .studio-page { grid-template-columns: 1fr; }
   .hero { gap: 2rem; min-height: auto; }
@@ -532,6 +575,8 @@ kbd { padding: .16rem .38rem; border: 1px solid #3b5058; border-bottom-width: 2p
 .project-settings { grid-template-columns: 1fr; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .gpu-status-grid, .gpu-check-layout { grid-template-columns: 1fr; }
+  .evaluation-controls, .evaluation-metrics { grid-template-columns: 1fr 1fr; }
+  .evaluation-diffs > button { grid-template-columns: 1fr; }
   .gpu-check-action { border-top: 1px solid var(--line); border-left: 0; padding-top: 1.25rem; padding-left: 0; }
 }
 
@@ -564,6 +609,7 @@ kbd { padding: .16rem .38rem; border: 1px solid #3b5058; border-bottom-width: 2p
   .gpu-page-heading { align-items: flex-start; flex-direction: column; }
   .gpu-overall-state { width: 100%; text-align: left; }
   .gpu-metric-grid { grid-template-columns: 1fr; }
+  .evaluation-controls, .evaluation-metrics { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 900px) {

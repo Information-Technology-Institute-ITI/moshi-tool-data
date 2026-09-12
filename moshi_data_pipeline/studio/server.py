@@ -55,7 +55,10 @@ from moshi_data_pipeline.studio.gpu_dispatcher import GpuDispatcherSettings
 from moshi_data_pipeline.studio.gpu_status import public_gpu_check
 from moshi_data_pipeline.studio.lifecycle import LifecycleProvider
 from moshi_data_pipeline.studio.media import store_upload
-from moshi_data_pipeline.studio.product_contracts import ReviewChapterConfig
+from moshi_data_pipeline.studio.product_contracts import (
+    EvaluationCreateRequest,
+    ReviewChapterConfig,
+)
 from moshi_data_pipeline.studio.protocol import (
     ClaimRequest,
     JobCompletion,
@@ -877,6 +880,44 @@ def create_studio_app(
             payload.decision,
             payload.note,
             principal=principal,
+        )
+
+    @app.get("/api/admin/evaluations/options")
+    def evaluation_options(request: Request):
+        require_admin(require_principal(request))
+        return {"options": service.catalog.evaluation_options()}
+
+    @app.post("/api/admin/evaluations/preview")
+    def preview_evaluation(payload: EvaluationCreateRequest, request: Request):
+        principal = require_admin(require_principal(request))
+        return service.evaluate_source(payload, principal=principal, persist=False)
+
+    @app.post("/api/admin/evaluations", status_code=201)
+    def create_evaluation(payload: EvaluationCreateRequest, request: Request):
+        principal = require_admin(require_principal(request))
+        return service.evaluate_source(payload, principal=principal, persist=True)
+
+    @app.get("/api/admin/evaluations")
+    def list_evaluations(request: Request):
+        require_admin(require_principal(request))
+        return {"reports": service.catalog.evaluation_reports()}
+
+    @app.get("/api/admin/evaluations/{report_id}")
+    def get_evaluation(report_id: str, request: Request):
+        require_admin(require_principal(request))
+        return service.catalog.evaluation_report(report_id)
+
+    @app.get("/api/admin/evaluations/{report_id}/download")
+    def download_evaluation(report_id: str, request: Request):
+        require_admin(require_principal(request))
+        report = service.catalog.evaluation_report(report_id)
+        return Response(
+            content=json.dumps(report, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{report_id}.json"',
+                "Cache-Control": "private, no-store",
+            },
         )
 
     @app.patch("/api/admin/projects/{project_id}/owner")

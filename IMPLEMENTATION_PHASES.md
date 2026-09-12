@@ -1,6 +1,6 @@
 # Moshi Dataset Studio — Executable Phases
 
-Status: P0 through P5 implementation complete; external backup replication remains pending
+Status: P0 through P7 implementation complete; external backup replication remains pending
 Specification: [FINAL_PRODUCT_IMPLEMENTATION_PLAN.md](FINAL_PRODUCT_IMPLEMENTATION_PLAN.md)
 
 ## How to execute this program
@@ -376,27 +376,30 @@ recoverable saving; and an approved final whole-source version.
 
 Goal: let reviewers correct overlap deliberately while preserving text and invalidating stale work.
 
+Status: **complete (2026-09-12)**
+Evidence: [P6_OVERLAP_REVIEW.md](P6_OVERLAP_REVIEW.md)
+
 ### Tasks
 
-- **P6-T1 — Overlap review schema**
+- [x] **P6-T1 — Overlap review schema**
   - Add classification, training decision, contributor, reviewer, artifact, and stale-state records.
 
-- **P6-T2 — Derived overlap lane**
+- [x] **P6-T2 — Derived overlap lane**
   - Render selectable overlap above the speaker lanes and highlight both contributors.
 
-- **P6-T3 — Boundary editing**
+- [x] **P6-T3 — Boundary editing**
   - Add drag, exact input, frame/word nudge, extend, shorten, split, and merge.
   - Preview transcript consequences and word-boundary warnings.
 
-- **P6-T4 — Semantic removal**
+- [x] **P6-T4 — Semantic removal**
   - Require Speaker A only, Speaker B only, or Neither usable.
   - Keep every action undoable before Save.
 
-- **P6-T5 — Classification and audition**
+- [x] **P6-T5 — Classification and audition**
   - Add confirmed, false positive, third speaker, noise, and unintelligible classifications.
   - Add raw/separate/exclude/needs-work decisions and available A/B audition.
 
-- **P6-T6 — Dependency invalidation**
+- [x] **P6-T6 — Dependency invalidation**
   - Mark recovery, QC, chapter completion, evaluation cache, and training dependencies stale after
     contributing activity changes.
 
@@ -406,32 +409,42 @@ A complete overlap correction workflow with explicit semantics and audit history
 
 ### Gate
 
-- Reviewers can increase, reduce, split, merge, or remove overlap.
-- No overlap action silently loses transcript text.
-- Stale recoveries or decisions cannot reach a training package.
-- Undo/redo and revision conflicts cover all operations.
+- [x] Reviewers can increase, reduce, split, merge, or remove overlap.
+- [x] No overlap action silently loses transcript text.
+- [x] Stale recoveries or decisions cannot reach approval or a future training package.
+- [x] Existing local Undo/Redo and server revision conflicts cover all operations.
+
+### Completion evidence
+
+- Schema 12 was rehearsed together with schema 13 against the production-size catalog before
+  deployment. All 2,502 annotation revisions and their combined payload digest were preserved.
+- Overlap edits use the existing `edit()` history path; browser Undo/Redo behavior was not replaced.
+- Backend persistence tests and five frontend overlap-operation tests pass.
 
 ## P7 — Admin WER/CER evaluation
 
 Goal: compare immutable Whisper output with selected verified corrections accurately and visibly.
 
+Status: **complete (2026-09-12)**
+Evidence: [P7_ADMIN_EVALUATION.md](P7_ADMIN_EVALUATION.md)
+
 ### Tasks
 
-- **P7-T1 — Metric engine**
+- [x] **P7-T1 — Metric engine**
   - Implement word/character edit operations and micro aggregation.
   - Report insertions, deletions, substitutions, denominators, and coverage.
 
-- **P7-T2 — Temporal comparison**
+- [x] **P7-T2 — Temporal comparison**
   - Align by time rather than mutable segment IDs.
   - Define and record overlap deduplication/exclusion policy.
 
-- **P7-T3 — Arabic normalization**
+- [x] **P7-T3 — Arabic normalization**
   - Add versioned strict and normalized policies with Arabic and mixed-language tests.
 
-- **P7-T4 — Evaluation APIs**
+- [x] **P7-T4 — Evaluation APIs**
   - Add preview, immutable report, history, and download endpoints under admin authorization.
 
-- **P7-T5 — Evaluation page**
+- [x] **P7-T5 — Evaluation page**
   - Add metrics, filters, coverage, original/corrected diff, and range playback.
 
 ### Deliverable
@@ -440,10 +453,20 @@ An admin-only, reproducible quality evaluation page and downloadable report.
 
 ### Gate
 
-- Metrics match independent fixtures.
-- Every percentage includes its denominator and evaluated coverage.
-- Diff remains correct after transcript split/join.
-- Normal users cannot access the page or APIs.
+- [x] Metrics match independent fixtures.
+- [x] Every percentage includes its denominator and evaluated coverage.
+- [x] Diff remains correct after transcript split/join.
+- [x] Normal users cannot access the page or APIs.
+
+### Completion evidence
+
+- Schema 13 was rehearsed and deployed with SQLite integrity `ok` and no foreign-key errors.
+- The deployed catalog remains at 2,502 annotation revisions with payload SHA-256
+  `df3b625d389035725d52c36758a6ed11e77f76732dd2580921e57affd63847e5`.
+- The final regression run passed 257 backend tests and 226 frontend tests; lint, TypeScript checks,
+  and the production build passed.
+- Port 80 serves the final frontend asset and `/api/health` reports `ok`; unauthenticated access to
+  the evaluation API returns HTTP 401.
 
 ## P8 — Admin training preparation and packages
 

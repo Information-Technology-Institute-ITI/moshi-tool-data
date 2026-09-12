@@ -18,6 +18,7 @@ from moshi_data_pipeline.studio.domain import (
     ClipPlanRequest,
     SourceRights,
 )
+from moshi_data_pipeline.studio.evaluation import evaluate_transcript
 from moshi_data_pipeline.studio.exporter import validate_project_export
 from moshi_data_pipeline.studio.gpu_dispatcher import (
     GpuDispatcherSettings,
@@ -48,6 +49,8 @@ from moshi_data_pipeline.studio.planning import (
     validate_annotation,
 )
 from moshi_data_pipeline.studio.product_contracts import (
+    EVALUATION_CONTRACT_VERSION,
+    EvaluationCreateRequest,
     ReviewChapterConfig,
     ReviewChapterSet,
     WaveformPeakWindow,
@@ -437,6 +440,92 @@ class StudioService:
             },
         }
 
+    def evaluate_source(
+        self,
+        request: EvaluationCreateRequest,
+        *,
+        principal: PrincipalLike,
+        persist: bool,
+    ) -> dict[str, Any]:
+        source = self.catalog.get_source(request.source_id, principal=principal)
+        machine = self.catalog.machine_transcript(
+            request.source_id, request.machine_ordinal
+        )
+        version = next(
+            (
+                item
+                for item in self.catalog.corrected_versions(request.source_id)
+                if int(item["ordinal"]) == request.corrected_version_ordinal
+            ),
+            None,
+        )
+        if version is None or version["status"] != "approved":
+            raise ValueError("Select an approved corrected version for evaluation")
+        annotation_version = int(version["current_annotation_version"])
+        annotation = self.catalog.annotation_at(request.source_id, annotation_version)
+        snapshot = machine.get("raw_snapshot_path")
+        if not snapshot:
+            raise ValueError("The selected machine transcript has no comparable raw transcript")
+        path = self.paths.resolve_relative(str(snapshot))
+        expected_hash = (machine.get("artifact_manifest") or {}).get("raw", {}).get(
+            "sha256"
+        )
+        if not path.is_file() or (
+            expected_hash and self.catalog._file_sha256(path) != expected_hash
+        ):
+            raise ValueError("The selected machine transcript snapshot failed verification")
+        payload = load_json_file(path)
+        if not isinstance(payload, dict):
+            raise ValueError("Machine transcript payload must be a JSON object")
+        result = evaluate_transcript(
+            annotation,
+            payload,
+            normalization_policy=request.normalization_policy,
+            overlap_policy=request.overlap_policy,
+            speakers=request.speakers,
+            verified_only=request.verified_only,
+        )
+        scope = {
+            "contract_version": EVALUATION_CONTRACT_VERSION,
+            "project_id": source["project_id"],
+            "source_ids": [request.source_id],
+            "model_run_ids": [machine["id"]],
+            "annotation_versions": {request.source_id: annotation_version},
+            "chapter_ids": [],
+            "speakers": request.speakers,
+            "verified_only": request.verified_only,
+            "normalization_policy": request.normalization_policy,
+            "overlap_policy": request.overlap_policy,
+        }
+        preview = {
+            "contract_version": EVALUATION_CONTRACT_VERSION,
+            "scope": scope,
+            **result,
+            "inputs": {
+                "source_id": request.source_id,
+                "machine_transcript": f"M{request.machine_ordinal}",
+                "machine_transcript_version_id": machine["id"],
+                "corrected_version": f"V{request.corrected_version_ordinal}",
+                "corrected_version_id": version["id"],
+                "annotation_version": annotation_version,
+                "content_fingerprint": version["content_fingerprint"],
+            },
+        }
+        if not persist:
+            return preview
+        return self.catalog.create_evaluation_report(
+            source_id=request.source_id,
+            machine_transcript_version_id=str(machine["id"]),
+            corrected_version_id=str(version["id"]),
+            annotation_version=annotation_version,
+            content_fingerprint=str(version["content_fingerprint"]),
+            normalization_policy=request.normalization_policy,
+            overlap_policy=request.overlap_policy,
+            scope=scope,
+            result=preview,
+            principal=principal,
+        )
+
     @staticmethod
     def _artifact_roles(
         artifacts: list[dict[str, Any]],
@@ -665,6 +754,18 @@ class StudioService:
             raise ValueError("Annotation source_id does not match the route")
         current = self.catalog.latest_annotation(source_id)
         prior = {value.id: value for value in current.transcript}
+        prior_activities = {value.id: value for value in current.activities}
+        incoming_activities = {value.id: value for value in annotation.activities}
+        changed_activity_ranges = []
+        for activity_id in set(prior_activities) | set(incoming_activities):
+            before = prior_activities.get(activity_id)
+            after = incoming_activities.get(activity_id)
+            if before == after:
+                continue
+            if before is not None:
+                changed_activity_ranges.append((before.start_sample, before.end_sample))
+            if after is not None:
+                changed_activity_ranges.append((after.start_sample, after.end_sample))
         incoming_ids = {value.id for value in annotation.transcript}
         structural_changes = [
             value for value in annotation.transcript if value.id not in prior
@@ -692,6 +793,10 @@ class StudioService:
                 and peer.end_sample > utterance.start_sample
                 for peer in structural_changes
             )
+            activity_context_changed = any(
+                start < utterance.end_sample and end > utterance.start_sample
+                for start, end in changed_activity_ranges
+            )
             transcript.append(
                 utterance.model_copy(
                     update={
@@ -704,14 +809,39 @@ class StudioService:
                         "review_candidates": previous.review_candidates if previous else [],
                         "human_verified": (
                             False
-                            if alignment_input_changed or overlap_context_changed
+                            if alignment_input_changed
+                            or overlap_context_changed
+                            or activity_context_changed
                             else utterance.human_verified
                         )
                     }
                 )
             )
+        activities_by_id = {value.id: value for value in annotation.activities}
+        overlap_reviews = []
+        for review in annotation.overlap_reviews:
+            a = activities_by_id.get(review.speaker_a_activity_id)
+            b = activities_by_id.get(review.speaker_b_activity_id)
+            start = max(a.start_sample, b.start_sample) if a and b else review.start_sample
+            end = min(a.end_sample, b.end_sample) if a and b else review.end_sample
+            stale = not a or not b or end <= start or (
+                start,
+                end,
+            ) != (review.start_sample, review.end_sample)
+            overlap_reviews.append(
+                review.model_copy(
+                    update={
+                        "state": "stale" if stale else review.state,
+                        "training_decision": "needs_work"
+                        if stale
+                        else review.training_decision,
+                    }
+                )
+            )
         normalized = normalize_annotation_bounds(
-            annotation.model_copy(update={"transcript": transcript}),
+            annotation.model_copy(
+                update={"transcript": transcript, "overlap_reviews": overlap_reviews}
+            ),
             int(source["duration_samples"] or 0),
         )
         errors = validate_annotation(
@@ -777,6 +907,28 @@ class StudioService:
         unresolved = int(metrics["unresolved_flagged_utterances"])
         if unresolved:
             blockers.append(f"Resolve {unresolved} blocking quality item(s)")
+        reviewed_pairs = {
+            (item.speaker_a_activity_id, item.speaker_b_activity_id): item
+            for item in annotation.overlap_reviews
+        }
+        unresolved_overlaps = 0
+        for a in (item for item in annotation.activities if item.speaker == "A"):
+            for b in (item for item in annotation.activities if item.speaker == "B"):
+                start = max(a.start_sample, b.start_sample)
+                end = min(a.end_sample, b.end_sample)
+                if end <= start:
+                    continue
+                review = reviewed_pairs.get((a.id, b.id))
+                if (
+                    review is None
+                    or review.state != "current"
+                    or review.classification == "unreviewed"
+                    or review.training_decision == "needs_work"
+                    or (review.start_sample, review.end_sample) != (start, end)
+                ):
+                    unresolved_overlaps += 1
+        if unresolved_overlaps:
+            blockers.append(f"Review {unresolved_overlaps} overlap region(s)")
         self.ensure_chapter_set(source_id, principal=principal)
         chapters = self.catalog.source_chapter_completion(source_id, annotation.version)
         if chapters["total"] == 0:

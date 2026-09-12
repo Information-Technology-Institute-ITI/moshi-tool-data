@@ -1499,6 +1499,71 @@ class StudioCatalog:
         versions = self.corrected_versions(source_id)
         return versions[0] if versions else None
 
+    def _store_overlap_review_audit(
+        self,
+        connection: sqlite3.Connection,
+        annotation: AnnotationDocument,
+        *,
+        actor_user_id: str | None,
+        previous: AnnotationDocument | None,
+        created_at: str,
+    ) -> None:
+        previous_reviews = {
+            (item.speaker_a_activity_id, item.speaker_b_activity_id): item
+            for item in (previous.overlap_reviews if previous else [])
+        }
+        for review in annotation.overlap_reviews:
+            record_id = new_id("overlap_review_record")
+            after = review.model_dump(mode="json")
+            before = previous_reviews.get(
+                (review.speaker_a_activity_id, review.speaker_b_activity_id)
+            )
+            connection.execute(
+                """
+                INSERT INTO overlap_reviews(
+                    id,source_id,annotation_version,speaker_a_activity_id,
+                    speaker_b_activity_id,start_sample,end_sample,classification,
+                    training_decision,state,note,reviewer_user_id,
+                    recovery_artifact_ids_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    record_id,
+                    annotation.source_id,
+                    annotation.version,
+                    review.speaker_a_activity_id,
+                    review.speaker_b_activity_id,
+                    review.start_sample,
+                    review.end_sample,
+                    review.classification,
+                    review.training_decision,
+                    review.state,
+                    review.note,
+                    actor_user_id,
+                    _json(review.recovery_artifact_ids),
+                    created_at,
+                    created_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO overlap_review_events(
+                    id,overlap_review_id,source_id,annotation_version,actor_user_id,
+                    event_type,before_json,after_json,created_at
+                ) VALUES(?,?,?,?,?,'saved',?,?,?)
+                """,
+                (
+                    new_id("overlap_review_event"),
+                    record_id,
+                    annotation.source_id,
+                    annotation.version,
+                    actor_user_id,
+                    before.model_dump_json() if before else None,
+                    _json(after),
+                    created_at,
+                ),
+            )
+
     @staticmethod
     def _file_sha256(path: Path) -> str:
         digest = hashlib.sha256()
@@ -1747,6 +1812,151 @@ class StudioCatalog:
         if row is None:
             raise KeyError(f"{source_id}:M{ordinal}")
         return self._machine_transcript_record(row)
+
+    def evaluation_options(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.id AS source_id,s.original_name,s.project_id,p.name AS project_name,
+                       v.id AS corrected_version_id,v.ordinal AS corrected_version_ordinal,
+                       v.current_annotation_version,v.content_fingerprint,
+                       m.id AS machine_transcript_version_id,m.ordinal AS machine_ordinal,
+                       m.model_name,m.producer,m.provenance_status,m.comparison_available
+                FROM corrected_versions v
+                JOIN sources s ON s.id=v.source_id
+                JOIN projects p ON p.id=s.project_id
+                JOIN machine_transcript_versions m ON m.source_id=s.id
+                WHERE v.status='approved' AND m.comparison_available=1
+                ORDER BY p.name,s.original_name,v.ordinal DESC,m.ordinal DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_evaluation_report(
+        self,
+        *,
+        source_id: str,
+        machine_transcript_version_id: str,
+        corrected_version_id: str,
+        annotation_version: int,
+        content_fingerprint: str,
+        normalization_policy: str,
+        overlap_policy: str,
+        scope: dict[str, Any],
+        result: dict[str, Any],
+        principal: PrincipalLike,
+    ) -> dict[str, Any]:
+        report_id = new_id("evaluation")
+        now = self._now()
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = self._source_mutation_row(connection, source_id, principal=principal)
+            version = connection.execute(
+                """
+                SELECT * FROM corrected_versions
+                WHERE id=? AND source_id=? AND status='approved'
+                  AND current_annotation_version=? AND content_fingerprint=?
+                """,
+                (
+                    corrected_version_id,
+                    source_id,
+                    annotation_version,
+                    content_fingerprint,
+                ),
+            ).fetchone()
+            machine = connection.execute(
+                """
+                SELECT 1 FROM machine_transcript_versions
+                WHERE id=? AND source_id=? AND comparison_available=1
+                """,
+                (machine_transcript_version_id, source_id),
+            ).fetchone()
+            if version is None or machine is None:
+                connection.rollback()
+                raise VersionConflictError("Evaluation inputs changed before report creation")
+            connection.execute(
+                """
+                INSERT INTO evaluation_reports(
+                    id,project_id,source_id,machine_transcript_version_id,
+                    corrected_version_id,annotation_version,content_fingerprint,
+                    normalization_policy,overlap_policy,scope_json,result_json,
+                    created_by_user_id,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    report_id,
+                    source["project_id"],
+                    source_id,
+                    machine_transcript_version_id,
+                    corrected_version_id,
+                    annotation_version,
+                    content_fingerprint,
+                    normalization_policy,
+                    overlap_policy,
+                    _json(scope),
+                    _json(result),
+                    principal.user_id,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO annotation_version_references(
+                    id,source_id,annotation_version,reference_kind,reference_id,created_at
+                ) VALUES(?,?,?,'evaluation_report',?,?)
+                """,
+                (
+                    new_id("annotation_ref"),
+                    source_id,
+                    annotation_version,
+                    report_id,
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.evaluation_report(report_id)
+
+    @staticmethod
+    def _evaluation_report_record(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["scope"] = _loads(value.pop("scope_json"), {})
+        value["result"] = _loads(value.pop("result_json"), {})
+        return value
+
+    def evaluation_reports(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.*,s.original_name,p.name AS project_name,
+                       m.ordinal AS machine_ordinal,v.ordinal AS corrected_version_ordinal
+                FROM evaluation_reports r
+                JOIN sources s ON s.id=r.source_id
+                JOIN projects p ON p.id=r.project_id
+                JOIN machine_transcript_versions m ON m.id=r.machine_transcript_version_id
+                JOIN corrected_versions v ON v.id=r.corrected_version_id
+                ORDER BY r.created_at DESC
+                """
+            ).fetchall()
+        return [self._evaluation_report_record(row) for row in rows]
+
+    def evaluation_report(self, report_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT r.*,s.original_name,p.name AS project_name,
+                       m.ordinal AS machine_ordinal,v.ordinal AS corrected_version_ordinal
+                FROM evaluation_reports r
+                JOIN sources s ON s.id=r.source_id
+                JOIN projects p ON p.id=r.project_id
+                JOIN machine_transcript_versions m ON m.id=r.machine_transcript_version_id
+                JOIN corrected_versions v ON v.id=r.corrected_version_id
+                WHERE r.id=?
+                """,
+                (report_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(report_id)
+        return self._evaluation_report_record(row)
 
     def corrected_version_annotation(self, source_id: str, ordinal: int) -> AnnotationDocument:
         with self.connect() as connection:
@@ -2255,6 +2465,15 @@ class StudioCatalog:
                     "current",
                     shared_aligned_words_id,
                 ),
+            )
+            self._store_overlap_review_audit(
+                connection,
+                value,
+                actor_user_id=actor_id,
+                previous=_annotation_from_row(current_revision)
+                if current_revision is not None
+                else None,
+                created_at=now,
             )
             if not must_create_version:
                 recovery_until = (
@@ -3630,6 +3849,13 @@ class StudioCatalog:
                         "current",
                         shared_aligned_words_id,
                     ),
+                )
+                self._store_overlap_review_audit(
+                    connection,
+                    value,
+                    actor_user_id=None,
+                    previous=None,
+                    created_at=now,
                 )
                 if not create_version:
                     recovery_until = (

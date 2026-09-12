@@ -144,7 +144,7 @@ class OverlapReviewRecord(SampleRange):
     speaker_a_activity_id: str = Field(min_length=1)
     speaker_b_activity_id: str = Field(min_length=1)
     classification: Literal[
-        "confirmed", "false_positive", "third_speaker", "noise", "unintelligible"
+        "unreviewed", "confirmed", "false_positive", "third_speaker", "noise", "unintelligible"
     ]
     training_decision: Literal["raw", "separate", "exclude", "needs_work"]
     state: Literal["current", "stale"]
@@ -187,6 +187,16 @@ class EvaluationPreview(ContractModel):
     eligible_duration_samples: int = Field(ge=0)
     coverage: float = Field(ge=0, le=1)
     breakdowns: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationCreateRequest(ContractModel):
+    source_id: str = Field(min_length=1)
+    machine_ordinal: int = Field(ge=1)
+    corrected_version_ordinal: int = Field(ge=1)
+    speakers: list[Literal["A", "B"]] = Field(default_factory=list)
+    verified_only: bool = True
+    normalization_policy: Literal["strict-v1", "arabic-normalized-v1"] = "strict-v1"
+    overlap_policy: Literal["deduplicate", "include", "exclude"] = "deduplicate"
 
 
 class TrainingProfile(ContractModel):
